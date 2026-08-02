@@ -16,6 +16,7 @@
   let detail: PlanningDetailDto | null = null;
   let loading = true;
   let busyAction = '';
+  let planningStarting = false;
   let error = '';
   let noPlanning = false;
   let answers: Record<string, string> = {};
@@ -65,7 +66,7 @@
         cause instanceof IpcError &&
         (cause.code === 'not_found' || cause.message.includes('has not been started'))
       ) {
-        if (busyAction !== 'start') {
+        if (!planningStarting) {
           noPlanning = true;
           detail = null;
           error = '';
@@ -99,9 +100,44 @@
   }
 
   async function startPlanning() {
-    await act('start', () =>
-      api.startPlanning({ workItemId: workItem.id, idempotencyKey: identifier() })
-    );
+    planningStarting = true;
+    error = '';
+    const operation = api.startPlanning({
+      workItemId: workItem.id,
+      idempotencyKey: identifier()
+    });
+    void refresh();
+    try {
+      syncDetail(await operation);
+    } catch (cause) {
+      const actionError = message(cause);
+      await refresh();
+      error = actionError;
+    } finally {
+      planningStarting = false;
+    }
+  }
+
+  async function replanWorkItem() {
+    if (!detail?.plan) return;
+    planningStarting = true;
+    error = '';
+    const operation = api.replanWorkItem({
+      planningRunId: detail.run.id,
+      expectedPlanUpdatedAt: detail.plan.updatedAt,
+      idempotencyKey: identifier()
+    });
+    void refresh();
+    try {
+      syncDetail(await operation, true);
+      planMode = 'preview';
+    } catch (cause) {
+      const actionError = message(cause);
+      await refresh();
+      error = actionError;
+    } finally {
+      planningStarting = false;
+    }
   }
 
   function pendingQuestionsFor(planningAgentId: string) {
@@ -284,7 +320,7 @@
     const poll = window.setInterval(() => {
       if (
         document.visibilityState === 'visible' &&
-        (busyAction === 'start' ||
+        (planningStarting ||
           (detail &&
             (activeStatuses.has(detail.run.status) ||
           detail.terminalHandoff?.status === 'awaiting_manual_reconcile')
@@ -328,8 +364,12 @@
           Plan approval:
           <strong>{workItem.requirePlanApproval ? 'Required' : 'Optional'}</strong>
         </p>
-        <button class="primary" disabled={busyAction !== ''} on:click={startPlanning}>
-          {busyAction === 'start' ? 'Starting planning…' : 'Start Planning'}
+        <button
+          class="primary"
+          disabled={planningStarting || busyAction !== ''}
+          on:click={startPlanning}
+        >
+          {planningStarting ? 'Starting planning…' : 'Start Planning'}
         </button>
       </div>
     </section>
@@ -574,6 +614,15 @@
               on:click={savePlan}
             >
               {busyAction === 'save-plan' ? 'Saving…' : 'Save Revision'}
+            </button>
+          {/if}
+
+          {#if detail.plan.approvalStatus !== 'approved' && !detail.queue.entry}
+            <button
+              disabled={planDirty || planningStarting || busyAction !== ''}
+              on:click={replanWorkItem}
+            >
+              {planningStarting ? 'Re-planning…' : 'Re-plan'}
             </button>
           {/if}
 

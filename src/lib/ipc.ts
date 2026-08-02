@@ -8,6 +8,7 @@ import type { UpdateSettingsRequest } from '../../src-tauri/bindings/UpdateSetti
 import type { IntakeLocalMarkdownRequest } from '../../src-tauri/bindings/IntakeLocalMarkdownRequest';
 import type { IntakeGithubIssueRequest } from '../../src-tauri/bindings/IntakeGithubIssueRequest';
 import type { StartPlanningRequest } from '../../src-tauri/bindings/StartPlanningRequest';
+import type { ReplanWorkItemRequest } from '../../src-tauri/bindings/ReplanWorkItemRequest';
 import type { SubmitPlanningAnswersRequest } from '../../src-tauri/bindings/SubmitPlanningAnswersRequest';
 import type { RetryPlanningRequest } from '../../src-tauri/bindings/RetryPlanningRequest';
 import type { LaunchTerminalHandoffRequest } from '../../src-tauri/bindings/LaunchTerminalHandoffRequest';
@@ -37,6 +38,7 @@ export type {
   PlanningEventDto,
   PlanningQuestionDto,
   RegisterRepositoryRequest,
+  ReplanWorkItemRequest,
   RepositoryDto,
   ResumeTerminalHandoffRequest,
   RetryPlanningRequest,
@@ -113,6 +115,8 @@ export const api = {
   listCopilotModels: () => command<string[]>('list_copilot_models'),
   startPlanning: (request: StartPlanningRequest) =>
     command<PlanningDetailDto>('start_planning', { request }),
+  replanWorkItem: (request: ReplanWorkItemRequest) =>
+    command<PlanningDetailDto>('replan_work_item', { request }),
   getPlanning: (workItemId: string) =>
     command<PlanningDetailDto>('get_planning', { workItemId }),
   submitPlanningAnswers: (request: SubmitPlanningAnswersRequest) =>

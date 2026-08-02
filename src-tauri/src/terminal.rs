@@ -756,6 +756,7 @@ mod tests {
                     "--disable-builtin-mcps".to_owned(),
                     "--disallow-temp-dir".to_owned(),
                     "--allow-all-tools".to_owned(),
+                    "--allow-all-paths".to_owned(),
                     "--deny-tool=write".to_owned(),
                     "--deny-tool=shell".to_owned(),
                     "--no-remote-export".to_owned(),

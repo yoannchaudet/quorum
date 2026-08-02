@@ -86,6 +86,11 @@ describe('IPC error normalization', () => {
       requirePlanApproval: true
     });
     await api.startPlanning({ workItemId: 'work', idempotencyKey: 'start-key' });
+    await api.replanWorkItem({
+      planningRunId: 'run',
+      expectedPlanUpdatedAt: 'plan-version',
+      idempotencyKey: 'replan-key'
+    });
     await api.getPlanning('work');
     await api.submitPlanningAnswers({
       planningRunId: 'run',
@@ -159,6 +164,16 @@ describe('IPC error normalization', () => {
         }
       ],
       ['start_planning', { request: { workItemId: 'work', idempotencyKey: 'start-key' } }],
+      [
+        'replan_work_item',
+        {
+          request: {
+            planningRunId: 'run',
+            expectedPlanUpdatedAt: 'plan-version',
+            idempotencyKey: 'replan-key'
+          }
+        }
+      ],
       ['get_planning', { workItemId: 'work' }],
       [
         'submit_planning_answers',

@@ -6,6 +6,7 @@ import { IpcError, type PlanningDetailDto } from './lib/ipc';
 const mocks = vi.hoisted(() => ({
   getPlanning: vi.fn(),
   startPlanning: vi.fn(),
+  replanWorkItem: vi.fn(),
   submitPlanningAnswers: vi.fn(),
   retryPlanningAgent: vi.fn(),
   openPlanningTerminal: vi.fn(),
@@ -164,6 +165,32 @@ describe('planning work item UX', () => {
     expect(mocks.startPlanning).toHaveBeenCalledWith(
       expect.objectContaining({ workItemId: 'work', idempotencyKey: expect.any(String) })
     );
+  });
+
+  it('can open a planner session while the initial planning request is still running', async () => {
+    let finishPlanning!: (value: PlanningDetailDto) => void;
+    const pendingPlanning = new Promise<PlanningDetailDto>((resolve) => {
+      finishPlanning = resolve;
+    });
+    mocks.getPlanning
+      .mockRejectedValueOnce(
+        new IpcError('not_found', 'Planning has not been started for this work item.')
+      )
+      .mockResolvedValue(detail());
+    mocks.startPlanning.mockReturnValue(pendingPlanning);
+    mocks.openCopilotSession.mockResolvedValue(undefined);
+    render(PlanningView, { workItem });
+
+    await fireEvent.click(await screen.findByRole('button', { name: 'Start Planning' }));
+    await fireEvent.click(
+      await screen.findByRole('button', { name: 'Open Planner 1 in Terminal' })
+    );
+
+    expect(mocks.openCopilotSession).toHaveBeenCalledWith({
+      workItemId: 'work',
+      planningAgentId: 'planner'
+    });
+    finishPlanning(detail());
   });
 
   it('opens Markdown links without refreshing an unstarted planning run on focus', async () => {
@@ -407,6 +434,31 @@ describe('planning work item UX', () => {
       expect(screen.getByRole('alert')).toHaveTextContent(
         'The plan changed. Review the refreshed revision.'
       );
+  });
+
+  it('re-plans an unapproved work item and hides the action after approval', async () => {
+    const pending = planDetail(true);
+    const replanned = detail();
+    mocks.getPlanning.mockResolvedValue(pending);
+    mocks.replanWorkItem.mockResolvedValue(replanned);
+    render(PlanningView, { workItem });
+
+    await fireEvent.click(await screen.findByRole('button', { name: 'Re-plan' }));
+
+    expect(mocks.replanWorkItem).toHaveBeenCalledWith({
+      planningRunId: 'run',
+      expectedPlanUpdatedAt: 'plan-version',
+      idempotencyKey: expect.any(String)
+    });
+    expect(await screen.findByText('Planning team')).toBeInTheDocument();
+
+    mocks.getPlanning.mockResolvedValue({
+      ...planDetail(true),
+      plan: { ...planDetail(true).plan!, approvalStatus: 'approved' }
+    });
+    render(PlanningView, { workItem });
+    await screen.findAllByText(/Approval Approved/);
+    expect(screen.queryByRole('button', { name: 'Re-plan' })).not.toBeInTheDocument();
   });
 
   it('edits, saves, approves, rejects, and only enqueues an eligible required plan', async () => {
