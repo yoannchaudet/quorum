@@ -6,8 +6,8 @@ use crate::copilot::SystemProcessRunner;
 use crate::error::AppError;
 use crate::planning::{
     EnqueuePlanRequest, PlanApprovalRequest, PlanningDetailDto, PlanningService,
-    RetryPlanningRequest, StartPlanningRequest, SubmitPlanningAnswersRequest,
-    SystemPlanningExecutor, UpdateSynthesizedPlanRequest,
+    ReplanWorkItemRequest, RetryPlanningRequest, StartPlanningRequest,
+    SubmitPlanningAnswersRequest, SystemPlanningExecutor, UpdateSynthesizedPlanRequest,
 };
 use crate::repository::{
     CreateWorkItemRequest, IntakeGithubIssueRequest, IntakeLocalMarkdownRequest,
@@ -183,6 +183,20 @@ pub async fn start_planning(
 }
 
 #[tauri::command(rename_all = "camelCase")]
+pub async fn replan_work_item(
+    state: State<'_, StartupState>,
+    request: ReplanWorkItemRequest,
+) -> Result<PlanningDetailDto, AppError> {
+    blocking(state.store()?, move |store| {
+        let executor = SystemPlanningExecutor::default();
+        let planning = PlanningService::with_executor(&store, &executor);
+        let state = planning.replan(&request)?;
+        planning.detail(&state.run.id)
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "camelCase")]
 pub async fn get_planning(
     state: State<'_, StartupState>,
     work_item_id: String,
@@ -334,9 +348,9 @@ mod bindings_tests {
     use crate::planning::{
         EnqueuePlanRequest, PlanApprovalRequest, PlanRevisionDto, PlanningAgentDto,
         PlanningAnswerInput, PlanningDetailDto, PlanningEventDto, PlanningQuestionDto,
-        PlanningQueueDto, PlanningRunDto, PlanningSourceDto, QueueEntryDto, RetryPlanningRequest,
-        StartPlanningRequest, SubmitPlanningAnswersRequest, TerminalHandoffSummaryDto,
-        UpdateSynthesizedPlanRequest,
+        PlanningQueueDto, PlanningRunDto, PlanningSourceDto, QueueEntryDto, ReplanWorkItemRequest,
+        RetryPlanningRequest, StartPlanningRequest, SubmitPlanningAnswersRequest,
+        TerminalHandoffSummaryDto, UpdateSynthesizedPlanRequest,
     };
     use crate::repository::{
         CreateWorkItemRequest, IntakeGithubIssueRequest, IntakeLocalMarkdownRequest,
@@ -390,6 +404,10 @@ mod bindings_tests {
         assert_binding(
             &bindings.join("StartPlanningRequest.ts"),
             &StartPlanningRequest::export_to_string().expect("start planning binding"),
+        );
+        assert_binding(
+            &bindings.join("ReplanWorkItemRequest.ts"),
+            &ReplanWorkItemRequest::export_to_string().expect("re-plan binding"),
         );
         assert_binding(
             &bindings.join("PlanningAnswerInput.ts"),

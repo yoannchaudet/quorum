@@ -10,12 +10,13 @@ use crate::error::AppError;
 
 const CONTRACT_VERSION: u8 = 1;
 const COPILOT_PROGRAM: &str = "copilot";
-pub(crate) const PLANNING_SAFETY_ARGUMENTS: [&str; 8] = [
+pub(crate) const PLANNING_SAFETY_ARGUMENTS: [&str; 9] = [
     "--plan",
     "--no-custom-instructions",
     "--disable-builtin-mcps",
     "--disallow-temp-dir",
     "--allow-all-tools",
+    "--allow-all-paths",
     "--deny-tool=write",
     "--deny-tool=shell",
     "--no-remote-export",
@@ -734,6 +735,7 @@ mod tests {
             "--disable-builtin-mcps",
             "--disallow-temp-dir",
             "--allow-all-tools",
+            "--allow-all-paths",
             "--deny-tool=write",
             "--deny-tool=shell",
             "--no-remote-export",

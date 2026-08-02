@@ -56,6 +56,7 @@ pub fn run() {
             ipc::update_settings,
             ipc::list_copilot_models,
             ipc::start_planning,
+            ipc::replan_work_item,
             ipc::get_planning,
             ipc::submit_planning_answers,
             ipc::retry_planning_agent,

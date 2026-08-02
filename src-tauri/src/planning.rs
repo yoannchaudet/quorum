@@ -26,6 +26,15 @@ pub struct StartPlanningRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(rename_all = "camelCase")]
+pub struct ReplanWorkItemRequest {
+    pub planning_run_id: String,
+    pub expected_plan_updated_at: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
 pub struct PlanningAnswerInput {
     pub question_id: String,
     pub answer_markdown: String,
@@ -376,6 +385,144 @@ impl<'a, E: PlanningExecutor> PlanningService<'a, E> {
                     ))
                 })?;
             let models = planner_models(&transaction)?;
+            let run_id = Uuid::new_v4().to_string();
+            let timestamp = now();
+            transaction.execute(
+                "INSERT INTO planning_runs (
+                    id, work_item_id, status, idempotency_key, created_at, updated_at
+                 ) VALUES (?1, ?2, 'running', ?3, ?4, ?4)",
+                params![run_id, work_item.id, idempotency_key, timestamp],
+            )?;
+            let mut planners = Vec::with_capacity(models.len());
+            for (ordinal, model) in models.iter().enumerate() {
+                let session = AgentSession::planner(&work_item.id, &run_id, ordinal);
+                insert_agent(
+                    &transaction,
+                    &run_id,
+                    &session,
+                    model,
+                    "running",
+                    1,
+                    &timestamp,
+                )?;
+                planners.push(Invocation {
+                    agent_id: session.id.to_string(),
+                    model: model.clone(),
+                    session,
+                    repository_path: work_item.repository_path.clone(),
+                    requirements: NormalizedRequirements::new(
+                        &work_item.title,
+                        &work_item.markdown,
+                    )
+                    .map_err(StoreError::App)?,
+                    attempt: 1,
+                });
+            }
+            let synthesizer = AgentSession::synthesizer(&work_item.id, &run_id);
+            insert_agent(
+                &transaction,
+                &run_id,
+                &synthesizer,
+                &models[0],
+                "pending",
+                0,
+                &timestamp,
+            )?;
+            transaction.commit()?;
+            Ok(Creation::Created { run_id, planners })
+        })?;
+
+        match creation {
+            Creation::Created { run_id, planners } => {
+                self.execute_initial_planners(&run_id, planners)?;
+                self.advance(&run_id)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub fn replan(&self, request: &ReplanWorkItemRequest) -> Result<PlanningStateDto, AppError> {
+        let idempotency_key = required(
+            &request.idempotency_key,
+            "A re-planning idempotency key is required.",
+        )?;
+        let creation = self.store.with_connection(|connection| {
+            let transaction = connection.unchecked_transaction()?;
+            let plan = load_plan_mutation(
+                &transaction,
+                &request.planning_run_id,
+                &request.expected_plan_updated_at,
+            )?;
+            if plan.approval_status == "approved" {
+                return Err(StoreError::App(AppError::conflict(
+                    "An approved plan cannot be replaced by re-planning.",
+                )));
+            }
+            let has_queue_entry: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM queue_entries WHERE plan_id = ?1)",
+                [&plan.id],
+                |row| row.get(0),
+            )?;
+            if has_queue_entry {
+                return Err(StoreError::App(AppError::conflict(
+                    "A queued plan cannot be replaced by re-planning.",
+                )));
+            }
+            let work_item = transaction
+                .query_row(
+                    "SELECT work_items.id, work_items.title, work_items.markdown_body,
+                            repositories.root_path
+                     FROM planning_runs
+                     JOIN work_items ON work_items.id = planning_runs.work_item_id
+                     JOIN repositories ON repositories.id = work_items.repository_id
+                     WHERE planning_runs.id = ?1
+                       AND work_items.lifecycle_status = 'open'
+                       AND repositories.archived_at IS NULL",
+                    [&request.planning_run_id],
+                    |row| {
+                        Ok(WorkItem {
+                            id: row.get(0)?,
+                            title: row.get(1)?,
+                            markdown: row.get(2)?,
+                            repository_path: row.get(3)?,
+                        })
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    StoreError::App(AppError::not_found(
+                        "The open work item could not be found.",
+                    ))
+                })?;
+            let models = planner_models(&transaction)?;
+            transaction.execute(
+                "DELETE FROM planning_answers
+                 WHERE question_id IN (
+                   SELECT id FROM planning_questions WHERE planning_run_id = ?1
+                 )",
+                [&request.planning_run_id],
+            )?;
+            for table in [
+                "terminal_handoffs",
+                "planning_agent_events",
+                "planning_artifacts",
+                "planning_questions",
+                "planning_agents",
+            ] {
+                transaction.execute(
+                    &format!("DELETE FROM {table} WHERE planning_run_id = ?1"),
+                    [&request.planning_run_id],
+                )?;
+            }
+            transaction.execute(
+                "DELETE FROM plans WHERE planning_run_id = ?1",
+                [&request.planning_run_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM planning_runs WHERE id = ?1",
+                [&request.planning_run_id],
+            )?;
+
             let run_id = Uuid::new_v4().to_string();
             let timestamp = now();
             transaction.execute(
@@ -2318,8 +2465,8 @@ mod tests {
 
     use super::{
         EnqueuePlanRequest, PlanApprovalRequest, PlanningAnswerInput, PlanningExecutor,
-        PlanningService, RetryPlanningRequest, StartPlanningRequest, SubmitPlanningAnswersRequest,
-        UpdateSynthesizedPlanRequest,
+        PlanningService, ReplanWorkItemRequest, RetryPlanningRequest, StartPlanningRequest,
+        SubmitPlanningAnswersRequest, UpdateSynthesizedPlanRequest,
     };
     use crate::copilot::{
         AgentEnvelope, AgentOutcome, AgentQuestion, AgentSession, CompletedPlannerArtifact,
@@ -2970,6 +3117,88 @@ mod tests {
             })
             .expect("queue count");
         assert_eq!(queue_count, 1);
+    }
+
+    #[test]
+    fn replans_rejected_work_and_preserves_approved_work() {
+        let harness = harness(&["model-a", "model-b"]);
+        let executor = FakeExecutor::new(
+            [
+                (
+                    0,
+                    vec![
+                        Ok(completed("# First candidate A", "planner-first-a")),
+                        Ok(completed("# Second candidate A", "planner-second-a")),
+                    ],
+                ),
+                (
+                    1,
+                    vec![
+                        Ok(completed("# First candidate B", "planner-first-b")),
+                        Ok(completed("# Second candidate B", "planner-second-b")),
+                    ],
+                ),
+            ],
+            vec![
+                Ok(completed("# First plan", "synthesizer-first")),
+                Ok(completed("# Replacement plan", "synthesizer-second")),
+            ],
+            Vec::new(),
+        );
+        let service = PlanningService::with_executor(&harness.store, &executor);
+        let first = service
+            .start(&start_request(&harness.work_item_id, "initial-plan"))
+            .expect("initial planning");
+        let first_plan = first.plan.expect("initial plan");
+        let rejected = service
+            .reject_plan(&PlanApprovalRequest {
+                planning_run_id: first.run.id.clone(),
+                expected_plan_updated_at: first_plan.updated_at,
+            })
+            .expect("reject initial plan");
+        let rejected_plan = rejected.plan.expect("rejected plan");
+
+        let replacement = service
+            .replan(&ReplanWorkItemRequest {
+                planning_run_id: first.run.id.clone(),
+                expected_plan_updated_at: rejected_plan.updated_at,
+                idempotency_key: "replacement-plan".to_owned(),
+            })
+            .expect("re-plan rejected work");
+        let replacement_plan = replacement.plan.expect("replacement plan");
+        assert_ne!(replacement.run.id, first.run.id);
+        assert_eq!(replacement_plan.markdown_body, "# Replacement plan");
+        assert_eq!(replacement_plan.approval_status, "pending");
+        assert_eq!(replacement_plan.edit_revision, 1);
+        let old_run_count: i64 = harness
+            .store
+            .with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT count(*) FROM planning_runs WHERE id = ?1",
+                        [&first.run.id],
+                        |row| row.get(0),
+                    )
+                    .map_err(Into::into)
+            })
+            .expect("old run count");
+        assert_eq!(old_run_count, 0);
+
+        let approved = service
+            .approve_plan(&PlanApprovalRequest {
+                planning_run_id: replacement.run.id.clone(),
+                expected_plan_updated_at: replacement_plan.updated_at,
+            })
+            .expect("approve replacement");
+        let approved_plan = approved.plan.expect("approved replacement");
+        let error = service
+            .replan(&ReplanWorkItemRequest {
+                planning_run_id: replacement.run.id,
+                expected_plan_updated_at: approved_plan.updated_at,
+                idempotency_key: "forbidden-replan".to_owned(),
+            })
+            .expect_err("approved plan must be preserved");
+        assert_eq!(error.code, "conflict");
     }
 
     #[test]
