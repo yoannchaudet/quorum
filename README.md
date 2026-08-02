@@ -53,3 +53,32 @@ three rounds. Blocked work remains inspectable and resumable.
 | [M3: Build and adversarial review](https://github.com/yoannchaudet/quorum/issues/3) | Resumable Copilot execution and review in isolated worktrees |
 | [M4: Pull request through merge](https://github.com/yoannchaudet/quorum/issues/4) | Checks, bounded Copilot remediation, guarded merge, and notifications |
 | [M5: Durable work queues](https://github.com/yoannchaudet/quorum/issues/5) | Sequential scheduling, explicit parallel work, controls, and restart recovery |
+
+## Development
+
+Quorum M1 supports macOS 14 Sonoma or later. Install a current Node.js LTS,
+the Rust stable toolchain (including `rustfmt` and `clippy`), Xcode Command Line
+Tools, and Git. The app validates registered folders with your local `git`
+executable.
+
+```bash
+npm ci
+npm run tauri dev
+```
+
+Run the locked checks before contributing:
+
+```bash
+npm run check
+npm run test:unit
+npm run build
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+npm run tauri build -- --no-bundle
+```
+
+`make check`, `make test`, `make rust-check`, and `make tauri-build` provide
+the corresponding shortcuts. Quorum stores its authoritative SQLite database
+in the operating system application-data directory; it never writes metadata
+into a registered repository.
