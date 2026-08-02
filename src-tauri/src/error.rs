@@ -47,6 +47,14 @@ impl AppError {
         )
     }
 
+    pub fn external(message: impl Into<String>) -> Self {
+        Self::new(
+            "external",
+            message,
+            Some("Check that GitHub Copilot CLI is installed and authenticated, then try again."),
+        )
+    }
+
     #[expect(
         dead_code,
         reason = "IPC conflict errors are reserved for optimistic state updates."

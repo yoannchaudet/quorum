@@ -1,6 +1,7 @@
 mod error;
 mod ipc;
 mod repository;
+mod settings;
 mod state;
 
 use std::sync::Arc;
@@ -43,7 +44,10 @@ pub fn run() {
             ipc::archive_repository,
             ipc::list_work_items,
             ipc::create_work_item,
-            ipc::get_work_item
+            ipc::get_work_item,
+            ipc::get_settings,
+            ipc::update_settings,
+            ipc::list_copilot_models
         ]);
 
     if let Err(error) = builder.run(tauri::generate_context!()) {

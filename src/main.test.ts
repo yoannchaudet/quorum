@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({ listRepositories: vi.fn() }));
 
 vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn() }));
-vi.mock('@tauri-apps/plugin-opener', () => ({ openUrl: vi.fn() }));
+vi.mock('@tauri-apps/plugin-opener', () => ({ openUrl: vi.fn(), revealItemInDir: vi.fn() }));
 vi.mock('./lib/ipc', () => ({
   IpcError: class IpcError extends Error {},
   api: {
@@ -13,7 +13,10 @@ vi.mock('./lib/ipc', () => ({
     archiveRepository: vi.fn(),
     listWorkItems: vi.fn(),
     createWorkItem: vi.fn(),
-    getWorkItem: vi.fn()
+    getWorkItem: vi.fn(),
+    getSettings: vi.fn(),
+    updateSettings: vi.fn(),
+    listCopilotModels: vi.fn()
   }
 }));
 

@@ -6,7 +6,10 @@ use rusqlite::{Connection, Transaction};
 use crate::error::{AppError, StoreError};
 
 const APPLICATION_ID: i32 = 0x5155_4F52;
-const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_initial.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/0001_initial.sql"),
+    include_str!("../migrations/0002_model_settings.sql"),
+];
 
 #[derive(Debug, Clone)]
 pub struct AppStore {
@@ -24,7 +27,6 @@ impl AppStore {
         Ok(store)
     }
 
-    #[cfg(test)]
     pub fn database_path(&self) -> &Path {
         &self.path
     }
@@ -106,7 +108,7 @@ mod tests {
     use rusqlite::Connection;
     use tempfile::tempdir;
 
-    use super::AppStore;
+    use super::{AppStore, APPLICATION_ID};
 
     #[test]
     fn initializes_and_reopens_without_resetting_data() {
@@ -164,6 +166,37 @@ mod tests {
     }
 
     #[test]
+    fn upgrades_a_version_one_database_with_model_defaults() {
+        let directory = tempdir().expect("temp dir");
+        let database = directory.path().join("quorum.sqlite3");
+        let connection = Connection::open(&database).expect("create database");
+        connection
+            .execute_batch(include_str!("../migrations/0001_initial.sql"))
+            .expect("version one schema");
+        connection
+            .execute_batch(&format!(
+                "PRAGMA application_id = {APPLICATION_ID}; PRAGMA user_version = 1;"
+            ))
+            .expect("version one identity");
+        drop(connection);
+
+        let store = AppStore::open(directory.path()).expect("upgrade");
+        store
+            .with_connection(|connection| {
+                let assignments: i32 =
+                    connection.query_row("SELECT count(*) FROM model_assignments", [], |row| {
+                        row.get(0)
+                    })?;
+                let version: i32 =
+                    connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+                assert_eq!(assignments, 4);
+                assert_eq!(version, 2);
+                Ok(())
+            })
+            .expect("upgraded defaults");
+    }
+
+    #[test]
     fn schema_enforces_repository_uniqueness_and_work_item_foreign_keys() {
         let directory = tempdir().expect("temp dir");
         let store = AppStore::open(directory.path()).expect("open store");
@@ -191,7 +224,7 @@ mod tests {
                     .is_err());
                 let version: i32 =
                     connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-                assert_eq!(version, 1);
+                assert_eq!(version, 2);
                 Ok(())
             })
             .expect("schema constraints");

@@ -29,4 +29,31 @@ describe('IPC error normalization', () => {
       new IpcError('unexpected', 'Quorum could not complete that request. Please try again.')
     );
   });
+
+  it('uses typed settings command names and payloads', async () => {
+    mocks.invoke
+      .mockResolvedValueOnce({
+        databasePath: '/tmp/quorum.sqlite3',
+        planningModels: ['planner'],
+        implementationModel: 'builder',
+        adversaryModel: 'reviewer'
+      })
+      .mockResolvedValueOnce(['planner']);
+
+    await api.updateSettings({
+      planningModels: ['planner'],
+      implementationModel: 'builder',
+      adversaryModel: 'reviewer'
+    });
+    await api.listCopilotModels();
+
+    expect(mocks.invoke).toHaveBeenNthCalledWith(1, 'update_settings', {
+      request: {
+        planningModels: ['planner'],
+        implementationModel: 'builder',
+        adversaryModel: 'reviewer'
+      }
+    });
+    expect(mocks.invoke).toHaveBeenNthCalledWith(2, 'list_copilot_models', undefined);
+  });
 });
