@@ -78,15 +78,31 @@ main {
 }
 
 aside {
+  display: flex;
+  flex-direction: column;
   grid-column: 1;
   grid-row: 2;
   min-width: 0;
   padding: 12px 10px;
-  overflow: auto;
+  overflow: hidden;
   border-right: 1px solid var(--hairline);
   background: rgba(238, 238, 238, 0.48);
   backdrop-filter: blur(28px) saturate(150%);
   -webkit-backdrop-filter: blur(28px) saturate(150%);
+}
+
+.source-list {
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+}
+
+.settings-link {
+  flex: none;
+  margin-top: 10px;
+  border-top: 1px solid var(--hairline);
+  border-radius: 0 0 6px 6px;
+  padding-top: 10px;
 }
 
 .section-heading {

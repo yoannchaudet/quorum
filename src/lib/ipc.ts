@@ -3,6 +3,8 @@ import type { CreateWorkItemRequest } from '../../src-tauri/bindings/CreateWorkI
 import type { RegisterRepositoryRequest } from '../../src-tauri/bindings/RegisterRepositoryRequest';
 import type { RepositoryDto } from '../../src-tauri/bindings/RepositoryDto';
 import type { WorkItemDto } from '../../src-tauri/bindings/WorkItemDto';
+import type { SettingsDto } from '../../src-tauri/bindings/SettingsDto';
+import type { UpdateSettingsRequest } from '../../src-tauri/bindings/UpdateSettingsRequest';
 
 export class IpcError extends Error {
   constructor(
@@ -55,5 +57,9 @@ export const api = {
     command<WorkItemDto[]>('list_work_items', { repositoryId }),
   createWorkItem: (request: CreateWorkItemRequest) =>
     command<WorkItemDto>('create_work_item', { request }),
-  getWorkItem: (workItemId: string) => command<WorkItemDto>('get_work_item', { workItemId })
+  getWorkItem: (workItemId: string) => command<WorkItemDto>('get_work_item', { workItemId }),
+  getSettings: () => command<SettingsDto>('get_settings'),
+  updateSettings: (request: UpdateSettingsRequest) =>
+    command<SettingsDto>('update_settings', { request }),
+  listCopilotModels: () => command<string[]>('list_copilot_models')
 };

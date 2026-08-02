@@ -4,6 +4,7 @@
   import { onMount } from 'svelte';
   import { api, IpcError } from './lib/ipc';
   import { renderMarkdown } from './lib/markdown';
+  import SettingsView from './SettingsView.svelte';
   import type { RepositoryDto } from '../src-tauri/bindings/RepositoryDto';
   import type { WorkItemDto } from '../src-tauri/bindings/WorkItemDto';
 
@@ -20,6 +21,7 @@
   let manualPath = '';
   let title = '';
   let markdownBody = '';
+  let view: 'workspace' | 'settings' = 'workspace';
 
   const message = (cause: unknown) =>
     cause instanceof IpcError ? `${cause.message}${cause.recovery ? ` ${cause.recovery}` : ''}` : 'An unexpected error occurred.';
@@ -44,6 +46,7 @@
   }
 
   async function selectRepository(repository: RepositoryDto) {
+    view = 'workspace';
     selectedRepository = repository;
     selectedWorkItem = null;
     workItems = [];
@@ -127,21 +130,27 @@
 <main aria-label="Quorum workspace">
   <header data-tauri-drag-region class="titlebar"><span>Quorum</span></header>
   <aside aria-label="Sources">
-    <div class="section-heading"><span>Repositories</span><button aria-label="Add repository" title="Add repository" on:click={() => (showAddRepository = true)}>+</button></div>
-    {#if loading}<p class="muted">Loading…</p>{/if}
-    {#each repositories as repository (repository.id)}
-      <button class:selected={selectedRepository?.id === repository.id} class="source-row" on:click={() => selectRepository(repository)}>{repository.displayName}</button>
-    {/each}
-    {#if !loading && repositories.length === 0}<p class="muted">No repositories</p>{/if}
-    {#if selectedRepository}
-      <div class="section-heading work-heading"><span>Work Items</span><button aria-label="New work item" title="New work item" on:click={() => (showNewWorkItem = true)}>+</button></div>
-      {#each workItems as item (item.id)}
-        <button class:selected={selectedWorkItem?.id === item.id} class="source-row work-item" on:click={() => (selectedWorkItem = item)}>{item.title}</button>
+    <div class="source-list">
+      <div class="section-heading"><span>Repositories</span><button aria-label="Add repository" title="Add repository" on:click={() => (showAddRepository = true)}>+</button></div>
+      {#if loading}<p class="muted">Loading…</p>{/if}
+      {#each repositories as repository (repository.id)}
+        <button class:selected={view === 'workspace' && selectedRepository?.id === repository.id} class="source-row" on:click={() => selectRepository(repository)}>{repository.displayName}</button>
       {/each}
-      {#if workItems.length === 0}<p class="muted">No work items</p>{/if}
-    {/if}
+      {#if !loading && repositories.length === 0}<p class="muted">No repositories</p>{/if}
+      {#if selectedRepository}
+        <div class="section-heading work-heading"><span>Work Items</span><button aria-label="New work item" title="New work item" on:click={() => (showNewWorkItem = true)}>+</button></div>
+        {#each workItems as item (item.id)}
+          <button class:selected={view === 'workspace' && selectedWorkItem?.id === item.id} class="source-row work-item" on:click={() => { view = 'workspace'; selectedWorkItem = item; }}>{item.title}</button>
+        {/each}
+        {#if workItems.length === 0}<p class="muted">No work items</p>{/if}
+      {/if}
+    </div>
+    <button class:selected={view === 'settings'} class="source-row settings-link" on:click={() => (view = 'settings')}>Settings</button>
   </aside>
   <section class="detail" aria-live="polite">
+    {#if view === 'settings'}
+      <SettingsView />
+    {:else}
     {#if error}<div role="alert" class="error"><span>{error}</span><button on:click={reloadRepositories}>Retry</button></div>{/if}
     {#if selectedWorkItem}
       <div class="toolbar"><span>{selectedRepository?.displayName}</span><button on:click={() => (showArchiveConfirmation = true)}>Archive repository</button></div>
@@ -153,6 +162,7 @@
       <div class="empty startup-error" role="alert"><h1>Quorum can’t open its data</h1><p>{error}</p><p>Your data has not been changed. Restore access to Quorum’s application data, then retry.</p></div>
     {:else}
       <div class="empty"><h1>Welcome to Quorum</h1><p>Add a local Git repository to keep its work items organized.</p><button class="primary" on:click={() => (showAddRepository = true)}>Add Repository</button></div>
+    {/if}
     {/if}
   </section>
 </main>
