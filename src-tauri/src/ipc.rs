@@ -18,8 +18,8 @@ use crate::settings::{
 };
 use crate::state::AppStore;
 use crate::terminal::{
-    LaunchTerminalHandoffRequest, ResumeTerminalHandoffRequest, TerminalHandoffService,
-    TerminalLauncher,
+    LaunchTerminalHandoffRequest, OpenCopilotSessionRequest, ResumeTerminalHandoffRequest,
+    TerminalHandoffService, TerminalLauncher,
 };
 use crate::StartupState;
 
@@ -240,6 +240,20 @@ pub async fn open_planning_terminal(
 }
 
 #[tauri::command(rename_all = "camelCase")]
+pub async fn open_copilot_session(
+    state: State<'_, StartupState>,
+    request: OpenCopilotSessionRequest,
+) -> Result<(), AppError> {
+    blocking(state.store()?, move |store| {
+        let executor = SystemPlanningExecutor::default();
+        let launcher = TerminalLauncher::new(SystemProcessRunner);
+        TerminalHandoffService::with_dependencies(&store, &launcher, &executor)
+            .open_session(&request)
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "camelCase")]
 pub async fn reconcile_planning_terminal(
     state: State<'_, StartupState>,
     request: ResumeTerminalHandoffRequest,
@@ -329,7 +343,9 @@ mod bindings_tests {
         RegisterRepositoryRequest, RepositoryDto, WorkItemDto,
     };
     use crate::settings::{SettingsDto, UpdateSettingsRequest};
-    use crate::terminal::{LaunchTerminalHandoffRequest, ResumeTerminalHandoffRequest};
+    use crate::terminal::{
+        LaunchTerminalHandoffRequest, OpenCopilotSessionRequest, ResumeTerminalHandoffRequest,
+    };
 
     #[test]
     #[allow(clippy::too_many_lines)]
@@ -402,6 +418,10 @@ mod bindings_tests {
         assert_binding(
             &bindings.join("LaunchTerminalHandoffRequest.ts"),
             &LaunchTerminalHandoffRequest::export_to_string().expect("terminal launch binding"),
+        );
+        assert_binding(
+            &bindings.join("OpenCopilotSessionRequest.ts"),
+            &OpenCopilotSessionRequest::export_to_string().expect("open session binding"),
         );
         assert_binding(
             &bindings.join("ResumeTerminalHandoffRequest.ts"),

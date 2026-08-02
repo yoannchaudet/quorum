@@ -1,5 +1,6 @@
 <script lang="ts">
   import { openUrl } from '@tauri-apps/plugin-opener';
+  import { writeText } from '@tauri-apps/plugin-clipboard-manager';
   import { onMount } from 'svelte';
   import { api, IpcError } from './lib/ipc';
   import { renderMarkdown } from './lib/markdown';
@@ -21,6 +22,7 @@
   let planDraft = '';
   let planMode: 'preview' | 'edit' = 'preview';
   let planDirty = false;
+  let copiedSessionId = '';
 
   const activeStatuses = new Set([
     'pending',
@@ -148,6 +150,34 @@
         idempotencyKey: identifier()
       })
     );
+  }
+
+  async function openAgentSession(agent: PlanningAgentDto) {
+    busyAction = `session-${agent.id}`;
+    error = '';
+    try {
+      await api.openCopilotSession({
+        workItemId: workItem.id,
+        planningAgentId: agent.id
+      });
+    } catch (cause) {
+      error =
+        cause instanceof IpcError
+          ? `${cause.message}${cause.recovery ? ` ${cause.recovery}` : ''}`
+          : 'Quorum could not open this Copilot session in the terminal.';
+    } finally {
+      busyAction = '';
+    }
+  }
+
+  async function copySession(agent: PlanningAgentDto) {
+    error = '';
+    try {
+      await writeText(agent.sessionName);
+      copiedSessionId = agent.id;
+    } catch {
+      error = 'Quorum could not copy this Copilot session name.';
+    }
   }
 
   async function reconcileTerminal() {
@@ -338,7 +368,31 @@
               <span class={`status-pill ${agent.status}`}>{label(agent.status)}</span>
             </div>
             <p>{agent.modelId}</p>
-            <code title="Named Copilot session">{agent.sessionName}</code>
+            <div class="agent-actions">
+              <button
+                class="icon-button"
+                title={copiedSessionId === agent.id ? 'Session name copied' : 'Copy session name'}
+                aria-label={`Copy ${agentName(agent)} session name`}
+                disabled={busyAction !== ''}
+                on:click={() => copySession(agent)}
+              >
+                {#if copiedSessionId === agent.id}
+                  <span aria-hidden="true">✓</span>
+                {:else}
+                  <svg aria-hidden="true" viewBox="0 0 16 16">
+                    <rect x="5" y="5" width="8" height="8" rx="1"></rect>
+                    <path d="M3 11H2.5A1.5 1.5 0 0 1 1 9.5v-7A1.5 1.5 0 0 1 2.5 1h7A1.5 1.5 0 0 1 11 2.5V3"></path>
+                  </svg>
+                {/if}
+              </button>
+              <button
+                aria-label={`Open ${agentName(agent)} in Terminal`}
+                disabled={busyAction !== ''}
+                on:click={() => openAgentSession(agent)}
+              >
+                {busyAction === `session-${agent.id}` ? 'Opening…' : 'Open in Terminal'}
+              </button>
+            </div>
             {#if agent.errorMessage}
               <div class="agent-error">
                 <span>{agent.errorMessage}</span>
@@ -697,16 +751,44 @@
     gap: 10px;
   }
 
-  .agent-card p,
-  .agent-card code {
+  .agent-card p {
     display: block;
     margin: 7px 0 0;
     color: var(--secondary);
     font-size: 11px;
   }
 
-  .agent-card code {
-    overflow-wrap: anywhere;
+  .agent-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 10px;
+  }
+
+  .agent-actions button {
+    padding: 5px 8px;
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    background: white;
+    font-size: 11px;
+  }
+
+  .agent-actions .icon-button {
+    display: grid;
+    width: 28px;
+    height: 28px;
+    padding: 5px;
+    place-items: center;
+  }
+
+  .icon-button svg {
+    width: 14px;
+    height: 14px;
+    fill: none;
+    stroke: currentColor;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    stroke-width: 1.4;
   }
 
   .status-pill {

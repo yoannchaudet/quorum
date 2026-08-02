@@ -11,6 +11,7 @@ import type { StartPlanningRequest } from '../../src-tauri/bindings/StartPlannin
 import type { SubmitPlanningAnswersRequest } from '../../src-tauri/bindings/SubmitPlanningAnswersRequest';
 import type { RetryPlanningRequest } from '../../src-tauri/bindings/RetryPlanningRequest';
 import type { LaunchTerminalHandoffRequest } from '../../src-tauri/bindings/LaunchTerminalHandoffRequest';
+import type { OpenCopilotSessionRequest } from '../../src-tauri/bindings/OpenCopilotSessionRequest';
 import type { ResumeTerminalHandoffRequest } from '../../src-tauri/bindings/ResumeTerminalHandoffRequest';
 import type { UpdateSynthesizedPlanRequest } from '../../src-tauri/bindings/UpdateSynthesizedPlanRequest';
 import type { PlanApprovalRequest } from '../../src-tauri/bindings/PlanApprovalRequest';
@@ -28,6 +29,7 @@ export type {
   IntakeGithubIssueRequest,
   IntakeLocalMarkdownRequest,
   LaunchTerminalHandoffRequest,
+  OpenCopilotSessionRequest,
   PlanApprovalRequest,
   PlanRevisionDto,
   PlanningAgentDto,
@@ -119,6 +121,8 @@ export const api = {
     command<PlanningDetailDto>('retry_planning_agent', { request }),
   openPlanningTerminal: (request: LaunchTerminalHandoffRequest) =>
     command<PlanningDetailDto>('open_planning_terminal', { request }),
+  openCopilotSession: (request: OpenCopilotSessionRequest) =>
+    command<void>('open_copilot_session', { request }),
   reconcilePlanningTerminal: (request: ResumeTerminalHandoffRequest) =>
     command<PlanningDetailDto>('reconcile_planning_terminal', { request }),
   updateSynthesizedPlan: (request: UpdateSynthesizedPlanRequest) =>

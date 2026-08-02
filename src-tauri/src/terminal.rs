@@ -27,6 +27,22 @@ pub trait TerminalOpener: Send + Sync {
         repository_path: &str,
         session_name: &str,
     ) -> Result<TerminalLaunchOutcome, AppError>;
+
+    fn open_session(
+        &self,
+        terminal_application: &str,
+        terminal_arguments: &str,
+        repository_path: &str,
+        session_name: &str,
+    ) -> Result<(), AppError> {
+        self.open(
+            terminal_application,
+            terminal_arguments,
+            repository_path,
+            session_name,
+        )
+        .map(|_| ())
+    }
 }
 
 pub struct TerminalLauncher<R> {
@@ -77,6 +93,51 @@ impl<R: ProcessRunner> TerminalOpener for TerminalLauncher<R> {
             Err(launcher_failure(&output))
         }
     }
+
+    fn open_session(
+        &self,
+        terminal_application: &str,
+        terminal_arguments: &str,
+        repository_path: &str,
+        session_name: &str,
+    ) -> Result<(), AppError> {
+        let mut arguments = expand_terminal_arguments(
+            terminal_arguments,
+            terminal_application,
+            repository_path,
+            session_name,
+        )?;
+        let open_argument_count = arguments
+            .iter()
+            .position(|argument| argument == "--args")
+            .unwrap_or(arguments.len());
+        arguments = arguments
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, argument)| {
+                if index < open_argument_count && matches!(argument.as_str(), "-W" | "--wait-apps")
+                {
+                    None
+                } else {
+                    Some(argument)
+                }
+            })
+            .collect();
+        for safety_argument in PLANNING_SAFETY_ARGUMENTS {
+            if !arguments.iter().any(|argument| argument == safety_argument) {
+                arguments.push(safety_argument.to_owned());
+            }
+        }
+        let output = self
+            .runner
+            .run("/usr/bin/open", &arguments)
+            .map_err(|error| launcher_start_error(&error))?;
+        if output.success {
+            Ok(())
+        } else {
+            Err(launcher_failure(&output))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -86,6 +147,14 @@ pub struct LaunchTerminalHandoffRequest {
     pub work_item_id: String,
     pub planning_agent_id: String,
     pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct OpenCopilotSessionRequest {
+    pub work_item_id: String,
+    pub planning_agent_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -129,6 +198,24 @@ impl<'a, L: TerminalOpener, E: PlanningExecutor> TerminalHandoffService<'a, L, E
             launcher,
             planning: PlanningService::with_executor(store, executor),
         }
+    }
+
+    pub fn open_session(&self, request: &OpenCopilotSessionRequest) -> Result<(), AppError> {
+        let work_item_id = required(&request.work_item_id, "A work item ID is required.")?;
+        let planning_agent_id = required(
+            &request.planning_agent_id,
+            "A planning agent ID is required.",
+        )?;
+        let target = self.store.with_connection(|connection| {
+            let transaction = connection.unchecked_transaction()?;
+            load_target(&transaction, &work_item_id, &planning_agent_id)
+        })?;
+        self.launcher.open_session(
+            &target.terminal_application,
+            &target.terminal_arguments,
+            &target.repository_path,
+            &target.session_name,
+        )
     }
 
     pub fn launch(
@@ -608,8 +695,8 @@ mod tests {
     use tempfile::{tempdir, TempDir};
 
     use super::{
-        LaunchTerminalHandoffRequest, ResumeTerminalHandoffRequest, TerminalHandoffService,
-        TerminalLaunchOutcome, TerminalLauncher, TerminalOpener,
+        LaunchTerminalHandoffRequest, OpenCopilotSessionRequest, ResumeTerminalHandoffRequest,
+        TerminalHandoffService, TerminalLaunchOutcome, TerminalLauncher, TerminalOpener,
     };
     use crate::copilot::{
         AgentEnvelope, AgentOutcome, AgentSession, CompletedPlannerArtifact, CopilotEvent,
@@ -691,6 +778,26 @@ mod tests {
         )
         .expect("launch");
         assert!(!outcome.completion_observed);
+    }
+
+    #[test]
+    fn opens_an_existing_session_without_waiting_for_terminal_completion() {
+        let runner = CapturingRunner {
+            call: Mutex::new(None),
+        };
+        TerminalOpener::open_session(
+            &TerminalLauncher::new(&runner),
+            "Ghostty.app",
+            "-W -na {terminalApplication} --args -e copilot -C {repositoryPath} --resume={sessionName}",
+            "/Users/example/repository",
+            "quorum-session",
+        )
+        .expect("open session");
+        let (_, arguments) = runner.call.lock().expect("call").clone().expect("captured");
+        assert!(!arguments.iter().any(|argument| argument == "-W"));
+        assert!(arguments
+            .iter()
+            .any(|argument| argument == "--resume=quorum-session"));
     }
 
     struct FakeOpener {
@@ -889,6 +996,36 @@ mod tests {
             planning_agent_id: AGENT_ID.to_owned(),
             idempotency_key: key.to_owned(),
         }
+    }
+
+    #[test]
+    fn opens_an_owned_completed_agent_without_creating_a_recovery_handoff() {
+        let harness = harness();
+        let opener = FakeOpener::new(vec![Ok(TerminalLaunchOutcome {
+            completion_observed: false,
+        })]);
+        let executor = FakePlanningExecutor::new(Vec::new());
+        let service = TerminalHandoffService::with_dependencies(&harness.store, &opener, &executor);
+
+        service
+            .open_session(&OpenCopilotSessionRequest {
+                work_item_id: WORK_ITEM_ID.to_owned(),
+                planning_agent_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            })
+            .expect("open completed planner");
+
+        assert_eq!(opener.calls.lock().expect("calls").len(), 1);
+        let handoffs: i64 = harness
+            .store
+            .with_connection(|connection| {
+                connection
+                    .query_row("SELECT count(*) FROM terminal_handoffs", [], |row| {
+                        row.get(0)
+                    })
+                    .map_err(Into::into)
+            })
+            .expect("handoff count");
+        assert_eq!(handoffs, 0);
     }
 
     #[test]

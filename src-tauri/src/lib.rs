@@ -26,6 +26,7 @@ impl StartupState {
 pub fn run() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let store = app
@@ -59,6 +60,7 @@ pub fn run() {
             ipc::submit_planning_answers,
             ipc::retry_planning_agent,
             ipc::open_planning_terminal,
+            ipc::open_copilot_session,
             ipc::reconcile_planning_terminal,
             ipc::update_synthesized_plan,
             ipc::approve_plan,

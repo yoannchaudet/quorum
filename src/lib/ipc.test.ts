@@ -103,6 +103,10 @@ describe('IPC error normalization', () => {
       planningAgentId: 'agent',
       idempotencyKey: 'terminal-key'
     });
+    await api.openCopilotSession({
+      workItemId: 'work',
+      planningAgentId: 'agent'
+    });
     await api.reconcilePlanningTerminal({
       workItemId: 'work',
       terminalHandoffId: 'handoff'
@@ -184,6 +188,15 @@ describe('IPC error normalization', () => {
             workItemId: 'work',
             planningAgentId: 'agent',
             idempotencyKey: 'terminal-key'
+          }
+        }
+      ],
+      [
+        'open_copilot_session',
+        {
+          request: {
+            workItemId: 'work',
+            planningAgentId: 'agent'
           }
         }
       ],

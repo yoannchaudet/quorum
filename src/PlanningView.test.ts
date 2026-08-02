@@ -10,14 +10,17 @@ const mocks = vi.hoisted(() => ({
   retryPlanningAgent: vi.fn(),
   openPlanningTerminal: vi.fn(),
   reconcilePlanningTerminal: vi.fn(),
+  openCopilotSession: vi.fn(),
   updateSynthesizedPlan: vi.fn(),
   approvePlan: vi.fn(),
   rejectPlan: vi.fn(),
   enqueuePlan: vi.fn(),
-  openUrl: vi.fn()
+  openUrl: vi.fn(),
+  writeText: vi.fn()
 }));
 
 vi.mock('@tauri-apps/plugin-opener', () => ({ openUrl: mocks.openUrl }));
+vi.mock('@tauri-apps/plugin-clipboard-manager', () => ({ writeText: mocks.writeText }));
 vi.mock('./lib/ipc', () => ({
   IpcError: class IpcError extends Error {
     constructor(
@@ -212,7 +215,7 @@ describe('planning work item UX', () => {
 
     expect(await screen.findByLabelText('Current phase Planning')).toHaveTextContent('Failed');
     expect(screen.getByText('Planner 1')).toBeInTheDocument();
-    expect(screen.getByText('quorum-work-planner-1')).toBeInTheDocument();
+    expect(screen.queryByText('quorum-work-planner-1')).not.toBeInTheDocument();
     expect(screen.getByText('Combining planner recommendations')).toBeInTheDocument();
     expect(screen.getByText('Copilot authentication expired.')).toBeInTheDocument();
 
@@ -224,6 +227,23 @@ describe('planning work item UX', () => {
         expectedRunUpdatedAt: 'run-version'
       })
     );
+  });
+
+  it('copies and opens each named agent session without displaying the identifier', async () => {
+    mocks.getPlanning.mockResolvedValue(detail());
+    mocks.writeText.mockResolvedValue(undefined);
+    mocks.openCopilotSession.mockResolvedValue(undefined);
+    render(PlanningView, { workItem });
+
+    await screen.findByText('Planner 1');
+    await fireEvent.click(screen.getByRole('button', { name: 'Copy Planner 1 session name' }));
+    expect(mocks.writeText).toHaveBeenCalledWith('quorum-work-planner-1');
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Open Planner 1 in Terminal' }));
+    expect(mocks.openCopilotSession).toHaveBeenCalledWith({
+      workItemId: 'work',
+      planningAgentId: 'planner'
+    });
   });
 
   it('surfaces pending and answered questions with in-app answer and exact-agent terminal handoff', async () => {
