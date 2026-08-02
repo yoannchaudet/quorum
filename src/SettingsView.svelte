@@ -143,8 +143,7 @@
               class="remove"
               aria-label={`Remove planner ${index + 1}`}
               disabled={planningModels.length === 1}
-              on:click={() => removePlanner(index)}>Remove</button
-            >
+              on:click={() => removePlanner(index)}>Remove</button>
           </div>
         {/each}
         <button class="add" disabled={planningModels.length === 3} on:click={addPlanner}>Add planner</button>
