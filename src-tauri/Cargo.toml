@@ -21,6 +21,8 @@ tauri-build = { version = "=2.6.3", features = [] }
 chrono = { version = "=0.4.41", default-features = false, features = ["clock", "serde"] }
 rusqlite = { version = "=0.35.0", features = ["bundled"] }
 serde = { version = "=1.0.219", features = ["derive"] }
+serde_json = "=1.0.140"
+shell-words = "=1.1.0"
 tauri = { version = "=2.6.2", features = ["macos-private-api"] }
 tauri-plugin-dialog = "=2.2.1"
 tauri-plugin-opener = "=2.2.7"
