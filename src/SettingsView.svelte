@@ -7,6 +7,8 @@
   let planningModels: string[] = [];
   let implementationModel = '';
   let adversaryModel = '';
+  let terminalApplication = '';
+  let terminalArguments = '';
   let availableModels: string[] = [];
   let loading = true;
   let saving = false;
@@ -28,6 +30,8 @@
       planningModels = [...settings.planningModels];
       implementationModel = settings.implementationModel;
       adversaryModel = settings.adversaryModel;
+      terminalApplication = settings.terminalApplication;
+      terminalArguments = settings.terminalArguments;
     } catch (cause) {
       error = message(cause);
     } finally {
@@ -52,11 +56,15 @@
       const settings = await api.updateSettings({
         planningModels: planningModels.map((model) => model.trim()),
         implementationModel: implementationModel.trim(),
-        adversaryModel: adversaryModel.trim()
+        adversaryModel: adversaryModel.trim(),
+        terminalApplication: terminalApplication.trim(),
+        terminalArguments: terminalArguments.trim()
       });
       planningModels = [...settings.planningModels];
       implementationModel = settings.implementationModel;
       adversaryModel = settings.adversaryModel;
+      terminalApplication = settings.terminalApplication;
+      terminalArguments = settings.terminalArguments;
       saved = true;
     } catch (cause) {
       error = message(cause);
@@ -79,17 +87,21 @@
   }
 
   function removePlanner(index: number) {
-    if (planningModels.length > 1) {
+    if (planningModels.length > 2) {
       planningModels = planningModels.filter((_, modelIndex) => modelIndex !== index);
     }
   }
 
   const valid = () =>
-    planningModels.length >= 1 &&
+    planningModels.length >= 2 &&
     planningModels.length <= 3 &&
     planningModels.every((model) => model.trim() !== '') &&
     implementationModel.trim() !== '' &&
-    adversaryModel.trim() !== '';
+    adversaryModel.trim() !== '' &&
+    terminalApplication.trim() !== '' &&
+    terminalArguments.includes('{terminalApplication}') &&
+    terminalArguments.includes('{repositoryPath}') &&
+    terminalArguments.includes('{sessionName}');
 
   onMount(() => {
     void loadSettings();
@@ -118,6 +130,25 @@
       </div>
     </section>
 
+    <section aria-labelledby="terminal-heading">
+      <h2 id="terminal-heading">Interactive terminal</h2>
+      <p class="description">
+        Quorum opens the named Copilot session that asked a planning question.
+      </p>
+      <div class="model-row single">
+        <label for="terminal-application">Terminal application</label>
+        <input id="terminal-application" bind:value={terminalApplication} />
+      </div>
+      <div class="model-row single">
+        <label for="terminal-arguments">Launch arguments</label>
+        <input id="terminal-arguments" bind:value={terminalArguments} />
+      </div>
+      <p class="description">
+        Required placeholders: <code>{'{terminalApplication}'}</code>,
+        <code>{'{repositoryPath}'}</code>, and <code>{'{sessionName}'}</code>.
+      </p>
+    </section>
+
     <section aria-labelledby="models-heading">
       <h2 id="models-heading">Copilot models</h2>
       <p class="description">Discovered models are suggestions. Custom model identifiers are also accepted.</p>
@@ -134,7 +165,7 @@
 
       <fieldset>
         <legend>Planning models</legend>
-        <p class="description">Quorum can ask one to three independent planners.</p>
+        <p class="description">Quorum asks two or three independent planners.</p>
         {#each planningModels as _, index (index)}
           <div class="model-row">
             <label for={`planner-${index}`}>Planner {index + 1}</label>
@@ -142,7 +173,7 @@
             <button
               class="remove"
               aria-label={`Remove planner ${index + 1}`}
-              disabled={planningModels.length === 1}
+              disabled={planningModels.length === 2}
               on:click={() => removePlanner(index)}>Remove</button>
           </div>
         {/each}

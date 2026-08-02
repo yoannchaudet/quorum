@@ -70,14 +70,20 @@ describe('Quorum shell', () => {
       databasePath: '/Users/me/Library/Application Support/quorum/quorum.sqlite3',
       planningModels: ['gpt-5.6-sol', 'claude-opus-5'],
       implementationModel: 'gpt-5.6-sol',
-      adversaryModel: 'claude-opus-5'
+      adversaryModel: 'claude-opus-5',
+      terminalApplication: 'Ghostty.app',
+      terminalArguments:
+        '-W -na {terminalApplication} --args -e copilot -C {repositoryPath} --resume={sessionName}'
     });
     mocks.listCopilotModels.mockResolvedValue(['gpt-5.6-sol', 'claude-opus-5']);
     mocks.updateSettings.mockResolvedValue({
       databasePath: '/Users/me/Library/Application Support/quorum/quorum.sqlite3',
       planningModels: ['gpt-5.6-sol', 'claude-opus-5', 'custom-planner'],
       implementationModel: 'gpt-5.6-sol',
-      adversaryModel: 'claude-opus-5'
+      adversaryModel: 'claude-opus-5',
+      terminalApplication: 'Ghostty.app',
+      terminalArguments:
+        '-W -na {terminalApplication} --args -e copilot -C {repositoryPath} --resume={sessionName}'
     });
     render(App);
 
@@ -91,6 +97,8 @@ describe('Quorum shell', () => {
     expect(mocks.revealItemInDir).toHaveBeenCalledWith(
       '/Users/me/Library/Application Support/quorum/quorum.sqlite3'
     );
+    expect(screen.getByRole('button', { name: 'Remove planner 1' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Remove planner 2' })).toBeDisabled();
 
     await fireEvent.click(screen.getByRole('button', { name: 'Add planner' }));
     await fireEvent.input(screen.getByLabelText('Planner 3'), {
@@ -102,7 +110,10 @@ describe('Quorum shell', () => {
       expect(mocks.updateSettings).toHaveBeenCalledWith({
         planningModels: ['gpt-5.6-sol', 'claude-opus-5', 'custom-planner'],
         implementationModel: 'gpt-5.6-sol',
-        adversaryModel: 'claude-opus-5'
+        adversaryModel: 'claude-opus-5',
+        terminalApplication: 'Ghostty.app',
+        terminalArguments:
+          '-W -na {terminalApplication} --args -e copilot -C {repositoryPath} --resume={sessionName}'
       })
     );
     expect(screen.getByRole('status')).toHaveTextContent('Settings saved.');

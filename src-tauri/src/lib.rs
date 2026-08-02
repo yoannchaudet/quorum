@@ -1,8 +1,11 @@
+mod copilot;
 mod error;
 mod ipc;
+mod planning;
 mod repository;
 mod settings;
 mod state;
+mod terminal;
 
 use std::sync::Arc;
 
@@ -23,6 +26,7 @@ impl StartupState {
 pub fn run() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let store = app
@@ -44,10 +48,24 @@ pub fn run() {
             ipc::archive_repository,
             ipc::list_work_items,
             ipc::create_work_item,
+            ipc::intake_inline_markdown,
+            ipc::intake_local_markdown,
+            ipc::intake_github_issue,
             ipc::get_work_item,
             ipc::get_settings,
             ipc::update_settings,
-            ipc::list_copilot_models
+            ipc::list_copilot_models,
+            ipc::start_planning,
+            ipc::get_planning,
+            ipc::submit_planning_answers,
+            ipc::retry_planning_agent,
+            ipc::open_planning_terminal,
+            ipc::open_copilot_session,
+            ipc::reconcile_planning_terminal,
+            ipc::update_synthesized_plan,
+            ipc::approve_plan,
+            ipc::reject_plan,
+            ipc::enqueue_plan
         ]);
 
     if let Err(error) = builder.run(tauri::generate_context!()) {

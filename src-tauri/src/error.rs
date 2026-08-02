@@ -55,10 +55,14 @@ impl AppError {
         )
     }
 
-    #[expect(
-        dead_code,
-        reason = "IPC conflict errors are reserved for optimistic state updates."
-    )]
+    pub fn github(message: impl Into<String>) -> Self {
+        Self::new(
+            "external",
+            message,
+            Some("Check that GitHub CLI is installed and authenticated, then try again."),
+        )
+    }
+
     pub fn conflict(message: impl Into<String>) -> Self {
         Self::new("conflict", message, Some("Refresh and try again."))
     }

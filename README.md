@@ -5,48 +5,57 @@
 </p>
 
 Quorum is a lightweight macOS harness for semi-autonomous software work. Built
-on the Copilot CLI, it turns a Markdown request or GitHub issue into a plan,
-implementation, reviewed pull request, and guarded merge.
+on the Copilot CLI, it currently turns a request into a durable, reviewed plan
+that can be queued for later implementation.
 
 ## Status
 
-Quorum is being designed as a minimal Tauri 2 application. The initial roadmap
-is open; no usable app has shipped yet.
+M2 planning and pre-planning are implemented in the Tauri 2 macOS app. Quorum
+accepts inline Markdown, a local Markdown file, or a GitHub issue. M2 stops
+after planning and enqueueing: it does not modify registered repositories or
+execute implementation work.
 
 ## Workflow
 
-A work item can start as text typed in Quorum, a local Markdown file, or a
-GitHub issue:
+A work item follows this planning-only workflow:
 
 ```text
-intake -> multi-agent plan -> questions -> optional plan review
-       -> build -> adversarial review -> pull request
-       -> Copilot review/fix loop -> merge -> notification
+inline Markdown | local Markdown file | GitHub issue
+       -> independent planners -> questions -> synthesis
+       -> review and edit -> optional approval -> enqueue for later
 ```
 
-Reviewed plans can be saved before implementation and queued for unattended
-work. Jobs run sequentially by default, while independent jobs can run in
-parallel in isolated Git worktrees.
+Each planner and the synthesizer has its own UUID-backed, unique named Copilot
+session. Planner outputs remain independent until synthesis. Questions can be
+answered in the app or handed off to the exact agent session in a configurable
+terminal.
+
+Terminal handoff defaults to Ghostty and configurable launch arguments using
+the required `{terminalApplication}`, `{repositoryPath}`, and `{sessionName}`
+placeholders. Quorum reconciles automatically when terminal completion is
+observable and provides manual resume/reconciliation otherwise.
+
+The synthesized plan can be reviewed, edited, and saved as a new revision.
+Plan approval is configurable per work item; when required, approval gates
+enqueueing. Enqueueing only persists intent for later implementation and does
+not start implementation.
 
 ## Local by design
 
-Quorum manages multiple local repositories but keeps its own durable SQLite
-state outside them. Requirements, plans, answers, run history, and queue state
-are not committed to target repositories. The app uses the user's existing
-Copilot and GitHub CLI sessions.
+Quorum manages multiple local repositories but keeps its durable SQLite state
+outside them. Intake, agent sessions, questions and answers, plan revisions,
+terminal handoffs, run history, approvals, and queue intent survive app
+restarts without being committed to target repositories. The app uses the
+user's existing Copilot and GitHub CLI sessions.
 
-Automation stops instead of bypassing repository protections: required checks
-must pass, Copilot comments must be resolved, and remediation is limited to
-three rounds. Blocked work remains inspectable and resumable.
-
-## MVP architecture
+## M2 architecture
 
 - Tauri 2 macOS app with a Svelte/TypeScript interface
 - Rust orchestration and typed IPC
 - SQLite state in the application data directory
-- Copilot CLI for planning, building, and review
-- GitHub CLI for issue, pull request, check, review, and merge operations
-- Native macOS completion and blocked-work notifications
+- Copilot CLI for independent planning and synthesis sessions
+- GitHub CLI for GitHub issue intake
+- Configurable terminal handoff for interactive Copilot sessions
 
 ## Roadmap
 
@@ -60,7 +69,7 @@ three rounds. Blocked work remains inspectable and resumable.
 
 ## Development
 
-Quorum M1 supports macOS 14 Sonoma or later. Install a current Node.js LTS,
+Quorum supports macOS 14 Sonoma or later. Install a current Node.js LTS,
 the Rust stable toolchain (including `rustfmt` and `clippy`), Xcode Command Line
 Tools, and Git. The app validates registered folders with your local `git`
 executable.
