@@ -97,15 +97,18 @@ describe('new work item intake', () => {
     render(NewWorkItemDialog, { repository, onCreated: vi.fn(), onClose: vi.fn() });
 
     await fireEvent.click(screen.getByLabelText('GitHub issue'));
+    const create = screen.getByRole('button', { name: 'Create Work Item' });
+    expect(create).toBeDisabled();
     await fireEvent.input(screen.getByLabelText('GitHub issue URL or owner/repo#number'), {
-      target: { value: 'owner/repo#42' }
+      target: { value: 'https://github.com/owner/repo/issues/42' }
     });
-    await fireEvent.click(screen.getByRole('button', { name: 'Create Work Item' }));
+    expect(create).toBeEnabled();
+    await fireEvent.click(create);
 
     await waitFor(() =>
       expect(mocks.github).toHaveBeenCalledWith({
         repositoryId: 'repository',
-        reference: 'owner/repo#42',
+        reference: 'https://github.com/owner/repo/issues/42',
         requirePlanApproval: true
       })
     );

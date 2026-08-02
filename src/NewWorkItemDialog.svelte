@@ -15,6 +15,12 @@
   let requirePlanApproval = true;
   let busy = false;
   let error = '';
+  $: canCreate =
+    source === 'inline'
+      ? title.trim() !== '' && markdownBody.trim() !== ''
+      : source === 'file'
+        ? localPath.toLowerCase().endsWith('.md')
+        : githubReference.trim() !== '';
 
   const message = (cause: unknown) =>
     cause instanceof IpcError
@@ -36,14 +42,8 @@
     }
   }
 
-  function valid() {
-    if (source === 'inline') return title.trim() !== '' && markdownBody.trim() !== '';
-    if (source === 'file') return localPath.toLowerCase().endsWith('.md');
-    return githubReference.trim() !== '';
-  }
-
   async function create() {
-    if (!valid()) return;
+    if (!canCreate) return;
     busy = true;
     error = '';
     try {
@@ -132,7 +132,7 @@
 
     <div class="dialog-actions">
       <button type="button" class="cancel" disabled={busy} on:click={onClose}>Cancel</button>
-      <button type="button" class="primary" disabled={!valid() || busy} on:click={create}>
+      <button type="button" class="primary" disabled={!canCreate || busy} on:click={create}>
         {busy ? 'Creating…' : 'Create Work Item'}
       </button>
     </div>

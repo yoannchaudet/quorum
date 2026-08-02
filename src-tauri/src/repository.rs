@@ -503,6 +503,8 @@ fn parse_github_issue_reference(reference: &str) -> Result<GithubIssueReference,
     let reference = reference.trim();
     let (owner, repository, number) =
         if let Some(path) = reference.strip_prefix("https://github.com/") {
+            let path = path.split_once('#').map_or(path, |(url, _)| url);
+            let path = path.split_once('?').map_or(path, |(url, _)| url);
             let path = path.trim_end_matches('/');
             let mut parts = path.split('/');
             let parsed = (
@@ -1030,6 +1032,8 @@ mod tests {
             "octo/project#42",
             "https://github.com/octo/project/issues/42",
             " https://github.com/octo/project/issues/42/ ",
+            "https://github.com/octo/project/issues/42?notification_referrer_id=1",
+            "https://github.com/octo/project/issues/42#issuecomment-1",
         ] {
             let parsed = parse_github_issue_reference(reference).expect("valid reference");
             assert_eq!(parsed.owner, "octo");
