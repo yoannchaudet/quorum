@@ -9,7 +9,6 @@ describe('renderMarkdown', () => {
 
     expect(html).toContain('<h1>Heading</h1>');
     expect(html).not.toMatch(/<script|<img|onerror|href="javascript:/i);
-    expect(html).not.toContain('href=');
-    expect(html).toContain('>good</a>');
+    expect(html).toContain('href="https://example.com"');
   });
 });

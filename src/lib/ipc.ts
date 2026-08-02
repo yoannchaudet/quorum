@@ -18,11 +18,23 @@ export class IpcError extends Error {
 type ErrorPayload = { code: string; message: string; recovery?: string | null };
 
 function normalizeError(error: unknown): IpcError {
-  if (typeof error === 'object' && error !== null && 'code' in error && 'message' in error) {
-    const payload = error as ErrorPayload;
+  if (isErrorPayload(error)) {
+    const payload = error;
     return new IpcError(payload.code, payload.message, payload.recovery);
   }
   return new IpcError('unexpected', 'Quorum could not complete that request. Please try again.');
+}
+
+function isErrorPayload(error: unknown): error is ErrorPayload {
+  if (typeof error !== 'object' || error === null) return false;
+  const candidate = error as Record<string, unknown>;
+  return (
+    typeof candidate.code === 'string' &&
+    typeof candidate.message === 'string' &&
+    (candidate.recovery === undefined ||
+      candidate.recovery === null ||
+      typeof candidate.recovery === 'string')
+  );
 }
 
 async function command<T>(name: string, args?: Record<string, unknown>): Promise<T> {

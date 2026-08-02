@@ -1,5 +1,6 @@
 <script lang="ts">
   import { open } from '@tauri-apps/plugin-dialog';
+  import { openUrl } from '@tauri-apps/plugin-opener';
   import { onMount } from 'svelte';
   import { api, IpcError } from './lib/ipc';
   import { renderMarkdown } from './lib/markdown';
@@ -101,6 +102,23 @@
     }
   }
 
+  function externalMarkdownLinks(node: HTMLElement) {
+    const handleClick = (event: MouseEvent) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const link = target.closest<HTMLAnchorElement>('a[href]');
+      if (!link) return;
+      event.preventDefault();
+      void openUrl(link.href).catch((cause) => {
+        error = message(cause);
+      });
+    };
+    node.addEventListener('click', handleClick);
+    return {
+      destroy: () => node.removeEventListener('click', handleClick)
+    };
+  }
+
   onMount(reloadRepositories);
 </script>
 
@@ -124,15 +142,15 @@
     {/if}
   </aside>
   <section class="detail" aria-live="polite">
-    {#if error}<div role="alert" class="error">{error}<button on:click={reloadRepositories}>Retry</button></div>{/if}
+    {#if error}<div role="alert" class="error"><span>{error}</span><button on:click={reloadRepositories}>Retry</button></div>{/if}
     {#if selectedWorkItem}
       <div class="toolbar"><span>{selectedRepository?.displayName}</span><button on:click={() => (showArchiveConfirmation = true)}>Archive repository</button></div>
-      <article><h1>{selectedWorkItem.title}</h1><div class="markdown">{@html renderMarkdown(selectedWorkItem.markdownBody)}</div></article>
+      <article><h1>{selectedWorkItem.title}</h1><div class="markdown" use:externalMarkdownLinks>{@html renderMarkdown(selectedWorkItem.markdownBody)}</div></article>
     {:else if selectedRepository}
       <div class="toolbar"><span>{selectedRepository.displayName}</span><button on:click={() => (showNewWorkItem = true)}>New Work Item</button><button on:click={() => (showArchiveConfirmation = true)}>Archive</button></div>
       <div class="empty"><h1>No work selected</h1><p>Create an inline Markdown work item to begin.</p><button class="primary" on:click={() => (showNewWorkItem = true)}>New Work Item</button></div>
     {:else if startupError}
-      <div class="empty startup-error" role="alert"><h1>Quorum can’t open its data</h1><p>{error}</p><p>Your data has not been changed. Restore access to Quorum’s application data, then relaunch the app.</p></div>
+      <div class="empty startup-error" role="alert"><h1>Quorum can’t open its data</h1><p>{error}</p><p>Your data has not been changed. Restore access to Quorum’s application data, then retry.</p></div>
     {:else}
       <div class="empty"><h1>Welcome to Quorum</h1><p>Add a local Git repository to keep its work items organized.</p><button class="primary" on:click={() => (showAddRepository = true)}>Add Repository</button></div>
     {/if}

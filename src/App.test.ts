@@ -5,6 +5,7 @@ import App from './App.svelte';
 const mocks = vi.hoisted(() => ({ listRepositories: vi.fn() }));
 
 vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn() }));
+vi.mock('@tauri-apps/plugin-opener', () => ({ openUrl: vi.fn() }));
 vi.mock('./lib/ipc', () => ({
   IpcError: class IpcError extends Error {},
   api: {
