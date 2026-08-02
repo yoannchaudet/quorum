@@ -1,5 +1,9 @@
 # Quorum
 
+<p align="center">
+  <img src="src-tauri/icons/icon.svg" alt="Quorum logo" width="180">
+</p>
+
 Quorum is a lightweight macOS harness for semi-autonomous software work. Built
 on the Copilot CLI, it turns a Markdown request or GitHub issue into a plan,
 implementation, reviewed pull request, and guarded merge.
