@@ -667,6 +667,13 @@
     font-size: 12px;
   }
 
+  .plan-actions button.primary,
+  .enqueue-card button.primary {
+    border-color: transparent;
+    color: white;
+    background: var(--accent);
+  }
+
   .planning-header {
     display: flex;
     align-items: flex-start;

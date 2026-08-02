@@ -450,7 +450,11 @@ describe('planning work item UX', () => {
     render(PlanningView, { workItem });
 
     expect(await screen.findByText(/Approval Pending/)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Enqueue' })).toBeDisabled();
+    const approveButton = screen.getByRole('button', { name: 'Approve Plan' });
+    const enqueueButton = screen.getByRole('button', { name: 'Enqueue' });
+    expect(approveButton).toHaveClass('primary');
+    expect(enqueueButton).toHaveClass('primary');
+    expect(enqueueButton).toBeDisabled();
     await fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
     await fireEvent.input(screen.getByLabelText('Synthesized plan Markdown'), {
       target: { value: '# Revised plan' }
