@@ -35,6 +35,9 @@
       ? `${cause.message}${cause.recovery ? ` ${cause.recovery}` : ''}`
       : 'Quorum could not refresh planning. Please try again.';
 
+  const linkMessage = (cause: unknown) =>
+    `Quorum could not open that link.${cause instanceof Error && cause.message ? ` ${cause.message}` : ''}`;
+
   const identifier = () =>
     globalThis.crypto?.randomUUID?.() ??
     `quorum-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -235,7 +238,7 @@
       const link = target.closest<HTMLAnchorElement>('a[href]');
       if (!link) return;
       event.preventDefault();
-      void openUrl(link.href).catch((cause) => (error = message(cause)));
+      void openUrl(link.href).catch((cause) => (error = linkMessage(cause)));
     };
     node.addEventListener('click', handleClick);
     return { destroy: () => node.removeEventListener('click', handleClick) };
@@ -243,7 +246,9 @@
 
   onMount(() => {
     void refresh(true);
-    const focus = () => void refresh();
+    const focus = () => {
+      if (!noPlanning) void refresh();
+    };
     const poll = window.setInterval(() => {
       if (
         document.visibilityState === 'visible' &&

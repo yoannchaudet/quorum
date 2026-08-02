@@ -13,10 +13,11 @@ const mocks = vi.hoisted(() => ({
   updateSynthesizedPlan: vi.fn(),
   approvePlan: vi.fn(),
   rejectPlan: vi.fn(),
-  enqueuePlan: vi.fn()
+  enqueuePlan: vi.fn(),
+  openUrl: vi.fn()
 }));
 
-vi.mock('@tauri-apps/plugin-opener', () => ({ openUrl: vi.fn() }));
+vi.mock('@tauri-apps/plugin-opener', () => ({ openUrl: mocks.openUrl }));
 vi.mock('./lib/ipc', () => ({
   IpcError: class IpcError extends Error {
     constructor(
@@ -160,6 +161,28 @@ describe('planning work item UX', () => {
     expect(mocks.startPlanning).toHaveBeenCalledWith(
       expect.objectContaining({ workItemId: 'work', idempotencyKey: expect.any(String) })
     );
+  });
+
+  it('opens Markdown links without refreshing an unstarted planning run on focus', async () => {
+    mocks.getPlanning.mockRejectedValue(
+      new IpcError('not_found', 'Planning has not been started for this work item.')
+    );
+    mocks.openUrl.mockResolvedValue(undefined);
+    render(PlanningView, {
+      workItem: {
+        ...workItem,
+        markdownBody: '[Parent issue](https://github.com/owner/repository/issues/50)'
+      }
+    });
+
+    await fireEvent.click(await screen.findByRole('link', { name: 'Parent issue' }));
+    window.dispatchEvent(new Event('focus'));
+
+    expect(mocks.openUrl).toHaveBeenCalledWith(
+      'https://github.com/owner/repository/issues/50'
+    );
+    expect(mocks.getPlanning).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
   it('shows durable phase, agent identities, sessions, activity, and actionable failures', async () => {
