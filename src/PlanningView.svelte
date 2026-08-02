@@ -35,8 +35,10 @@
       ? `${cause.message}${cause.recovery ? ` ${cause.recovery}` : ''}`
       : 'Quorum could not refresh planning. Please try again.';
 
-  const linkMessage = (cause: unknown) =>
-    `Quorum could not open that link.${cause instanceof Error && cause.message ? ` ${cause.message}` : ''}`;
+  const linkMessage = (cause: unknown) => {
+    const detail = cause instanceof Error ? cause.message : String(cause ?? '');
+    return `Quorum could not open that link.${detail ? ` ${detail}` : ''}`;
+  };
 
   const identifier = () =>
     globalThis.crypto?.randomUUID?.() ??
