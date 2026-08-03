@@ -2353,6 +2353,36 @@ fn rotate_unconfirmed_session(
     Ok(())
 }
 
+fn copilot_log_messages(stdout: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|event| {
+            let event_type = event.get("type").and_then(Value::as_str)?;
+            match event_type {
+                "assistant.message" => {
+                    let content = event
+                        .get("data")
+                        .and_then(|data| data.get("content"))
+                        .or_else(|| event.get("content"))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|content| !content.is_empty());
+                    Some(content.map_or_else(
+                        || "Copilot completed the session.".to_owned(),
+                        ToOwned::to_owned,
+                    ))
+                }
+                "error" => event
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 fn status_for_step(step: &str) -> &'static str {
     match step {
         "preparing" => "starting",
@@ -4245,46 +4275,66 @@ impl ExecutionService {
         let mut persisted_bytes = 0_usize;
         let mut persist_error = None;
         let mut truncation_logged = false;
-        let mut persist_chunk = |chunk: ProcessChunk| {
-            if persist_error.is_some() {
-                return;
-            }
-            let remaining = MAX_PERSISTED_COMMAND_BYTES.saturating_sub(persisted_bytes);
-            if remaining == 0 {
-                if !truncation_logged {
-                    persist_error = self
-                        .append_log(
-                            &snapshot.run_id,
-                            &command_id,
-                            sequence,
-                            "system",
-                            "[Further command output omitted by Quorum's persisted log limit.]",
-                            true,
-                        )
-                        .err();
-                    sequence += 1;
-                    truncation_logged = true;
+        let copilot_json_stream = request
+            .arguments
+            .iter()
+            .any(|argument| argument == "--stream=on");
+        let result = {
+            let mut persist_chunk = |chunk: ProcessChunk| {
+                if persist_error.is_some() {
+                    return;
                 }
-                return;
+                if copilot_json_stream && chunk.stream == "stdout" {
+                    return;
+                }
+                let remaining = MAX_PERSISTED_COMMAND_BYTES.saturating_sub(persisted_bytes);
+                if remaining == 0 {
+                    if !truncation_logged {
+                        persist_error = self
+                            .append_log(
+                                &snapshot.run_id,
+                                &command_id,
+                                sequence,
+                                "system",
+                                "[Further command output omitted by Quorum's persisted log limit.]",
+                                true,
+                            )
+                            .err();
+                        sequence += 1;
+                        truncation_logged = true;
+                    }
+                    return;
+                }
+                let retained = remaining.min(chunk.bytes.len());
+                let text = String::from_utf8_lossy(&chunk.bytes[..retained]);
+                if let Err(error) = self.append_log(
+                    &snapshot.run_id,
+                    &command_id,
+                    sequence,
+                    chunk.stream,
+                    &text,
+                    retained < chunk.bytes.len(),
+                ) {
+                    persist_error = Some(error);
+                    return;
+                }
+                sequence += 1;
+                persisted_bytes += retained;
+                truncation_logged |= retained < chunk.bytes.len();
+            };
+            let result = self.runner.run(&request, control, &mut persist_chunk);
+            if copilot_json_stream {
+                if let Ok(result) = &result {
+                    for message in copilot_log_messages(&result.stdout) {
+                        persist_chunk(ProcessChunk {
+                            stream: "stdout",
+                            bytes: message.into_bytes(),
+                        });
+                    }
+                }
             }
-            let retained = remaining.min(chunk.bytes.len());
-            let text = String::from_utf8_lossy(&chunk.bytes[..retained]);
-            if let Err(error) = self.append_log(
-                &snapshot.run_id,
-                &command_id,
-                sequence,
-                chunk.stream,
-                &text,
-                retained < chunk.bytes.len(),
-            ) {
-                persist_error = Some(error);
-                return;
-            }
-            sequence += 1;
-            persisted_bytes += retained;
-            truncation_logged |= retained < chunk.bytes.len();
+            result
         };
-        let result = self.runner.run(&request, control, &mut persist_chunk);
         let git_metadata_error = request
             .untrusted
             .then(|| validate_snapshot_git_metadata(snapshot))
@@ -6315,7 +6365,7 @@ mod tests {
     use super::macos_sandbox_profile;
     use super::{
         collect_base_evidence, collect_base_evidence_bytes, copilot_environment,
-        copilot_session_confirmed, inherited_copilot_token, open_output_file,
+        copilot_log_messages, copilot_session_confirmed, inherited_copilot_token, open_output_file,
         preflight_with_executables, process_evidence, resolve_executable, run_owned_process,
         validate_confinement_tree, CancelExecutionRequest, EvidenceBudget, ExecutionDetailDto,
         ExecutionProcessRunner, ExecutionService, ExecutionSupervisor, ProcessChunk,
@@ -8167,6 +8217,21 @@ mod tests {
             capture_truncated: true,
         };
         assert!(copilot_session_confirmed(&result));
+    }
+
+    #[test]
+    fn copilot_logs_keep_complete_messages_and_drop_streaming_deltas() {
+        let stdout = br#"{"type":"assistant.tool_call_delta","data":"partial"}
+{"type":"assistant.message","data":{"content":"Implemented the requested change."}}
+{"type":"error","message":"Actionable failure"}
+"#;
+        assert_eq!(
+            copilot_log_messages(stdout),
+            [
+                "Implemented the requested change.".to_owned(),
+                "Actionable failure".to_owned()
+            ]
+        );
     }
 
     #[test]
