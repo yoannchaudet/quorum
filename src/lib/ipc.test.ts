@@ -130,6 +130,15 @@ describe('IPC error normalization', () => {
       expectedPlanUpdatedAt: 'plan-version'
     });
     await api.enqueuePlan({ planningRunId: 'run' });
+    await api.startExecution({ queueEntryId: 'queue', idempotencyKey: 'execution-key' });
+    await api.getExecution('work');
+    await api.resumeExecution({ runId: 'execution' });
+    await api.cancelExecution({ runId: 'execution' });
+    await api.resolveExecutionFinding({
+      runId: 'execution',
+      findingId: 'finding',
+      dispositionNote: 'Explicitly accepted.'
+    });
 
     expect(mocks.invoke.mock.calls).toEqual([
       [
@@ -237,7 +246,24 @@ describe('IPC error normalization', () => {
         'reject_plan',
         { request: { planningRunId: 'run', expectedPlanUpdatedAt: 'plan-version' } }
       ],
-      ['enqueue_plan', { request: { planningRunId: 'run' } }]
+      ['enqueue_plan', { request: { planningRunId: 'run' } }],
+      [
+        'start_execution',
+        { request: { queueEntryId: 'queue', idempotencyKey: 'execution-key' } }
+      ],
+      ['get_execution', { workItemId: 'work' }],
+      ['resume_execution', { request: { runId: 'execution' } }],
+      ['cancel_execution', { request: { runId: 'execution' } }],
+      [
+        'resolve_execution_finding',
+        {
+          request: {
+            runId: 'execution',
+            findingId: 'finding',
+            dispositionNote: 'Explicitly accepted.'
+          }
+        }
+      ]
     ]);
   });
 });

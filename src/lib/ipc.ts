@@ -23,10 +23,27 @@ import type { PlanningEventDto } from '../../src-tauri/bindings/PlanningEventDto
 import type { PlanningQuestionDto } from '../../src-tauri/bindings/PlanningQuestionDto';
 import type { PlanRevisionDto } from '../../src-tauri/bindings/PlanRevisionDto';
 import type { TerminalHandoffSummaryDto } from '../../src-tauri/bindings/TerminalHandoffSummaryDto';
+import type { StartExecutionRequest } from '../../src-tauri/bindings/StartExecutionRequest';
+import type { ResumeExecutionRequest } from '../../src-tauri/bindings/ResumeExecutionRequest';
+import type { CancelExecutionRequest } from '../../src-tauri/bindings/CancelExecutionRequest';
+import type { ResolveExecutionFindingRequest } from '../../src-tauri/bindings/ResolveExecutionFindingRequest';
+import type { ExecutionDetailDto } from '../../src-tauri/bindings/ExecutionDetailDto';
+import type { ExecutionRunDto } from '../../src-tauri/bindings/ExecutionRunDto';
+import type { ExecutionAttemptDto } from '../../src-tauri/bindings/ExecutionAttemptDto';
+import type { ExecutionLogDto } from '../../src-tauri/bindings/ExecutionLogDto';
+import type { ExecutionFindingDto } from '../../src-tauri/bindings/ExecutionFindingDto';
+import type { ExecutionPhaseEventDto } from '../../src-tauri/bindings/ExecutionPhaseEventDto';
 
 export type {
+  CancelExecutionRequest,
   CreateWorkItemRequest,
   EnqueuePlanRequest,
+  ExecutionAttemptDto,
+  ExecutionDetailDto,
+  ExecutionFindingDto,
+  ExecutionLogDto,
+  ExecutionPhaseEventDto,
+  ExecutionRunDto,
   IntakeGithubIssueRequest,
   IntakeLocalMarkdownRequest,
   LaunchTerminalHandoffRequest,
@@ -42,8 +59,11 @@ export type {
   RepositoryDto,
   ResumeTerminalHandoffRequest,
   RetryPlanningRequest,
+  ResolveExecutionFindingRequest,
+  ResumeExecutionRequest,
   SettingsDto,
   StartPlanningRequest,
+  StartExecutionRequest,
   SubmitPlanningAnswersRequest,
   TerminalHandoffSummaryDto,
   UpdateSettingsRequest,
@@ -136,5 +156,15 @@ export const api = {
   rejectPlan: (request: PlanApprovalRequest) =>
     command<PlanningDetailDto>('reject_plan', { request }),
   enqueuePlan: (request: EnqueuePlanRequest) =>
-    command<PlanningDetailDto>('enqueue_plan', { request })
+    command<PlanningDetailDto>('enqueue_plan', { request }),
+  startExecution: (request: StartExecutionRequest) =>
+    command<ExecutionDetailDto>('start_execution', { request }),
+  getExecution: (workItemId: string) =>
+    command<ExecutionDetailDto | null>('get_execution', { workItemId }),
+  resumeExecution: (request: ResumeExecutionRequest) =>
+    command<ExecutionDetailDto>('resume_execution', { request }),
+  cancelExecution: (request: CancelExecutionRequest) =>
+    command<ExecutionDetailDto>('cancel_execution', { request }),
+  resolveExecutionFinding: (request: ResolveExecutionFindingRequest) =>
+    command<ExecutionDetailDto>('resolve_execution_finding', { request })
 };

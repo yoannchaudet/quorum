@@ -1,5 +1,6 @@
 mod copilot;
 mod error;
+mod execution;
 mod ipc;
 mod planning;
 mod repository;
@@ -11,10 +12,16 @@ use std::sync::Arc;
 
 use tauri::Manager;
 
+use crate::execution::ExecutionSupervisor;
 use crate::state::AppStore;
+
+pub fn owned_process_entry() -> Option<std::process::ExitCode> {
+    execution::owned_process_entry()
+}
 
 pub struct StartupState {
     store: Result<Arc<AppStore>, error::AppError>,
+    supervisor: Arc<ExecutionSupervisor>,
 }
 
 impl StartupState {
@@ -39,7 +46,10 @@ pub fn run() {
                 })
                 .and_then(AppStore::open)
                 .map(Arc::new);
-            app.manage(StartupState { store });
+            app.manage(StartupState {
+                store,
+                supervisor: Arc::new(ExecutionSupervisor::default()),
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -66,7 +76,12 @@ pub fn run() {
             ipc::update_synthesized_plan,
             ipc::approve_plan,
             ipc::reject_plan,
-            ipc::enqueue_plan
+            ipc::enqueue_plan,
+            ipc::start_execution,
+            ipc::get_execution,
+            ipc::resume_execution,
+            ipc::cancel_execution,
+            ipc::resolve_execution_finding
         ]);
 
     if let Err(error) = builder.run(tauri::generate_context!()) {

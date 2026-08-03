@@ -4,6 +4,7 @@
   import { onMount } from 'svelte';
   import { api, IpcError } from './lib/ipc';
   import { renderMarkdown } from './lib/markdown';
+  import ExecutionView from './ExecutionView.svelte';
   import type {
     PlanningAgentDto,
     PlanningDetailDto,
@@ -648,9 +649,9 @@
             </strong>
             <p>
               {detail.queue.entry
-                ? 'Intent is persisted. Planning has stopped; implementation has not started.'
+                ? 'Planning has stopped. Start or inspect the single persisted execution run below.'
                 : detail.queue.reason ??
-                  'Enqueue persists future implementation intent without starting implementation.'}
+                  'Enqueue the plan before explicitly starting one implementation run.'}
             </p>
           </div>
           <button
@@ -661,6 +662,10 @@
             {busyAction === 'enqueue' ? 'Enqueueing…' : 'Enqueue'}
           </button>
         </div>
+
+        {#if detail.queue.entry}
+          <ExecutionView workItemId={workItem.id} queueEntryId={detail.queue.entry.id} />
+        {/if}
       </section>
     {/if}
   {/if}

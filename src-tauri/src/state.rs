@@ -1,7 +1,10 @@
 use std::fs;
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::Utc;
+use fs2::FileExt;
 use rusqlite::{Connection, Transaction};
 
 use crate::error::{AppError, StoreError};
@@ -15,19 +18,48 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0005_terminal_handoffs.sql"),
     include_str!("../migrations/0006_planning_ipc.sql"),
     include_str!("../migrations/0007_work_item_approval_policy.sql"),
+    include_str!("../migrations/0008_execution.sql"),
 ];
 
 #[derive(Debug, Clone)]
 pub struct AppStore {
     path: PathBuf,
+    _lease: Arc<File>,
 }
 
 impl AppStore {
     pub fn open(app_data_dir: impl AsRef<Path>) -> Result<Self, AppError> {
         let app_data_dir = app_data_dir.as_ref();
         fs::create_dir_all(app_data_dir).map_err(StoreError::from)?;
+        let lease_path = app_data_dir.join("quorum.lock");
+        match fs::symlink_metadata(&lease_path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(AppError::path(format!(
+                    "{} is not a regular lock file.",
+                    lease_path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(StoreError::from(error).into()),
+        }
+        let mut lease_options = OpenOptions::new();
+        lease_options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            lease_options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let lease = lease_options.open(&lease_path).map_err(StoreError::from)?;
+        FileExt::try_lock_exclusive(&lease).map_err(|error| {
+            AppError::conflict(format!(
+                "Another live Quorum instance owns {}. Startup recovery was not run: {error}",
+                lease_path.display()
+            ))
+        })?;
         let store = Self {
             path: app_data_dir.join("quorum.sqlite3"),
+            _lease: Arc::new(lease),
         };
         let connection = Connection::open(&store.path).map_err(StoreError::from)?;
         configure(&connection).map_err(StoreError::from)?;
@@ -38,6 +70,49 @@ impl AppStore {
 
     pub fn database_path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn app_data_dir(&self) -> &Path {
+        self.path
+            .parent()
+            .expect("Quorum's database always has an application-data parent")
+    }
+
+    pub fn run_lease_path(&self, run_id: &str) -> Result<PathBuf, AppError> {
+        let directory = self.app_data_dir().join("run-leases");
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => {
+                return Err(AppError::path(format!(
+                    "{} is not a real directory.",
+                    directory.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&directory).map_err(StoreError::from)?;
+            }
+            Err(error) => return Err(StoreError::from(error).into()),
+        }
+        let root = fs::canonicalize(self.app_data_dir()).map_err(StoreError::from)?;
+        let resolved = fs::canonicalize(&directory).map_err(StoreError::from)?;
+        if !resolved.starts_with(root) {
+            return Err(AppError::path(
+                "Quorum's execution lease directory escapes application data.",
+            ));
+        }
+        let path = directory.join(format!("{run_id}.lock"));
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(AppError::path(format!(
+                    "{} is not a regular execution lock file.",
+                    path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(StoreError::from(error).into()),
+        }
+        Ok(path)
     }
 
     pub fn with_connection<T>(
@@ -60,6 +135,7 @@ fn configure(connection: &Connection) -> Result<(), rusqlite::Error> {
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn recover_interrupted_work(connection: &Connection) -> Result<(), AppError> {
     let transaction = connection
         .unchecked_transaction()
@@ -77,6 +153,65 @@ fn recover_interrupted_work(connection: &Connection) -> Result<(), AppError> {
                  AND planning_agents.status = 'running'
              )",
             [&timestamp],
+        )
+        .map_err(StoreError::from)?;
+    transaction
+        .execute(
+            "UPDATE execution_commands
+             SET status = 'interrupted', completed_at = ?1
+             WHERE status = 'running'",
+            [&timestamp],
+        )
+        .map_err(StoreError::from)?;
+    transaction
+        .execute(
+            "UPDATE execution_attempts
+             SET status = 'interrupted', error_code = 'interrupted',
+                 error_message = 'Quorum restarted while this owned execution attempt was running.',
+                 completed_at = ?1
+             WHERE status = 'running'",
+            [&timestamp],
+        )
+        .map_err(StoreError::from)?;
+    transaction
+        .execute(
+            "UPDATE runs
+             SET outcome = 'blocked', updated_at = ?1
+             WHERE id IN (
+               SELECT run_id FROM execution_runs
+               WHERE status IN (
+                 'starting', 'building', 'verifying', 'reviewing', 'remediating', 'cancelling'
+               )
+             )",
+            [&timestamp],
+        )
+        .map_err(StoreError::from)?;
+    transaction
+        .execute(
+            "UPDATE execution_runs
+             SET status = 'blocked', error_code = 'interrupted',
+                 error_message = 'Quorum restarted while execution was running. Resume to create a new owned attempt; persisted process identifiers were not reused.',
+                 updated_at = ?1, completed_at = ?1
+             WHERE status IN (
+               'starting', 'building', 'verifying', 'reviewing', 'remediating', 'cancelling'
+             )",
+            [&timestamp],
+        )
+        .map_err(StoreError::from)?;
+    transaction
+        .execute(
+            "UPDATE execution_runs
+             SET builder_session_state = 'not_started'
+             WHERE builder_session_state = 'launching'",
+            [],
+        )
+        .map_err(StoreError::from)?;
+    transaction
+        .execute(
+            "UPDATE execution_runs
+             SET reviewer_session_state = 'not_started'
+             WHERE reviewer_session_state = 'launching'",
+            [],
         )
         .map_err(StoreError::from)?;
     transaction
@@ -229,6 +364,7 @@ mod tests {
                 Ok(())
             })
             .expect("write");
+        drop(store);
         let reopened = AppStore::open(directory.path()).expect("reopen store");
         let count: i64 = reopened
             .with_connection(|connection| {
@@ -242,6 +378,17 @@ mod tests {
             reopened.database_path(),
             directory.path().join("quorum.sqlite3")
         );
+    }
+
+    #[test]
+    fn rejects_a_second_live_store_owner_and_reopens_after_release() {
+        let directory = tempdir().expect("temp dir");
+        let store = AppStore::open(directory.path()).expect("first owner");
+        let error = AppStore::open(directory.path()).expect_err("second owner must fail closed");
+        assert_eq!(error.code, "conflict");
+        assert!(error.message.contains("Another live Quorum instance"));
+        drop(store);
+        AppStore::open(directory.path()).expect("lease released after owner drop");
     }
 
     #[test]
@@ -305,7 +452,7 @@ mod tests {
                     |row| row.get(0),
                 )?;
                 assert_eq!(assignments, 4);
-                assert_eq!(version, 7);
+                assert_eq!(version, 8);
                 assert_eq!(terminal_application, DEFAULT_TERMINAL_APPLICATION);
                 assert_eq!(terminal_arguments, DEFAULT_TERMINAL_ARGUMENTS);
                 Ok(())
@@ -395,7 +542,7 @@ mod tests {
                 let version: i32 =
                     connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
                 assert_eq!(foreign_key_errors, 0);
-                assert_eq!(version, 7);
+                assert_eq!(version, 8);
                 Ok(())
             })
             .expect("preserved data");
@@ -433,7 +580,7 @@ mod tests {
                     .is_err());
                 let version: i32 =
                     connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-                assert_eq!(version, 7);
+                assert_eq!(version, 8);
                 Ok(())
             })
             .expect("schema constraints");
@@ -585,6 +732,7 @@ mod tests {
             })
             .expect("seed interrupted work");
 
+        drop(store);
         let reopened = AppStore::open(directory.path()).expect("recover on reopen");
         reopened
             .with_connection(|connection| {
@@ -632,5 +780,132 @@ mod tests {
                 Ok(())
             })
             .expect("verify recovered work");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reopening_interrupts_execution_without_reusing_process_identity() {
+        let directory = tempdir().expect("temp dir");
+        let store = AppStore::open(directory.path()).expect("open store");
+        store
+            .with_connection(|connection| {
+                connection.execute_batch(
+                    "INSERT INTO repositories (
+                       id, root_path, display_name, created_at, updated_at
+                     ) VALUES ('repository', '/repo', 'repo', 'before', 'before');
+                     INSERT INTO work_items (
+                       id, repository_id, title, source_kind, source_metadata_json,
+                       markdown_body, lifecycle_status, created_at, updated_at
+                     ) VALUES (
+                       'work', 'repository', 'title', 'inline_markdown',
+                       '{\"kind\":\"inline_markdown\"}', '# Work', 'open',
+                       'before', 'before'
+                     );
+                     INSERT INTO planning_runs (
+                       id, work_item_id, status, created_at, updated_at, completed_at
+                     ) VALUES ('planning', 'work', 'succeeded', 'before', 'before', 'before');
+                     INSERT INTO plans (
+                       id, work_item_id, revision, markdown_body, approval_policy,
+                       approval_status, created_at, updated_at, planning_run_id,
+                       queue_eligibility_key, queue_eligible_at
+                     ) VALUES (
+                       'plan', 'work', 1, '# Plan', 'not_required', 'draft',
+                       'before', 'before', 'planning', 'eligible', 'before'
+                     );
+                     INSERT INTO runs (
+                       id, work_item_id, plan_id, phase, outcome, created_at, updated_at
+                     ) VALUES (
+                       'execution', 'work', 'plan', 'building', 'running', 'before', 'before'
+                     );
+                     INSERT INTO queue_entries (
+                       id, work_item_id, position, scheduling_status, created_at,
+                       updated_at, plan_id, idempotency_key, run_id
+                     ) VALUES (
+                       'queue', 'work', 0, 'queued', 'before', 'before',
+                       'plan', 'eligible', 'execution'
+                     );
+                     INSERT INTO execution_runs (
+                       run_id, queue_entry_id, source_repository_path, base_commit,
+                       branch_name, worktree_path, ownership_token, copilot_program,
+                       builder_session_id, builder_session_name, builder_model,
+                       reviewer_session_id, reviewer_session_name, reviewer_model,
+                       verification_program, verification_args_json, status, current_step,
+                       builder_session_state, reviewer_session_state,
+                       idempotency_key, created_at, updated_at
+                     ) VALUES (
+                       'execution', 'queue', '/repo', 'base', 'quorum/work-execution',
+                       '/app/worktree', 'owner', 'copilot', 'builder-id', 'builder-session', 'builder',
+                       'reviewer-id', 'reviewer-session', 'reviewer',
+                       'make', '[\"check\"]', 'building', 'building', 'launching', 'launching',
+                       'execution-key', 'before', 'before'
+                     );
+                     INSERT INTO execution_attempts (
+                       id, run_id, number, reason, status, started_at
+                     ) VALUES (
+                       'attempt', 'execution', 1, 'start', 'running', 'before'
+                     );
+                     INSERT INTO execution_commands (
+                       id, run_id, execution_attempt_id, ordinal, phase, program,
+                       args_json, cwd, status, started_at
+                     ) VALUES (
+                       'command', 'execution', 'attempt', 0, 'building', 'copilot',
+                       '[]', '/app/worktree', 'running', 'before'
+                     );",
+                )?;
+                Ok(())
+            })
+            .expect("seed interrupted execution");
+
+        drop(store);
+        let reopened = AppStore::open(directory.path()).expect("recover on reopen");
+        reopened
+            .with_connection(|connection| {
+                let execution: (String, Option<String>, String, String, String) = connection
+                    .query_row(
+                        "SELECT status, error_code, current_step,
+                            builder_session_state, reviewer_session_state
+                     FROM execution_runs WHERE run_id = 'execution'",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                            ))
+                        },
+                    )?;
+                let run: String = connection.query_row(
+                    "SELECT outcome FROM runs WHERE id = 'execution'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let attempt: String = connection.query_row(
+                    "SELECT status FROM execution_attempts WHERE id = 'attempt'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let command: String = connection.query_row(
+                    "SELECT status FROM execution_commands WHERE id = 'command'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(
+                    execution,
+                    (
+                        "blocked".to_owned(),
+                        Some("interrupted".to_owned()),
+                        "building".to_owned(),
+                        "not_started".to_owned(),
+                        "not_started".to_owned()
+                    )
+                );
+                assert_eq!(run, "blocked");
+                assert_eq!(attempt, "interrupted");
+                assert_eq!(command, "interrupted");
+                Ok(())
+            })
+            .expect("verify interrupted execution");
     }
 }
