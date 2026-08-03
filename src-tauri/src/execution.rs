@@ -502,7 +502,7 @@ impl ExecutionProcessRunner for SystemExecutionProcessRunner {
         control.install_child(child)?;
         let mut child_guard = InstalledChildGuard::new(control);
 
-        let mut captured_stdout = Vec::new();
+        let mut stdout_tail = Vec::new();
         let mut captured_stderr = Vec::new();
         let mut capture_truncated = false;
         let mut total_output = 0_usize;
@@ -522,12 +522,16 @@ impl ExecutionProcessRunner for SystemExecutionProcessRunner {
                         if retained > 0 {
                             chunk.bytes.truncate(retained);
                             total_output += retained;
-                            capture_chunk(
-                                &chunk,
-                                &mut captured_stdout,
-                                &mut captured_stderr,
-                                &mut capture_truncated,
-                            );
+                            if chunk.stream == "stdout" {
+                                capture_truncated |=
+                                    append_tail(&mut stdout_tail, &chunk.bytes, MAX_CAPTURE_BYTES);
+                            } else {
+                                capture_prefix(
+                                    &mut captured_stderr,
+                                    &chunk.bytes,
+                                    &mut capture_truncated,
+                                );
+                            }
                             output(chunk);
                         }
                         if retained < chunk_length {
@@ -565,11 +569,28 @@ impl ExecutionProcessRunner for SystemExecutionProcessRunner {
             success: status.success() && !control.cancelled() && !output_limit_exceeded,
             exit_code: status.code(),
             status: rendered_status,
-            stdout: captured_stdout,
+            stdout: stdout_tail,
             stderr: captured_stderr,
             capture_truncated,
         })
     }
+}
+
+fn append_tail(destination: &mut Vec<u8>, bytes: &[u8], limit: usize) -> bool {
+    if bytes.len() >= limit {
+        destination.clear();
+        destination.extend_from_slice(&bytes[bytes.len() - limit..]);
+        return true;
+    }
+    let overflow = destination
+        .len()
+        .saturating_add(bytes.len())
+        .saturating_sub(limit);
+    if overflow > 0 {
+        destination.drain(..overflow);
+    }
+    destination.extend_from_slice(bytes);
+    overflow > 0
 }
 
 struct InstalledChildGuard<'a> {
@@ -822,25 +843,15 @@ fn spawn_reader(
     })
 }
 
-fn capture_chunk(
-    chunk: &ProcessChunk,
-    stdout: &mut Vec<u8>,
-    stderr: &mut Vec<u8>,
-    truncated: &mut bool,
-) {
-    let destination = if chunk.stream == "stderr" {
-        stderr
-    } else {
-        stdout
-    };
+fn capture_prefix(destination: &mut Vec<u8>, bytes: &[u8], truncated: &mut bool) {
     let remaining = MAX_CAPTURE_BYTES.saturating_sub(destination.len());
     if remaining == 0 {
         *truncated = true;
         return;
     }
-    let retained = remaining.min(chunk.bytes.len());
-    destination.extend_from_slice(&chunk.bytes[..retained]);
-    *truncated |= retained < chunk.bytes.len();
+    let retained = remaining.min(bytes.len());
+    destination.extend_from_slice(&bytes[..retained]);
+    *truncated |= retained < bytes.len();
 }
 
 #[derive(Clone)]
@@ -6111,7 +6122,6 @@ fn process_failure(code: &str, prefix: &str, result: &ProcessResult) -> WorkerEr
 
 fn copilot_session_confirmed(result: &ProcessResult) -> bool {
     result.success
-        && !result.capture_truncated
         && String::from_utf8_lossy(&result.stdout).lines().any(|line| {
             serde_json::from_str::<Value>(line)
                 .ok()
@@ -6305,13 +6315,13 @@ mod tests {
     use super::macos_sandbox_profile;
     use super::{
         collect_base_evidence, collect_base_evidence_bytes, copilot_environment,
-        inherited_copilot_token, open_output_file, preflight_with_executables, process_evidence,
-        resolve_executable, run_owned_process, validate_confinement_tree, CancelExecutionRequest,
-        EvidenceBudget, ExecutionDetailDto, ExecutionProcessRunner, ExecutionService,
-        ExecutionSupervisor, ProcessChunk, ProcessRequest, ProcessResult,
-        ResolveExecutionFindingRequest, ResumeExecutionRequest, RunControl, StartExecutionRequest,
-        SystemExecutionProcessRunner, MAX_EVIDENCE_BYTES, MAX_PROCESS_OUTPUT_BYTES,
-        MAX_REVIEW_DIFF_BYTES,
+        copilot_session_confirmed, inherited_copilot_token, open_output_file,
+        preflight_with_executables, process_evidence, resolve_executable, run_owned_process,
+        validate_confinement_tree, CancelExecutionRequest, EvidenceBudget, ExecutionDetailDto,
+        ExecutionProcessRunner, ExecutionService, ExecutionSupervisor, ProcessChunk,
+        ProcessRequest, ProcessResult, ResolveExecutionFindingRequest, ResumeExecutionRequest,
+        RunControl, StartExecutionRequest, SystemExecutionProcessRunner, MAX_EVIDENCE_BYTES,
+        MAX_PROCESS_OUTPUT_BYTES, MAX_REVIEW_DIFF_BYTES,
     };
     use crate::state::AppStore;
 
@@ -8022,6 +8032,25 @@ mod tests {
     }
 
     #[test]
+    fn process_runner_retains_completion_evidence_after_capture_truncation() {
+        let request = ProcessRequest::new(
+            "/bin/sh".to_owned(),
+            vec![
+                "-c".to_owned(),
+                "dd if=/dev/zero bs=600000 count=1 2>/dev/null | tr '\\000' x; printf '\\n{\"type\":\"assistant.message\"}\\n'"
+                    .to_owned(),
+            ],
+            PathBuf::from("/"),
+        );
+        let result = SystemExecutionProcessRunner
+            .run(&request, &RunControl::default(), &mut |_| {})
+            .expect("capture process tail");
+        assert!(result.success);
+        assert!(result.capture_truncated);
+        assert!(copilot_session_confirmed(&result));
+    }
+
+    #[test]
     fn process_runner_terminates_commands_that_exceed_total_output_budget() {
         let request =
             ProcessRequest::new("/usr/bin/yes".to_owned(), Vec::new(), PathBuf::from("/"));
@@ -8125,6 +8154,19 @@ mod tests {
         let evidence = process_evidence(&result);
         assert!(evidence.ends_with("[diagnostic truncated]"));
         assert!(evidence.is_char_boundary(evidence.len()));
+    }
+
+    #[test]
+    fn truncated_builder_capture_can_confirm_from_the_retained_stdout_tail() {
+        let result = ProcessResult {
+            success: true,
+            exit_code: Some(0),
+            status: "exit status: 0".to_owned(),
+            stdout: br#"{"type":"assistant.message","data":{"content":"done"}}"#.to_vec(),
+            stderr: Vec::new(),
+            capture_truncated: true,
+        };
+        assert!(copilot_session_confirmed(&result));
     }
 
     #[test]
