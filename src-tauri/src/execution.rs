@@ -1125,6 +1125,7 @@ impl ExecutionService {
                 |row| row.get(0),
             )?;
             let timestamp = now();
+            rotate_unconfirmed_session(&transaction, &run_id, &record.1, &timestamp)?;
             transaction.execute(
                 "INSERT INTO execution_attempts (
                    id, run_id, number, reason, status, started_at
@@ -2298,6 +2299,47 @@ fn short_id(value: &str) -> String {
 
 fn now() -> String {
     Utc::now().to_rfc3339()
+}
+
+fn rotate_unconfirmed_session(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    current_step: &str,
+    timestamp: &str,
+) -> Result<(), StoreError> {
+    let (state_column, id_column, name_column) = match current_step {
+        "building" | "remediating" => (
+            "builder_session_state",
+            "builder_session_id",
+            "builder_session_name",
+        ),
+        "reviewing" => (
+            "reviewer_session_state",
+            "reviewer_session_id",
+            "reviewer_session_name",
+        ),
+        _ => return Ok(()),
+    };
+    let query =
+        format!("SELECT {state_column}, {name_column} FROM execution_runs WHERE run_id = ?1");
+    let (state, name): (String, String) =
+        transaction.query_row(&query, [run_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    if state != "not_started" {
+        return Ok(());
+    }
+    let session_id = Uuid::new_v4().to_string();
+    let base_name = name.split("-retry-").next().unwrap_or(&name);
+    let session_name = format!("{base_name}-retry-{}", short_id(&session_id));
+    let update = format!(
+        "UPDATE execution_runs
+         SET {id_column} = ?2, {name_column} = ?3, updated_at = ?4
+         WHERE run_id = ?1 AND {state_column} = 'not_started'"
+    );
+    transaction.execute(
+        &update,
+        params![run_id, session_id, session_name, timestamp],
+    )?;
+    Ok(())
 }
 
 fn status_for_step(step: &str) -> &'static str {
@@ -7473,14 +7515,15 @@ mod tests {
             blocked.run.error_code.as_deref(),
             Some("process_start_failed")
         );
-        let state: String = harness
+        let (state, first_session_id): (String, String) = harness
             .store
             .with_connection(|connection| {
                 connection
                     .query_row(
-                        "SELECT builder_session_state FROM execution_runs WHERE run_id = ?1",
+                        "SELECT builder_session_state, builder_session_id
+                         FROM execution_runs WHERE run_id = ?1",
                         [&started.run.id],
-                        |row| row.get(0),
+                        |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .map_err(Into::into)
             })
@@ -7519,6 +7562,10 @@ mod tests {
             .arguments
             .iter()
             .any(|argument| argument == "--session-id"));
+        assert!(!builder
+            .arguments
+            .iter()
+            .any(|argument| argument == &first_session_id));
         assert!(!builder
             .arguments
             .iter()
