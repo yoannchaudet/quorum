@@ -4566,7 +4566,6 @@ fn copilot_common_arguments(worktree_path: &Path, reviewer: bool) -> Vec<String>
         "--stream=on".to_owned(),
         "--silent".to_owned(),
         "--no-ask-user".to_owned(),
-        "--no-custom-instructions".to_owned(),
         "--disable-builtin-mcps".to_owned(),
         "--disallow-temp-dir".to_owned(),
         "--allow-all-tools".to_owned(),
