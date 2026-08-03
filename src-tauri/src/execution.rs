@@ -4540,8 +4540,51 @@ fn copilot_process_request(
         .into_iter()
         .map(|(name, path)| (name.to_owned(), path.to_string_lossy().into_owned()))
         .collect();
+    #[cfg(not(test))]
+    request
+        .environment
+        .push(copilot_authentication_environment()?);
     request.untrusted = true;
     Ok(request)
+}
+
+#[cfg(not(test))]
+fn copilot_authentication_environment() -> Result<(String, String), WorkerError> {
+    if let Some(token) = inherited_copilot_token(|name| std::env::var(name).ok()) {
+        return Ok(("COPILOT_GITHUB_TOKEN".to_owned(), token));
+    }
+    let gh = resolve_executable("gh").ok_or_else(|| {
+        WorkerError::new(
+            "copilot_auth",
+            "Copilot authentication is unavailable because GitHub CLI was not found on PATH. Install `gh`, run `gh auth login`, and resume execution.",
+        )
+    })?;
+    let output = Command::new(gh)
+        .args(["auth", "token"])
+        .output()
+        .map_err(|error| {
+            WorkerError::new(
+                "copilot_auth",
+                format!("GitHub CLI could not provide Copilot authentication: {error}"),
+            )
+        })?;
+    let token = String::from_utf8(output.stdout)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let Some(token) = token.filter(|_| output.status.success()) else {
+        return Err(WorkerError::new(
+            "copilot_auth",
+            "GitHub CLI has no usable authentication token. Run `gh auth login`, then resume execution.",
+        ));
+    };
+    Ok(("COPILOT_GITHUB_TOKEN".to_owned(), token))
+}
+
+fn inherited_copilot_token(mut lookup: impl FnMut(&str) -> Option<String>) -> Option<String> {
+    ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]
+        .into_iter()
+        .find_map(|name| lookup(name).filter(|value| !value.trim().is_empty()))
 }
 
 fn copilot_environment(runtime: &Path) -> [(&'static str, PathBuf); 7] {
@@ -6219,13 +6262,14 @@ mod tests {
     #[cfg(target_os = "macos")]
     use super::macos_sandbox_profile;
     use super::{
-        collect_base_evidence, collect_base_evidence_bytes, copilot_environment, open_output_file,
-        preflight_with_executables, process_evidence, resolve_executable, run_owned_process,
-        validate_confinement_tree, CancelExecutionRequest, EvidenceBudget, ExecutionDetailDto,
-        ExecutionProcessRunner, ExecutionService, ExecutionSupervisor, ProcessChunk,
-        ProcessRequest, ProcessResult, ResolveExecutionFindingRequest, ResumeExecutionRequest,
-        RunControl, StartExecutionRequest, SystemExecutionProcessRunner, MAX_EVIDENCE_BYTES,
-        MAX_PROCESS_OUTPUT_BYTES, MAX_REVIEW_DIFF_BYTES,
+        collect_base_evidence, collect_base_evidence_bytes, copilot_environment,
+        inherited_copilot_token, open_output_file, preflight_with_executables, process_evidence,
+        resolve_executable, run_owned_process, validate_confinement_tree, CancelExecutionRequest,
+        EvidenceBudget, ExecutionDetailDto, ExecutionProcessRunner, ExecutionService,
+        ExecutionSupervisor, ProcessChunk, ProcessRequest, ProcessResult,
+        ResolveExecutionFindingRequest, ResumeExecutionRequest, RunControl, StartExecutionRequest,
+        SystemExecutionProcessRunner, MAX_EVIDENCE_BYTES, MAX_PROCESS_OUTPUT_BYTES,
+        MAX_REVIEW_DIFF_BYTES,
     };
     use crate::state::AppStore;
 
@@ -7892,6 +7936,17 @@ mod tests {
             .find_map(|(name, path)| (*name == "HOME").then_some(path));
         assert_eq!(home, Some(&runtime.join("copilot-home")));
         assert!(home.expect("HOME").starts_with(runtime));
+    }
+
+    #[test]
+    fn copilot_authentication_prefers_documented_secret_environment_variables() {
+        let token = inherited_copilot_token(|name| match name {
+            "COPILOT_GITHUB_TOKEN" => Some(String::new()),
+            "GH_TOKEN" => Some("github-cli-token".to_owned()),
+            "GITHUB_TOKEN" => Some("fallback-token".to_owned()),
+            _ => None,
+        });
+        assert_eq!(token.as_deref(), Some("github-cli-token"));
     }
 
     #[test]
