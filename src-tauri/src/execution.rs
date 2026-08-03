@@ -4509,14 +4509,7 @@ fn copilot_process_request(
     secure_directory(&logs, &runtime_root)?;
     let mut arguments = arguments;
     arguments.extend(["--log-dir".to_owned(), logs.to_string_lossy().into_owned()]);
-    let environment = [
-        ("COPILOT_HOME", runtime.join("copilot-home")),
-        ("TMPDIR", runtime.join("tmp")),
-        ("XDG_CACHE_HOME", runtime.join("xdg-cache")),
-        ("XDG_CONFIG_HOME", runtime.join("xdg-config")),
-        ("XDG_DATA_HOME", runtime.join("xdg-data")),
-        ("XDG_STATE_HOME", runtime.join("xdg-state")),
-    ];
+    let environment = copilot_environment(&runtime);
     for (_, path) in &environment {
         secure_directory(path, &runtime_root)?;
     }
@@ -4549,6 +4542,19 @@ fn copilot_process_request(
         .collect();
     request.untrusted = true;
     Ok(request)
+}
+
+fn copilot_environment(runtime: &Path) -> [(&'static str, PathBuf); 7] {
+    let copilot_home = runtime.join("copilot-home");
+    [
+        ("HOME", copilot_home.clone()),
+        ("COPILOT_HOME", copilot_home),
+        ("TMPDIR", runtime.join("tmp")),
+        ("XDG_CACHE_HOME", runtime.join("xdg-cache")),
+        ("XDG_CONFIG_HOME", runtime.join("xdg-config")),
+        ("XDG_DATA_HOME", runtime.join("xdg-data")),
+        ("XDG_STATE_HOME", runtime.join("xdg-state")),
+    ]
 }
 
 fn verification_process_request(snapshot: &WorkerSnapshot) -> Result<ProcessRequest, WorkerError> {
@@ -6213,7 +6219,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     use super::macos_sandbox_profile;
     use super::{
-        collect_base_evidence, collect_base_evidence_bytes, open_output_file,
+        collect_base_evidence, collect_base_evidence_bytes, copilot_environment, open_output_file,
         preflight_with_executables, process_evidence, resolve_executable, run_owned_process,
         validate_confinement_tree, CancelExecutionRequest, EvidenceBudget, ExecutionDetailDto,
         ExecutionProcessRunner, ExecutionService, ExecutionSupervisor, ProcessChunk,
@@ -7875,6 +7881,17 @@ mod tests {
             fs::read_to_string(git_pointer).expect("unchanged git pointer"),
             "gitdir: trusted\n"
         );
+    }
+
+    #[test]
+    fn copilot_home_keeps_package_extraction_inside_the_sandbox() {
+        let runtime = Path::new("/managed/.quorum-runtime/builder");
+        let environment = copilot_environment(runtime);
+        let home = environment
+            .iter()
+            .find_map(|(name, path)| (*name == "HOME").then_some(path));
+        assert_eq!(home, Some(&runtime.join("copilot-home")));
+        assert!(home.expect("HOME").starts_with(runtime));
     }
 
     #[test]
