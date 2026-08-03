@@ -3720,16 +3720,6 @@ impl ExecutionService {
                 &execution.result,
             ));
         }
-        if execution.result.capture_truncated {
-            if snapshot.reviewer_session_state != "resumable" {
-                self.reset_session_launch(&snapshot.run_id, "reviewer")
-                    .map_err(WorkerError::database)?;
-            }
-            return Err(WorkerError::new(
-                "review_output_incomplete",
-                "The reviewer output exceeded Quorum's complete-capture bound. Delivery is blocked because the structured review result may be incomplete.",
-            ));
-        }
         if !copilot_session_confirmed(&execution.result) {
             if snapshot.reviewer_session_state != "resumable" {
                 self.reset_session_launch(&snapshot.run_id, "reviewer")
@@ -7927,7 +7917,7 @@ mod tests {
     }
 
     #[test]
-    fn truncated_reviewer_output_never_reaches_delivery() {
+    fn truncated_reviewer_deltas_can_deliver_from_a_complete_retained_result() {
         let harness = Harness::new(true);
         let runner = Arc::new(
             FakeRunner::new(
@@ -7941,12 +7931,8 @@ mod tests {
         );
         let service = harness.service(runner);
         let started = start(&service, &harness.queue_entry_id);
-        let blocked = wait_for_status(&service, &started.run.id, &["blocked"]);
-        assert_eq!(
-            blocked.run.error_code.as_deref(),
-            Some("review_output_incomplete")
-        );
-        assert!(!blocked.delivery_ready);
+        let ready = wait_for_status(&service, &started.run.id, &["ready"]);
+        assert!(ready.delivery_ready);
     }
 
     #[test]
