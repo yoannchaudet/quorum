@@ -16,6 +16,11 @@ const mocks = vi.hoisted(() => ({
   approvePlan: vi.fn(),
   rejectPlan: vi.fn(),
   enqueuePlan: vi.fn(),
+  getExecution: vi.fn(),
+  startExecution: vi.fn(),
+  resumeExecution: vi.fn(),
+  cancelExecution: vi.fn(),
+  resolveExecutionFinding: vi.fn(),
   openUrl: vi.fn(),
   writeText: vi.fn()
 }));
@@ -149,6 +154,7 @@ function planDetail(required = true): PlanningDetailDto {
 describe('planning work item UX', () => {
   beforeEach(() => {
     for (const mock of Object.values(mocks)) mock.mockReset();
+    mocks.getExecution.mockResolvedValue(null);
   });
 
   it('starts planning and clearly stops before implementation', async () => {

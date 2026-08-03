@@ -3254,14 +3254,16 @@ mod tests {
                 Ok(())
             })
             .expect("seed interrupted run");
-        let reopened = AppStore::open(
-            harness
-                .store
-                .database_path()
-                .parent()
-                .expect("app data directory"),
-        )
-        .expect("reopen after interruption");
+        let Harness {
+            _directory, store, ..
+        } = harness;
+        let app_data = store
+            .database_path()
+            .parent()
+            .expect("app data directory")
+            .to_path_buf();
+        drop(store);
+        let reopened = AppStore::open(app_data).expect("reopen after interruption");
         let executor = FakeExecutor::new(
             [],
             vec![Ok(completed("# Final", "synth"))],

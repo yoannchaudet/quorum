@@ -4,6 +4,10 @@ use tauri::State;
 
 use crate::copilot::SystemProcessRunner;
 use crate::error::AppError;
+use crate::execution::{
+    CancelExecutionRequest, ExecutionDetailDto, ExecutionService, ResolveExecutionFindingRequest,
+    ResumeExecutionRequest, StartExecutionRequest,
+};
 use crate::planning::{
     EnqueuePlanRequest, PlanApprovalRequest, PlanningDetailDto, PlanningService,
     ReplanWorkItemRequest, RetryPlanningRequest, StartPlanningRequest,
@@ -338,6 +342,66 @@ pub async fn enqueue_plan(
     .await
 }
 
+#[tauri::command(rename_all = "camelCase")]
+pub async fn start_execution(
+    state: State<'_, StartupState>,
+    request: StartExecutionRequest,
+) -> Result<ExecutionDetailDto, AppError> {
+    let supervisor = Arc::clone(&state.supervisor);
+    blocking(state.store()?, move |store| {
+        ExecutionService::system(store, supervisor).start(&request)
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn get_execution(
+    state: State<'_, StartupState>,
+    work_item_id: String,
+) -> Result<Option<ExecutionDetailDto>, AppError> {
+    let supervisor = Arc::clone(&state.supervisor);
+    blocking(state.store()?, move |store| {
+        ExecutionService::system(store, supervisor).latest_for_work_item(&work_item_id)
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn resume_execution(
+    state: State<'_, StartupState>,
+    request: ResumeExecutionRequest,
+) -> Result<ExecutionDetailDto, AppError> {
+    let supervisor = Arc::clone(&state.supervisor);
+    blocking(state.store()?, move |store| {
+        ExecutionService::system(store, supervisor).resume(&request)
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn cancel_execution(
+    state: State<'_, StartupState>,
+    request: CancelExecutionRequest,
+) -> Result<ExecutionDetailDto, AppError> {
+    let supervisor = Arc::clone(&state.supervisor);
+    blocking(state.store()?, move |store| {
+        ExecutionService::system(store, supervisor).cancel(&request)
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn resolve_execution_finding(
+    state: State<'_, StartupState>,
+    request: ResolveExecutionFindingRequest,
+) -> Result<ExecutionDetailDto, AppError> {
+    let supervisor = Arc::clone(&state.supervisor);
+    blocking(state.store()?, move |store| {
+        ExecutionService::system(store, supervisor).resolve_finding(&request)
+    })
+    .await
+}
+
 #[cfg(test)]
 mod bindings_tests {
     use std::fs;
@@ -345,6 +409,11 @@ mod bindings_tests {
     use ts_rs::TS;
 
     use crate::error::AppError;
+    use crate::execution::{
+        CancelExecutionRequest, ExecutionAttemptDto, ExecutionDetailDto, ExecutionFindingDto,
+        ExecutionLogDto, ExecutionPhaseEventDto, ExecutionRunDto, ResolveExecutionFindingRequest,
+        ResumeExecutionRequest, StartExecutionRequest,
+    };
     use crate::planning::{
         EnqueuePlanRequest, PlanApprovalRequest, PlanRevisionDto, PlanningAgentDto,
         PlanningAnswerInput, PlanningDetailDto, PlanningEventDto, PlanningQuestionDto,
@@ -484,6 +553,47 @@ mod bindings_tests {
         assert_binding(
             &bindings.join("PlanningDetailDto.ts"),
             &PlanningDetailDto::export_to_string().expect("planning detail binding"),
+        );
+        assert_binding(
+            &bindings.join("StartExecutionRequest.ts"),
+            &StartExecutionRequest::export_to_string().expect("start execution binding"),
+        );
+        assert_binding(
+            &bindings.join("ResumeExecutionRequest.ts"),
+            &ResumeExecutionRequest::export_to_string().expect("resume execution binding"),
+        );
+        assert_binding(
+            &bindings.join("CancelExecutionRequest.ts"),
+            &CancelExecutionRequest::export_to_string().expect("cancel execution binding"),
+        );
+        assert_binding(
+            &bindings.join("ResolveExecutionFindingRequest.ts"),
+            &ResolveExecutionFindingRequest::export_to_string()
+                .expect("resolve execution finding binding"),
+        );
+        assert_binding(
+            &bindings.join("ExecutionRunDto.ts"),
+            &ExecutionRunDto::export_to_string().expect("execution run binding"),
+        );
+        assert_binding(
+            &bindings.join("ExecutionAttemptDto.ts"),
+            &ExecutionAttemptDto::export_to_string().expect("execution attempt binding"),
+        );
+        assert_binding(
+            &bindings.join("ExecutionLogDto.ts"),
+            &ExecutionLogDto::export_to_string().expect("execution log binding"),
+        );
+        assert_binding(
+            &bindings.join("ExecutionFindingDto.ts"),
+            &ExecutionFindingDto::export_to_string().expect("execution finding binding"),
+        );
+        assert_binding(
+            &bindings.join("ExecutionPhaseEventDto.ts"),
+            &ExecutionPhaseEventDto::export_to_string().expect("execution event binding"),
+        );
+        assert_binding(
+            &bindings.join("ExecutionDetailDto.ts"),
+            &ExecutionDetailDto::export_to_string().expect("execution detail binding"),
         );
     }
 

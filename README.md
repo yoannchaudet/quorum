@@ -5,24 +5,26 @@
 </p>
 
 Quorum is a lightweight macOS harness for semi-autonomous software work. Built
-on the Copilot CLI, it currently turns a request into a durable, reviewed plan
-that can be queued for later implementation.
+on the Copilot CLI, it turns a request into a durable, reviewed plan and can
+execute one queued plan through verification and adversarial review.
 
 ## Status
 
-M2 planning and pre-planning are implemented in the Tauri 2 macOS app. Quorum
-accepts inline Markdown, a local Markdown file, or a GitHub issue. M2 stops
-after planning and enqueueing: it does not modify registered repositories or
-execute implementation work.
+M3 execution is implemented in the Tauri 2 macOS app. Quorum accepts inline
+Markdown, a local Markdown file, or a GitHub issue, plans the work, and starts
+one queued plan only through an explicit action. Each run uses a dedicated
+managed Git branch and worktree outside the registered checkout.
 
 ## Workflow
 
-A work item follows this planning-only workflow:
+A work item follows this workflow:
 
 ```text
 inline Markdown | local Markdown file | GitHub issue
        -> independent planners -> questions -> synthesis
-       -> review and edit -> optional approval -> enqueue for later
+       -> review and edit -> optional approval -> enqueue
+       -> isolated builder -> repository verification -> adversarial review
+       -> bounded remediation and focused re-review -> ready for delivery
 ```
 
 Each planner and the synthesizer has its own UUID-backed, unique named Copilot
@@ -37,8 +39,29 @@ observable and provides manual resume/reconciliation otherwise.
 
 The synthesized plan can be reviewed, edited, and saved as a new revision.
 Plan approval is configurable per work item; when required, approval gates
-enqueueing. Enqueueing only persists intent for later implementation and does
-not start implementation.
+enqueueing. Enqueueing does not auto-start work: the queued plan exposes a
+separate execution action.
+
+Execution captures the exact clean, attached source `HEAD`, creates a
+`quorum/<work-item>-<run-id>` branch in an application-data worktree, and
+starts a persisted named builder session. Quorum discovers verification in
+this order: Makefile `check`, Makefile `test`, package.json `test`, then Cargo
+`test`. Builder, verification, and reviewer processes run under a whole-process
+macOS Seatbelt profile that permits writes only in the managed worktree. The
+Copilot CLI's experimental `/sandbox` is not used as the security boundary
+because it does not OS-sandbox built-in file edits; platforms without configured
+whole-process confinement fail closed. After verification succeeds, a separately
+named adversarial reviewer receives the persisted plan, acceptance intent,
+complete bounded base diff, and verification evidence. Oversized or incomplete
+evidence blocks delivery rather than being truncated.
+
+Phase history, bounded command output, attempts, sessions, verification
+arguments, findings, and dispositions survive restarts. Interrupted work is
+blocked and resumed through a new owned attempt. Durable app/run file leases and
+explicit branch/worktree ownership claims prevent concurrent recovery and stale
+resume; persisted process identifiers are never trusted. Cancellation targets
+only the current run's owned process group. Quorum never resets, stashes, or
+cleans user work.
 
 ## Local by design
 
@@ -48,14 +71,19 @@ terminal handoffs, run history, approvals, and queue intent survive app
 restarts without being committed to target repositories. The app uses the
 user's existing Copilot and GitHub CLI sessions.
 
-## M2 architecture
+## M3 architecture
 
 - Tauri 2 macOS app with a Svelte/TypeScript interface
 - Rust orchestration and typed IPC
 - SQLite state in the application data directory
 - Copilot CLI for independent planning and synthesis sessions
+- Managed Git worktrees for builder and adversarial-review execution
+- Persisted verification evidence, bounded logs, findings, and dispositions
 - GitHub CLI for GitHub issue intake
 - Configurable terminal handoff for interactive Copilot sessions
+
+M3 does not push branches, open pull requests, remediate pull-request review,
+or schedule multiple queued jobs.
 
 ## Roadmap
 
