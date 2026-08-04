@@ -502,7 +502,7 @@ impl ExecutionProcessRunner for SystemExecutionProcessRunner {
         control.install_child(child)?;
         let mut child_guard = InstalledChildGuard::new(control);
 
-        let mut captured_stdout = Vec::new();
+        let mut stdout_tail = Vec::new();
         let mut captured_stderr = Vec::new();
         let mut capture_truncated = false;
         let mut total_output = 0_usize;
@@ -522,12 +522,16 @@ impl ExecutionProcessRunner for SystemExecutionProcessRunner {
                         if retained > 0 {
                             chunk.bytes.truncate(retained);
                             total_output += retained;
-                            capture_chunk(
-                                &chunk,
-                                &mut captured_stdout,
-                                &mut captured_stderr,
-                                &mut capture_truncated,
-                            );
+                            if chunk.stream == "stdout" {
+                                capture_truncated |=
+                                    append_tail(&mut stdout_tail, &chunk.bytes, MAX_CAPTURE_BYTES);
+                            } else {
+                                capture_prefix(
+                                    &mut captured_stderr,
+                                    &chunk.bytes,
+                                    &mut capture_truncated,
+                                );
+                            }
                             output(chunk);
                         }
                         if retained < chunk_length {
@@ -565,11 +569,28 @@ impl ExecutionProcessRunner for SystemExecutionProcessRunner {
             success: status.success() && !control.cancelled() && !output_limit_exceeded,
             exit_code: status.code(),
             status: rendered_status,
-            stdout: captured_stdout,
+            stdout: stdout_tail,
             stderr: captured_stderr,
             capture_truncated,
         })
     }
+}
+
+fn append_tail(destination: &mut Vec<u8>, bytes: &[u8], limit: usize) -> bool {
+    if bytes.len() >= limit {
+        destination.clear();
+        destination.extend_from_slice(&bytes[bytes.len() - limit..]);
+        return true;
+    }
+    let overflow = destination
+        .len()
+        .saturating_add(bytes.len())
+        .saturating_sub(limit);
+    if overflow > 0 {
+        destination.drain(..overflow);
+    }
+    destination.extend_from_slice(bytes);
+    overflow > 0
 }
 
 struct InstalledChildGuard<'a> {
@@ -822,25 +843,15 @@ fn spawn_reader(
     })
 }
 
-fn capture_chunk(
-    chunk: &ProcessChunk,
-    stdout: &mut Vec<u8>,
-    stderr: &mut Vec<u8>,
-    truncated: &mut bool,
-) {
-    let destination = if chunk.stream == "stderr" {
-        stderr
-    } else {
-        stdout
-    };
+fn capture_prefix(destination: &mut Vec<u8>, bytes: &[u8], truncated: &mut bool) {
     let remaining = MAX_CAPTURE_BYTES.saturating_sub(destination.len());
     if remaining == 0 {
         *truncated = true;
         return;
     }
-    let retained = remaining.min(chunk.bytes.len());
-    destination.extend_from_slice(&chunk.bytes[..retained]);
-    *truncated |= retained < chunk.bytes.len();
+    let retained = remaining.min(bytes.len());
+    destination.extend_from_slice(&bytes[..retained]);
+    *truncated |= retained < bytes.len();
 }
 
 #[derive(Clone)]
@@ -1125,6 +1136,7 @@ impl ExecutionService {
                 |row| row.get(0),
             )?;
             let timestamp = now();
+            rotate_unconfirmed_session(&transaction, &run_id, &record.1, &timestamp)?;
             transaction.execute(
                 "INSERT INTO execution_attempts (
                    id, run_id, number, reason, status, started_at
@@ -2298,6 +2310,77 @@ fn short_id(value: &str) -> String {
 
 fn now() -> String {
     Utc::now().to_rfc3339()
+}
+
+fn rotate_unconfirmed_session(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    current_step: &str,
+    timestamp: &str,
+) -> Result<(), StoreError> {
+    let (state_column, id_column, name_column) = match current_step {
+        "building" | "remediating" => (
+            "builder_session_state",
+            "builder_session_id",
+            "builder_session_name",
+        ),
+        "reviewing" => (
+            "reviewer_session_state",
+            "reviewer_session_id",
+            "reviewer_session_name",
+        ),
+        _ => return Ok(()),
+    };
+    let query =
+        format!("SELECT {state_column}, {name_column} FROM execution_runs WHERE run_id = ?1");
+    let (state, name): (String, String) =
+        transaction.query_row(&query, [run_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    if state != "not_started" {
+        return Ok(());
+    }
+    let session_id = Uuid::new_v4().to_string();
+    let base_name = name.split("-retry-").next().unwrap_or(&name);
+    let session_name = format!("{base_name}-retry-{}", short_id(&session_id));
+    let update = format!(
+        "UPDATE execution_runs
+         SET {id_column} = ?2, {name_column} = ?3, updated_at = ?4
+         WHERE run_id = ?1 AND {state_column} = 'not_started'"
+    );
+    transaction.execute(
+        &update,
+        params![run_id, session_id, session_name, timestamp],
+    )?;
+    Ok(())
+}
+
+fn copilot_log_messages(stdout: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|event| {
+            let event_type = event.get("type").and_then(Value::as_str)?;
+            match event_type {
+                "assistant.message" => {
+                    let content = event
+                        .get("data")
+                        .and_then(|data| data.get("content"))
+                        .or_else(|| event.get("content"))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|content| !content.is_empty());
+                    Some(content.map_or_else(
+                        || "Copilot completed the session.".to_owned(),
+                        ToOwned::to_owned,
+                    ))
+                }
+                "error" => event
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 fn status_for_step(step: &str) -> &'static str {
@@ -3637,16 +3720,6 @@ impl ExecutionService {
                 &execution.result,
             ));
         }
-        if execution.result.capture_truncated {
-            if snapshot.reviewer_session_state != "resumable" {
-                self.reset_session_launch(&snapshot.run_id, "reviewer")
-                    .map_err(WorkerError::database)?;
-            }
-            return Err(WorkerError::new(
-                "review_output_incomplete",
-                "The reviewer output exceeded Quorum's complete-capture bound. Delivery is blocked because the structured review result may be incomplete.",
-            ));
-        }
         if !copilot_session_confirmed(&execution.result) {
             if snapshot.reviewer_session_state != "resumable" {
                 self.reset_session_launch(&snapshot.run_id, "reviewer")
@@ -4192,46 +4265,66 @@ impl ExecutionService {
         let mut persisted_bytes = 0_usize;
         let mut persist_error = None;
         let mut truncation_logged = false;
-        let mut persist_chunk = |chunk: ProcessChunk| {
-            if persist_error.is_some() {
-                return;
-            }
-            let remaining = MAX_PERSISTED_COMMAND_BYTES.saturating_sub(persisted_bytes);
-            if remaining == 0 {
-                if !truncation_logged {
-                    persist_error = self
-                        .append_log(
-                            &snapshot.run_id,
-                            &command_id,
-                            sequence,
-                            "system",
-                            "[Further command output omitted by Quorum's persisted log limit.]",
-                            true,
-                        )
-                        .err();
-                    sequence += 1;
-                    truncation_logged = true;
+        let copilot_json_stream = request
+            .arguments
+            .iter()
+            .any(|argument| argument == "--stream=on");
+        let result = {
+            let mut persist_chunk = |chunk: ProcessChunk| {
+                if persist_error.is_some() {
+                    return;
                 }
-                return;
+                if copilot_json_stream && chunk.stream == "stdout" {
+                    return;
+                }
+                let remaining = MAX_PERSISTED_COMMAND_BYTES.saturating_sub(persisted_bytes);
+                if remaining == 0 {
+                    if !truncation_logged {
+                        persist_error = self
+                            .append_log(
+                                &snapshot.run_id,
+                                &command_id,
+                                sequence,
+                                "system",
+                                "[Further command output omitted by Quorum's persisted log limit.]",
+                                true,
+                            )
+                            .err();
+                        sequence += 1;
+                        truncation_logged = true;
+                    }
+                    return;
+                }
+                let retained = remaining.min(chunk.bytes.len());
+                let text = String::from_utf8_lossy(&chunk.bytes[..retained]);
+                if let Err(error) = self.append_log(
+                    &snapshot.run_id,
+                    &command_id,
+                    sequence,
+                    chunk.stream,
+                    &text,
+                    retained < chunk.bytes.len(),
+                ) {
+                    persist_error = Some(error);
+                    return;
+                }
+                sequence += 1;
+                persisted_bytes += retained;
+                truncation_logged |= retained < chunk.bytes.len();
+            };
+            let result = self.runner.run(&request, control, &mut persist_chunk);
+            if copilot_json_stream {
+                if let Ok(result) = &result {
+                    for message in copilot_log_messages(&result.stdout) {
+                        persist_chunk(ProcessChunk {
+                            stream: "stdout",
+                            bytes: message.into_bytes(),
+                        });
+                    }
+                }
             }
-            let retained = remaining.min(chunk.bytes.len());
-            let text = String::from_utf8_lossy(&chunk.bytes[..retained]);
-            if let Err(error) = self.append_log(
-                &snapshot.run_id,
-                &command_id,
-                sequence,
-                chunk.stream,
-                &text,
-                retained < chunk.bytes.len(),
-            ) {
-                persist_error = Some(error);
-                return;
-            }
-            sequence += 1;
-            persisted_bytes += retained;
-            truncation_logged |= retained < chunk.bytes.len();
+            result
         };
-        let result = self.runner.run(&request, control, &mut persist_chunk);
         let git_metadata_error = request
             .untrusted
             .then(|| validate_snapshot_git_metadata(snapshot))
@@ -4473,7 +4566,6 @@ fn copilot_common_arguments(worktree_path: &Path, reviewer: bool) -> Vec<String>
         "--stream=on".to_owned(),
         "--silent".to_owned(),
         "--no-ask-user".to_owned(),
-        "--no-custom-instructions".to_owned(),
         "--disable-builtin-mcps".to_owned(),
         "--disallow-temp-dir".to_owned(),
         "--allow-all-tools".to_owned(),
@@ -4509,14 +4601,7 @@ fn copilot_process_request(
     secure_directory(&logs, &runtime_root)?;
     let mut arguments = arguments;
     arguments.extend(["--log-dir".to_owned(), logs.to_string_lossy().into_owned()]);
-    let environment = [
-        ("COPILOT_HOME", runtime.join("copilot-home")),
-        ("TMPDIR", runtime.join("tmp")),
-        ("XDG_CACHE_HOME", runtime.join("xdg-cache")),
-        ("XDG_CONFIG_HOME", runtime.join("xdg-config")),
-        ("XDG_DATA_HOME", runtime.join("xdg-data")),
-        ("XDG_STATE_HOME", runtime.join("xdg-state")),
-    ];
+    let environment = copilot_environment(&runtime);
     for (_, path) in &environment {
         secure_directory(path, &runtime_root)?;
     }
@@ -4547,8 +4632,64 @@ fn copilot_process_request(
         .into_iter()
         .map(|(name, path)| (name.to_owned(), path.to_string_lossy().into_owned()))
         .collect();
+    #[cfg(not(test))]
+    request
+        .environment
+        .push(copilot_authentication_environment()?);
     request.untrusted = true;
     Ok(request)
+}
+
+#[cfg(not(test))]
+fn copilot_authentication_environment() -> Result<(String, String), WorkerError> {
+    if let Some(token) = inherited_copilot_token(|name| std::env::var(name).ok()) {
+        return Ok(("COPILOT_GITHUB_TOKEN".to_owned(), token));
+    }
+    let gh = resolve_executable("gh").ok_or_else(|| {
+        WorkerError::new(
+            "copilot_auth",
+            "Copilot authentication is unavailable because GitHub CLI was not found on PATH. Install `gh`, run `gh auth login`, and resume execution.",
+        )
+    })?;
+    let output = Command::new(gh)
+        .args(["auth", "token"])
+        .output()
+        .map_err(|error| {
+            WorkerError::new(
+                "copilot_auth",
+                format!("GitHub CLI could not provide Copilot authentication: {error}"),
+            )
+        })?;
+    let token = String::from_utf8(output.stdout)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let Some(token) = token.filter(|_| output.status.success()) else {
+        return Err(WorkerError::new(
+            "copilot_auth",
+            "GitHub CLI has no usable authentication token. Run `gh auth login`, then resume execution.",
+        ));
+    };
+    Ok(("COPILOT_GITHUB_TOKEN".to_owned(), token))
+}
+
+fn inherited_copilot_token(mut lookup: impl FnMut(&str) -> Option<String>) -> Option<String> {
+    ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]
+        .into_iter()
+        .find_map(|name| lookup(name).filter(|value| !value.trim().is_empty()))
+}
+
+fn copilot_environment(runtime: &Path) -> [(&'static str, PathBuf); 7] {
+    let copilot_home = runtime.join("copilot-home");
+    [
+        ("HOME", copilot_home.clone()),
+        ("COPILOT_HOME", copilot_home),
+        ("TMPDIR", runtime.join("tmp")),
+        ("XDG_CACHE_HOME", runtime.join("xdg-cache")),
+        ("XDG_CONFIG_HOME", runtime.join("xdg-config")),
+        ("XDG_DATA_HOME", runtime.join("xdg-data")),
+        ("XDG_STATE_HOME", runtime.join("xdg-state")),
+    ]
 }
 
 fn verification_process_request(snapshot: &WorkerSnapshot) -> Result<ProcessRequest, WorkerError> {
@@ -6020,7 +6161,6 @@ fn process_failure(code: &str, prefix: &str, result: &ProcessResult) -> WorkerEr
 
 fn copilot_session_confirmed(result: &ProcessResult) -> bool {
     result.success
-        && !result.capture_truncated
         && String::from_utf8_lossy(&result.stdout).lines().any(|line| {
             serde_json::from_str::<Value>(line)
                 .ok()
@@ -6213,7 +6353,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     use super::macos_sandbox_profile;
     use super::{
-        collect_base_evidence, collect_base_evidence_bytes, open_output_file,
+        collect_base_evidence, collect_base_evidence_bytes, copilot_environment,
+        copilot_log_messages, copilot_session_confirmed, inherited_copilot_token, open_output_file,
         preflight_with_executables, process_evidence, resolve_executable, run_owned_process,
         validate_confinement_tree, CancelExecutionRequest, EvidenceBudget, ExecutionDetailDto,
         ExecutionProcessRunner, ExecutionService, ExecutionSupervisor, ProcessChunk,
@@ -7423,14 +7564,15 @@ mod tests {
             blocked.run.error_code.as_deref(),
             Some("process_start_failed")
         );
-        let state: String = harness
+        let (state, first_session_id): (String, String) = harness
             .store
             .with_connection(|connection| {
                 connection
                     .query_row(
-                        "SELECT builder_session_state FROM execution_runs WHERE run_id = ?1",
+                        "SELECT builder_session_state, builder_session_id
+                         FROM execution_runs WHERE run_id = ?1",
                         [&started.run.id],
-                        |row| row.get(0),
+                        |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .map_err(Into::into)
             })
@@ -7469,6 +7611,10 @@ mod tests {
             .arguments
             .iter()
             .any(|argument| argument == "--session-id"));
+        assert!(!builder
+            .arguments
+            .iter()
+            .any(|argument| argument == &first_session_id));
         assert!(!builder
             .arguments
             .iter()
@@ -7770,7 +7916,7 @@ mod tests {
     }
 
     #[test]
-    fn truncated_reviewer_output_never_reaches_delivery() {
+    fn truncated_reviewer_deltas_can_deliver_from_a_complete_retained_result() {
         let harness = Harness::new(true);
         let runner = Arc::new(
             FakeRunner::new(
@@ -7784,12 +7930,8 @@ mod tests {
         );
         let service = harness.service(runner);
         let started = start(&service, &harness.queue_entry_id);
-        let blocked = wait_for_status(&service, &started.run.id, &["blocked"]);
-        assert_eq!(
-            blocked.run.error_code.as_deref(),
-            Some("review_output_incomplete")
-        );
-        assert!(!blocked.delivery_ready);
+        let ready = wait_for_status(&service, &started.run.id, &["ready"]);
+        assert!(ready.delivery_ready);
     }
 
     #[test]
@@ -7878,6 +8020,28 @@ mod tests {
     }
 
     #[test]
+    fn copilot_home_keeps_package_extraction_inside_the_sandbox() {
+        let runtime = Path::new("/managed/.quorum-runtime/builder");
+        let environment = copilot_environment(runtime);
+        let home = environment
+            .iter()
+            .find_map(|(name, path)| (*name == "HOME").then_some(path));
+        assert_eq!(home, Some(&runtime.join("copilot-home")));
+        assert!(home.expect("HOME").starts_with(runtime));
+    }
+
+    #[test]
+    fn copilot_authentication_prefers_documented_secret_environment_variables() {
+        let token = inherited_copilot_token(|name| match name {
+            "COPILOT_GITHUB_TOKEN" => Some(String::new()),
+            "GH_TOKEN" => Some("github-cli-token".to_owned()),
+            "GITHUB_TOKEN" => Some("fallback-token".to_owned()),
+            _ => None,
+        });
+        assert_eq!(token.as_deref(), Some("github-cli-token"));
+    }
+
+    #[test]
     fn process_runner_drains_final_output_after_child_exit() {
         let request = ProcessRequest::new(
             "/bin/sh".to_owned(),
@@ -7900,6 +8064,25 @@ mod tests {
         assert!(result.success);
         assert!(result.stdout.ends_with(b"FINAL"));
         assert!(streamed.ends_with(b"FINAL"));
+    }
+
+    #[test]
+    fn process_runner_retains_completion_evidence_after_capture_truncation() {
+        let request = ProcessRequest::new(
+            "/bin/sh".to_owned(),
+            vec![
+                "-c".to_owned(),
+                "dd if=/dev/zero bs=600000 count=1 2>/dev/null | tr '\\000' x; printf '\\n{\"type\":\"assistant.message\"}\\n'"
+                    .to_owned(),
+            ],
+            PathBuf::from("/"),
+        );
+        let result = SystemExecutionProcessRunner
+            .run(&request, &RunControl::default(), &mut |_| {})
+            .expect("capture process tail");
+        assert!(result.success);
+        assert!(result.capture_truncated);
+        assert!(copilot_session_confirmed(&result));
     }
 
     #[test]
@@ -8006,6 +8189,34 @@ mod tests {
         let evidence = process_evidence(&result);
         assert!(evidence.ends_with("[diagnostic truncated]"));
         assert!(evidence.is_char_boundary(evidence.len()));
+    }
+
+    #[test]
+    fn truncated_builder_capture_can_confirm_from_the_retained_stdout_tail() {
+        let result = ProcessResult {
+            success: true,
+            exit_code: Some(0),
+            status: "exit status: 0".to_owned(),
+            stdout: br#"{"type":"assistant.message","data":{"content":"done"}}"#.to_vec(),
+            stderr: Vec::new(),
+            capture_truncated: true,
+        };
+        assert!(copilot_session_confirmed(&result));
+    }
+
+    #[test]
+    fn copilot_logs_keep_complete_messages_and_drop_streaming_deltas() {
+        let stdout = br#"{"type":"assistant.tool_call_delta","data":"partial"}
+{"type":"assistant.message","data":{"content":"Implemented the requested change."}}
+{"type":"error","message":"Actionable failure"}
+"#;
+        assert_eq!(
+            copilot_log_messages(stdout),
+            [
+                "Implemented the requested change.".to_owned(),
+                "Actionable failure".to_owned()
+            ]
+        );
     }
 
     #[test]
