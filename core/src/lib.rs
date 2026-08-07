@@ -10,5 +10,5 @@ pub mod state;
 
 pub use config::Config;
 pub use coordinator::Coordinator;
-pub use persistence::Store;
+pub use persistence::{Store, Transition};
 pub use state::{Kind, State};
