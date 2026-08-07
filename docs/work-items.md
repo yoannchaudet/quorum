@@ -33,6 +33,9 @@ Images are first-class — they will be used extensively.
 The WI's normalized markdown is stored in `quorum.db`; only binary images live under
 `assets/`.
 
+`implementation/` is the IM's **writable sandbox workspace** (its cwd). PL and RV run
+read-only against the WI, assets, and IM output. See [isolation](isolation.md).
+
 ## Validation (during Intake)
 
 - File exists and is valid UTF-8 markdown.

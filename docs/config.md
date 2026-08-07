@@ -21,6 +21,20 @@ models:
   reviewer: <model-id>          # MUST differ from implementer
   coordinator: <model-id>       # used for merge/convergence prompts
 
+# Execution isolation (see isolation.md). Applied to every agent invocation.
+sandbox:
+  enabled: true                 # run agents inside Copilot's local sandbox
+  experimental: true            # local sandbox currently requires --experimental
+  # Destructive tools denied even inside the sandbox (defense in depth).
+  deny_tools:
+    - shell(rm)
+  # Per-role filesystem posture. IM is the only writer.
+  roles:
+    planner:      { filesystem: read-only,  network: true }
+    reviewer:     { filesystem: read-only,  network: true }
+    implementer:  { filesystem: read-write, network: true }
+  cloud: false                  # future: interactive-only, unusable unattended
+
 # Human-review gates (see state-machine.md).
 reviews:
   plan_review: true             # PlanReview gate on/off
@@ -44,3 +58,5 @@ CLI flag > config file > built-in default.
 - Model IDs are the only vendor-specific values; the *roster size and roles* are fixed in
   the [docs](agents.md).
 - `reviewer` MUST differ from `implementer` for the adversarial loop to be meaningful.
+- `sandbox.cloud` is reserved for the future; the unattended CO can only use the local
+  sandbox (see [isolation](isolation.md)).
