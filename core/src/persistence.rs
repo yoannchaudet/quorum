@@ -6,8 +6,9 @@
 //! the schema and open/migrate path are real so `verify` is meaningful.
 
 use crate::state::State;
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The current schema version. Bump when `migrate` changes.
 pub const SCHEMA_VERSION: i64 = 1;
@@ -17,8 +18,17 @@ pub const SCHEMA_VERSION: i64 = 1;
 pub enum StoreError {
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
-    #[error("no state row found")]
-    MissingState,
+    #[error("stored state {0:?} is not a known state")]
+    UnknownState(String),
+}
+
+/// A recorded state transition, newest-relevant order as inserted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Transition {
+    pub from: Option<State>,
+    pub to: State,
+    pub reason: String,
+    pub ts: String,
 }
 
 /// A handle to a work item's SQLite database.
@@ -134,11 +144,85 @@ impl Store {
                 row.get::<_, String>(0)
             });
         match row {
-            Ok(s) => Ok(serde_yaml::from_str(&s).ok()),
+            Ok(s) => State::from_db_str(&s)
+                .map(Some)
+                .ok_or(StoreError::UnknownState(s)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
+
+    /// Atomically advance the persisted state and record the transition.
+    ///
+    /// Updates the single `state` row, appends to `transitions`, and appends an
+    /// `events` row — all in one SQLite transaction, so a crash leaves either
+    /// the whole transition or none of it (see `docs/persistence.md`).
+    pub fn record_transition(
+        &mut self,
+        from: Option<State>,
+        to: State,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        let ts = now_millis();
+        let from_s = from.map(|s| s.as_str());
+        let to_s = to.as_str();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO state (id, state, updated_at) VALUES (1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at",
+            params![to_s, ts],
+        )?;
+        tx.execute(
+            "INSERT INTO transitions (from_state, to_state, reason, ts) VALUES (?1, ?2, ?3, ?4)",
+            params![from_s, to_s, reason, ts],
+        )?;
+        let data = format!("{}->{}", from_s.unwrap_or("-"), to_s);
+        tx.execute(
+            "INSERT INTO events (ts, kind, data) VALUES (?1, 'transition', ?2)",
+            params![ts, data],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The full transition history, in the order it was recorded.
+    pub fn history(&self) -> Result<Vec<Transition>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT from_state, to_state, reason, ts FROM transitions ORDER BY id ASC")?;
+        let rows = stmt.query_map([], |row| {
+            let from: Option<String> = row.get(0)?;
+            let to: String = row.get(1)?;
+            let reason: String = row.get(2)?;
+            let ts: String = row.get(3)?;
+            Ok((from, to, reason, ts))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (from, to, reason, ts) = row?;
+            let from = match from {
+                Some(s) => Some(State::from_db_str(&s).ok_or(StoreError::UnknownState(s))?),
+                None => None,
+            };
+            let to = State::from_db_str(&to).ok_or(StoreError::UnknownState(to))?;
+            out.push(Transition {
+                from,
+                to,
+                reason,
+                ts,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// Milliseconds since the Unix epoch, as a string (sortable, dependency-free).
+fn now_millis() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+        .to_string()
 }
 
 #[cfg(test)]
@@ -152,15 +236,25 @@ mod tests {
     }
 
     #[test]
-    fn open_creates_file_and_is_reopenable() {
+    fn records_and_reads_back_transitions() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("quorum.db");
         {
-            let store = Store::open(&path).unwrap();
-            assert_eq!(store.current_state().unwrap(), None);
+            let mut store = Store::open(&path).unwrap();
+            store
+                .record_transition(Some(State::Intake), State::Planning, "auto")
+                .unwrap();
+            store
+                .record_transition(Some(State::Planning), State::Converging, "auto")
+                .unwrap();
         }
-        // Reopening the same file must migrate idempotently.
+        // Reopen to prove durability across a close (crash-resume shape).
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(store.current_state().unwrap(), Some(State::Converging));
+        let history = store.history().unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].from, Some(State::Intake));
+        assert_eq!(history[0].to, State::Planning);
+        assert_eq!(history[1].to, State::Converging);
     }
 }

@@ -60,7 +60,8 @@ fn run() -> Result<()> {
                     .with_context(|| format!("creating {}", parent.display()))?;
             }
             let store = Store::open(&db_path).context("opening state database")?;
-            let co = Coordinator::new(config, store).context("initializing coordinator")?;
+            let mut co = Coordinator::new(config, store).context("initializing coordinator")?;
+            co.run_until_blocked().context("advancing work item")?;
             report(&wi_id, co.state());
         }
         Command::Status { db } => {

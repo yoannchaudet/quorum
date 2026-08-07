@@ -74,11 +74,10 @@ impl State {
     pub fn can_transition_to(self, next: State) -> bool {
         self.allowed_next().contains(&next)
     }
-}
 
-impl fmt::Display for State {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
+    /// The canonical string used to persist this state.
+    pub fn as_str(self) -> &'static str {
+        match self {
             State::Intake => "Intake",
             State::IntakeReview => "IntakeReview",
             State::Planning => "Planning",
@@ -90,8 +89,32 @@ impl fmt::Display for State {
             State::Done => "Done",
             State::Failed => "Failed",
             State::Abandoned => "Abandoned",
+        }
+    }
+
+    /// Parse a state from its canonical string, as stored in the DB.
+    pub fn from_db_str(s: &str) -> Option<State> {
+        let v = match s {
+            "Intake" => State::Intake,
+            "IntakeReview" => State::IntakeReview,
+            "Planning" => State::Planning,
+            "Converging" => State::Converging,
+            "PlanReview" => State::PlanReview,
+            "Implementing" => State::Implementing,
+            "Reviewing" => State::Reviewing,
+            "WorkReview" => State::WorkReview,
+            "Done" => State::Done,
+            "Failed" => State::Failed,
+            "Abandoned" => State::Abandoned,
+            _ => return None,
         };
-        f.write_str(s)
+        Some(v)
+    }
+}
+
+impl fmt::Display for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -137,5 +160,26 @@ mod tests {
         assert!(!State::Intake.can_transition_to(State::Done));
         assert!(!State::Done.can_transition_to(State::Planning));
         assert!(!State::Planning.can_transition_to(State::Reviewing));
+    }
+
+    #[test]
+    fn string_roundtrip_is_stable() {
+        for s in [
+            State::Intake,
+            State::IntakeReview,
+            State::Planning,
+            State::Converging,
+            State::PlanReview,
+            State::Implementing,
+            State::Reviewing,
+            State::WorkReview,
+            State::Done,
+            State::Failed,
+            State::Abandoned,
+        ] {
+            assert_eq!(State::from_db_str(s.as_str()), Some(s));
+            assert_eq!(s.to_string(), s.as_str());
+        }
+        assert_eq!(State::from_db_str("bogus"), None);
     }
 }
