@@ -15,3 +15,7 @@ Where does the name come from? I believe all models will eventually converge, an
 - At intake — providing a work item as a GitHub issue or a markdown prompt, and answering the planners' follow-up questions
 - Optionally, to review the finalized plan
 - Optionally, to review the finalized work
+
+## Documentation
+
+The Core and CLI are specified under [`docs/`](docs/README.md).
