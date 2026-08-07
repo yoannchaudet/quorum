@@ -40,6 +40,9 @@ structured — WI text, state, history, candidate plans, reviews, event log — 
   the same transaction that persisted the step's outputs.
 - **Idempotent steps**: each step writes to deterministic keys (e.g. `(planner, iteration)`)
   so a re-run after a crash overwrites cleanly rather than duplicating.
+- **Confined agent writes**: the Local Sandbox restricts each agent's writes to the WI
+  workspace, so a crashed agent never leaves state outside `<state_dir>/<wi-id>/`
+  (see [isolation](isolation.md)).
 
 ## Resume after crash
 

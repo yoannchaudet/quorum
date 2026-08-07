@@ -13,8 +13,9 @@ only stateful orchestrator; PL/IM/RV are stateless workers given explicit inputs
 
 ## Planners (PL) — the quorum
 
-- Each PL produces a **candidate plan** for the WI **in isolation**: it sees the WI and
-  HI answers, but never another PL's output. Isolation keeps ideas independent.
+- Each PL produces a **candidate plan** for the WI **in isolation** (*idea isolation*): it
+  sees the WI and HI answers, but never another PL's output. This keeps ideas independent.
+  (Distinct from *execution isolation* — see below.)
 - PLs may raise **follow-up questions**. If any do, the CO enters `IntakeReview` (HI),
   collects answers, and re-runs the PLs.
 
@@ -61,3 +62,17 @@ The CO pulls humans in at exactly three points, each a blocked state:
 
 All HI happens through a resumable [Session](sessions.md). All prompts the CO gives any
 agent live as reviewable markdown files (see [prompts](prompts.md)).
+
+## Execution isolation
+
+Every agent (PL, IM, RV) runs inside a Local Sandbox (LS), non-interactively, with a
+per-role filesystem profile. This is separate from the *idea isolation* above.
+
+| Role | Filesystem |
+|------|-----------|
+| PL | read-only |
+| RV | read-only |
+| IM | read/write, confined to its WI workspace |
+
+Full details — invocation flags, deny-list, network policy — are in
+[isolation](isolation.md).

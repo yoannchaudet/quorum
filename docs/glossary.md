@@ -15,6 +15,9 @@ Every term is defined here once. Elsewhere we use the acronym.
 | Human Intervention | HI | A point where the CO pauses autonomous progress and requires a human (intake answers, plan review, or work review). |
 | Core | — | The Rust library crate implementing all Quorum logic (state machine, agents, persistence). |
 | CLI | — | The Rust binary crate that drives the Core for a single WI. Light; no multi-item orchestration. |
+| Local Sandbox | LS | Copilot's OS-level sandbox (`--sandbox`) that confines an agent's filesystem, network, and tool access. Quorum's execution-isolation boundary (see [isolation](isolation.md)). |
+| Idea Isolation | — | Keeping each PL from seeing other PLs' output, so candidate plans stay independent (see [agents](agents.md)). |
+| Execution Isolation | — | Confining an agent's actions (filesystem/network/tools) via the LS, so unattended runs are safe (see [isolation](isolation.md)). |
 
 ## Roles at a glance
 

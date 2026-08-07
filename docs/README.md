@@ -9,11 +9,12 @@ Specifications for Quorum's **Core** and **CLI**. Design-on-paper; no code yet.
 3. [work-items.md](work-items.md) — what a WI is; GitHub pull; images.
 4. [state-machine.md](state-machine.md) — the backbone: states, loops, HI signaling.
 5. [agents.md](agents.md) — CO, PL quorum, IM↔RV, convergence, HI.
-6. [prompts.md](prompts.md) — prompts as markdown files with frontmatter.
-7. [sessions.md](sessions.md) — HI via resumable `copilot` sessions.
-8. [config.md](config.md) — `~/.quorum/config.yaml` schema.
-9. [persistence.md](persistence.md) — crash resilience and recovery.
-10. [dev-lifecycle.md](dev-lifecycle.md) — Makefile: `verify` / `verify-full`.
+6. [isolation.md](isolation.md) — execution isolation: local sandbox + per-role profiles.
+7. [prompts.md](prompts.md) — prompts as markdown files with frontmatter.
+8. [sessions.md](sessions.md) — HI via resumable `copilot` sessions.
+9. [config.md](config.md) — `~/.quorum/config.yaml` schema.
+10. [persistence.md](persistence.md) — crash resilience and recovery.
+11. [dev-lifecycle.md](dev-lifecycle.md) — Makefile: `verify` / `verify-full`.
 
 ## Doc style rules
 
