@@ -22,6 +22,8 @@ pub struct Config {
     pub reviews: Reviews,
     /// Loop bounds and resilience knobs.
     pub limits: Limits,
+    /// Execution isolation (see `docs/isolation.md`).
+    pub sandbox: Sandbox,
 }
 
 /// Model ids for the non-planner roles.
@@ -54,6 +56,18 @@ pub struct Limits {
     pub step_timeout_secs: u64,
 }
 
+/// Execution isolation applied to every agent invocation (see `docs/isolation.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Sandbox {
+    /// Run agents inside Copilot's local sandbox.
+    pub enabled: bool,
+    /// The local sandbox currently requires `--experimental`.
+    pub experimental: bool,
+    /// Destructive tools denied even inside the sandbox (defense in depth).
+    pub deny_tools: Vec<String>,
+}
+
 /// Errors surfaced while loading or validating configuration.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -76,6 +90,17 @@ impl Default for Config {
             models: Models::default(),
             reviews: Reviews::default(),
             limits: Limits::default(),
+            sandbox: Sandbox::default(),
+        }
+    }
+}
+
+impl Default for Sandbox {
+    fn default() -> Self {
+        Sandbox {
+            enabled: true,
+            experimental: true,
+            deny_tools: vec!["shell(rm)".to_string()],
         }
     }
 }
@@ -175,6 +200,9 @@ mod tests {
         assert!(c.planners.contains_key("planner-a"));
         assert!(c.planners.contains_key("planner-b"));
         assert!(c.planners.contains_key("planner-c"));
+        assert!(c.sandbox.enabled);
+        assert!(c.sandbox.experimental);
+        assert_eq!(c.sandbox.deny_tools, vec!["shell(rm)".to_string()]);
     }
 
     #[test]
