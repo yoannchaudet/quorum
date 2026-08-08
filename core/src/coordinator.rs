@@ -26,6 +26,8 @@ pub enum CoordinatorError {
     IllegalTransition { from: State, to: State },
     #[error("no work item has been loaded")]
     NoWorkItem,
+    #[error("no plan is available to implement")]
+    NoPlan,
     #[error("cannot {decision} in state {state} (not an applicable human-intervention state)")]
     InvalidResolution { state: State, decision: Decision },
 }
@@ -247,6 +249,54 @@ impl Coordinator {
         Ok(converged)
     }
 
+    /// Run the Implementer (IM) against the accepted Plan, in its writable
+    /// workspace, and persist the summary it returns.
+    ///
+    /// The IM runs read/write, confined to the `implementation/` subdirectory of
+    /// the WI workspace (its sandbox cwd, see `docs/isolation.md`). On re-entry
+    /// from the adversarial loop, the latest review feedback is fed back in.
+    fn run_implementer(&mut self) -> Result<(), CoordinatorError> {
+        let work_item = self
+            .store
+            .work_item()?
+            .ok_or(CoordinatorError::NoWorkItem)?;
+        let plan = self.store.plan()?.ok_or(CoordinatorError::NoPlan)?;
+        let feedback = self
+            .store
+            .latest_review()?
+            .filter(|(_, accepted)| !accepted)
+            .map(|(text, _)| text)
+            .unwrap_or_default();
+
+        // The IM's writable sandbox cwd is the workspace's implementation/ dir.
+        let impl_dir = self.workspace.join("implementation");
+        std::fs::create_dir_all(&impl_dir).map_err(|source| AgentError::Spawn {
+            role: "IM".to_string(),
+            source,
+        })?;
+
+        let rendered = Prompt::implementer().render(&[
+            ("work_item", &work_item),
+            ("plan", &plan),
+            ("feedback", &feedback),
+        ])?;
+        let req = AgentRequest {
+            role: "IM".to_string(),
+            prompt: rendered,
+            cwd: impl_dir,
+            filesystem: Filesystem::ReadWrite,
+        };
+        let output = self.runner.run(&req)?;
+
+        // The IM iteration tracks adversarial rounds: one past the latest review.
+        let iteration = match self.store.latest_implementation()? {
+            Some((prev, _)) => prev + 1,
+            None => 0,
+        };
+        self.store.save_implementation(iteration, &output)?;
+        Ok(())
+    }
+
     /// Advance the WI by one autonomous step, performing any agent work the
     /// current state requires before transitioning.
     ///
@@ -282,7 +332,10 @@ impl Coordinator {
                     Planning
                 }
             }
-            Implementing => Reviewing,
+            Implementing => {
+                self.run_implementer()?;
+                Reviewing
+            }
             Reviewing => {
                 if self.config.reviews.work_review {
                     WorkReview
@@ -318,10 +371,13 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    fn coordinator_with_wi(config: Config) -> Coordinator {
+    fn coordinator_with_wi(config: Config) -> (Coordinator, tempfile::TempDir) {
+        let workspace = tempfile::tempdir().unwrap();
         let mut store = Store::open_in_memory().unwrap();
         store.set_work_item("# WI\ndo the thing").unwrap();
-        Coordinator::new(config, store, Box::new(EchoRunner), PathBuf::from(".")).unwrap()
+        let co =
+            Coordinator::new(config, store, Box::new(EchoRunner), workspace.path().into()).unwrap();
+        (co, workspace)
     }
 
     /// A runner whose merge output reports `ITERATE` for the first `iterate_times`
@@ -365,7 +421,7 @@ mod tests {
 
     #[test]
     fn new_coordinator_starts_at_intake() {
-        let co = coordinator_with_wi(Config::default());
+        let (co, _tmp) = coordinator_with_wi(Config::default());
         assert_eq!(co.state(), State::Intake);
     }
 
@@ -384,7 +440,7 @@ mod tests {
 
     #[test]
     fn runs_until_first_review_gate_by_default() {
-        let mut co = coordinator_with_wi(Config::default());
+        let (mut co, _tmp) = coordinator_with_wi(Config::default());
         let state = co.run_until_blocked().unwrap();
         assert_eq!(state, State::PlanReview);
 
@@ -397,7 +453,7 @@ mod tests {
 
     #[test]
     fn planning_persists_a_candidate_per_planner() {
-        let mut co = coordinator_with_wi(Config::default());
+        let (mut co, _tmp) = coordinator_with_wi(Config::default());
         co.run_until_blocked().unwrap();
         let candidates = co.store.candidates(0).unwrap();
         // Default roster has three planner slots.
@@ -408,7 +464,7 @@ mod tests {
     #[test]
     fn single_pass_convergence_persists_a_plan() {
         // EchoRunner reports CONVERGED, so one pass suffices.
-        let mut co = coordinator_with_wi(Config::default());
+        let (mut co, _tmp) = coordinator_with_wi(Config::default());
         assert_eq!(co.run_until_blocked().unwrap(), State::PlanReview);
         let plan = co.store.plan().unwrap();
         assert!(plan.is_some(), "a converged plan must be persisted");
@@ -468,7 +524,7 @@ mod tests {
         let mut config = Config::default();
         config.reviews.plan_review = false;
         config.reviews.work_review = false;
-        let mut co = coordinator_with_wi(config);
+        let (mut co, _tmp) = coordinator_with_wi(config);
         let state = co.run_until_blocked().unwrap();
         assert_eq!(state, State::Done);
 
@@ -486,8 +542,53 @@ mod tests {
     }
 
     #[test]
+    fn implementer_persists_summary_and_creates_workspace() {
+        let mut config = Config::default();
+        config.reviews.plan_review = false;
+        config.reviews.work_review = false;
+        let (mut co, tmp) = coordinator_with_wi(config);
+        assert_eq!(co.run_until_blocked().unwrap(), State::Done);
+
+        // The IM summary is persisted at iteration 0.
+        let latest = co.store.latest_implementation().unwrap();
+        assert!(latest.is_some());
+        let (iteration, summary) = latest.unwrap();
+        assert_eq!(iteration, 0);
+        assert!(summary.contains("IM"));
+
+        // The IM's writable workspace was created.
+        assert!(tmp.path().join("implementation").is_dir());
+    }
+
+    #[test]
+    fn implementing_without_plan_errors() {
+        // Jump straight to Implementing with no plan persisted.
+        let mut store = Store::open_in_memory().unwrap();
+        store.set_work_item("# WI").unwrap();
+        store
+            .record_transition(Some(State::Intake), State::Planning, "x")
+            .unwrap();
+        store
+            .record_transition(Some(State::Planning), State::Converging, "x")
+            .unwrap();
+        store
+            .record_transition(Some(State::Converging), State::Implementing, "x")
+            .unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut co = Coordinator::new(
+            Config::default(),
+            store,
+            Box::new(EchoRunner),
+            workspace.path().into(),
+        )
+        .unwrap();
+        assert_eq!(co.state(), State::Implementing);
+        assert!(matches!(co.step(), Err(CoordinatorError::NoPlan)));
+    }
+
+    #[test]
     fn illegal_transition_is_rejected() {
-        let mut co = coordinator_with_wi(Config::default());
+        let (mut co, _tmp) = coordinator_with_wi(Config::default());
         let err = co.transition_to(State::Done, "nope").unwrap_err();
         assert!(matches!(err, CoordinatorError::IllegalTransition { .. }));
         assert_eq!(co.state(), State::Intake);
@@ -495,21 +596,21 @@ mod tests {
 
     #[test]
     fn approve_plan_review_proceeds_to_implementing() {
-        let mut co = coordinator_with_wi(Config::default());
+        let (mut co, _tmp) = coordinator_with_wi(Config::default());
         assert_eq!(co.run_until_blocked().unwrap(), State::PlanReview);
         assert_eq!(co.resolve(Decision::Approve).unwrap(), State::Implementing);
     }
 
     #[test]
     fn reject_plan_review_returns_to_planning() {
-        let mut co = coordinator_with_wi(Config::default());
+        let (mut co, _tmp) = coordinator_with_wi(Config::default());
         co.run_until_blocked().unwrap();
         assert_eq!(co.resolve(Decision::Reject).unwrap(), State::Planning);
     }
 
     #[test]
     fn drives_intake_to_done_via_approvals() {
-        let mut co = coordinator_with_wi(Config::default());
+        let (mut co, _tmp) = coordinator_with_wi(Config::default());
         // Plan gate.
         assert_eq!(co.run_until_blocked().unwrap(), State::PlanReview);
         assert_eq!(co.resolve(Decision::Approve).unwrap(), State::Implementing);
@@ -521,14 +622,14 @@ mod tests {
 
     #[test]
     fn abandon_from_blocked_state_terminates() {
-        let mut co = coordinator_with_wi(Config::default());
+        let (mut co, _tmp) = coordinator_with_wi(Config::default());
         co.run_until_blocked().unwrap();
         assert_eq!(co.resolve(Decision::Abandon).unwrap(), State::Abandoned);
     }
 
     #[test]
     fn resolve_rejected_when_not_blocked() {
-        let mut co = coordinator_with_wi(Config::default());
+        let (mut co, _tmp) = coordinator_with_wi(Config::default());
         // At Intake (autonomous), no HI decision applies.
         let err = co.resolve(Decision::Approve).unwrap_err();
         assert!(matches!(err, CoordinatorError::InvalidResolution { .. }));
@@ -537,7 +638,7 @@ mod tests {
 
     #[test]
     fn answer_only_applies_at_intake_review() {
-        let mut co = coordinator_with_wi(Config::default());
+        let (mut co, _tmp) = coordinator_with_wi(Config::default());
         co.run_until_blocked().unwrap(); // PlanReview
         let err = co.resolve(Decision::Answer("nope".into())).unwrap_err();
         assert!(matches!(err, CoordinatorError::InvalidResolution { .. }));
@@ -545,7 +646,7 @@ mod tests {
 
     #[test]
     fn rejected_resolution_records_no_events() {
-        let mut co = coordinator_with_wi(Config::default());
+        let (mut co, _tmp) = coordinator_with_wi(Config::default());
         // At Intake, approve is invalid and must not write any event.
         let _ = co.resolve(Decision::Approve);
         let events = co.store.count_events().unwrap();
