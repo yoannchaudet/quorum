@@ -434,6 +434,30 @@ impl Store {
         }
     }
 
+    /// Record (or reuse) the named HI session for a blocked state. Idempotent:
+    /// the name is deterministic, so re-recording is a no-op update.
+    pub fn record_session(&mut self, state: State, name: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO sessions (state, session_name, ts) VALUES (?1, ?2, ?3)
+             ON CONFLICT(state) DO UPDATE SET session_name = excluded.session_name, ts = excluded.ts",
+            params![state.as_str(), name, now_millis()],
+        )?;
+        Ok(())
+    }
+
+    /// The recorded session name for a state, if any.
+    pub fn session(&self, state: State) -> Result<Option<String>, StoreError> {
+        match self.conn.query_row(
+            "SELECT session_name FROM sessions WHERE state = ?1",
+            params![state.as_str()],
+            |r| r.get::<_, String>(0),
+        ) {
+            Ok(n) => Ok(Some(n)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Save the Reviewer's verdict and findings for a given iteration. Idempotent.
     pub fn save_review(
         &mut self,

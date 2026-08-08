@@ -20,12 +20,16 @@ This makes the right Session trivial to find and resume for a given block.
 When a WI enters a blocked state, the CLI:
 
 1. Prints the current state and why it is blocked.
-2. Creates (or reuses) the named Session and prints the **exact resume command**, e.g.:
+2. Records the deterministic session name (see above) and surfaces it, with the
+   commands to name/resume the `copilot` session:
+   - First time, start a session and name it: run `copilot`, then `/rename quorum/1234/IntakeReview`.
+   - Later, resume it: `copilot --resume quorum/1234/IntakeReview`.
 
-   ```
-   copilot --resume quorum/1234/IntakeReview
-   ```
-3. Polls the Session's outcome and resumes autonomous progress once the human is done.
+   > `copilot` has no non-interactive flag to create a session with a chosen
+   > name, so the human assigns the name once via `/rename`; Quorum supplies the
+   > name to use so it stays consistent for the block.
+3. The human resolves the block with a Quorum command (`quorum approve` /
+   `reject` / `answer` / `abandon`), and the CO resumes autonomous progress.
 
 ## Tauri UX (future)
 

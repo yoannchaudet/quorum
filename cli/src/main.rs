@@ -116,7 +116,7 @@ fn run() -> Result<()> {
             } else {
                 Box::new(CopilotRunner::new(config.sandbox.clone()))
             };
-            let mut co = Coordinator::new(config, store, runner, workspace)
+            let mut co = Coordinator::new(config, store, runner, workspace, wi_id.clone())
                 .context("initializing coordinator")?;
             co.run_until_blocked().context("advancing work item")?;
             report(&wi_id, &co)?;
@@ -133,8 +133,17 @@ fn run() -> Result<()> {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."));
             let store = Store::open(&db).context("opening state database")?;
-            let co = Coordinator::new(config, store, Box::new(EchoRunner), workspace)
-                .context("initializing coordinator")?;
+            let mut co = Coordinator::new(
+                config,
+                store,
+                Box::new(EchoRunner),
+                workspace,
+                wi_id.clone(),
+            )
+            .context("initializing coordinator")?;
+            // Ensure the HI session row exists (deterministic; repairs it if a
+            // crash occurred before it was recorded).
+            co.ensure_session().context("recording HI session")?;
             report(&wi_id, &co)?;
         }
         Command::Approve { wi, dry_run } => {
@@ -189,8 +198,8 @@ fn resolve_and_continue(
         Box::new(CopilotRunner::new(config.sandbox.clone()))
     };
     let store = Store::open(&db_path).context("opening state database")?;
-    let mut co =
-        Coordinator::new(config, store, runner, workspace).context("initializing coordinator")?;
+    let mut co = Coordinator::new(config, store, runner, workspace, wi_id)
+        .context("initializing coordinator")?;
     co.resolve(decision)
         .context("resolving human intervention")?;
     co.run_until_blocked().context("advancing work item")?;
@@ -202,15 +211,21 @@ fn resolve_and_continue(
 /// intake questions awaiting answers).
 fn report(wi_id: &str, co: &Coordinator) -> Result<()> {
     let state = co.state();
-    if state.is_blocked() {
-        let session = format!("quorum/{wi_id}/{state}");
+    if let Some(session) = co.session_name() {
         println!("state: {state} (stuck — awaiting human intervention)");
         if state == State::IntakeReview {
             if let Some(questions) = co.questions().context("reading intake questions")? {
                 println!("questions:\n{questions}");
             }
         }
-        println!("resume: copilot --resume {session}");
+        // copilot cannot create a named session non-interactively, so the human
+        // names it once via /rename, then resumes by that name (see docs/sessions.md).
+        println!("HI session: {session}");
+        println!("  first time: run `copilot`, then `/rename {session}`");
+        println!("  resume:     copilot --resume {session}");
+        if let Some(hint) = resolve_hint(state) {
+            println!("resolve with: quorum {hint} {wi_id}");
+        }
     } else if state == State::Failed {
         println!("state: {state} (failed — see quorum.db for details)");
     } else if state.is_terminal() {
@@ -219,6 +234,15 @@ fn report(wi_id: &str, co: &Coordinator) -> Result<()> {
         println!("state: {state} (progressing)");
     }
     Ok(())
+}
+
+/// The Quorum command(s) that resolve a given blocked state.
+fn resolve_hint(state: State) -> Option<&'static str> {
+    match state {
+        State::IntakeReview => Some("answer"),
+        State::PlanReview | State::WorkReview => Some("approve|reject"),
+        _ => None,
+    }
 }
 
 /// Derive a stable WI id from the work item file name (stem).

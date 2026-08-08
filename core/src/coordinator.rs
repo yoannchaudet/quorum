@@ -82,18 +82,22 @@ pub struct Coordinator {
     runner: Box<dyn AgentRunner>,
     /// Working directory used as the sandbox cwd for agent invocations.
     workspace: PathBuf,
+    /// The work item id, used to derive session names (see `docs/sessions.md`).
+    wi_id: String,
     state: State,
 }
 
 impl Coordinator {
     /// Create a Coordinator over an opened `store`, resuming the persisted state
     /// if present, otherwise starting at `Intake`. `workspace` is the sandbox
-    /// cwd for agent invocations.
+    /// cwd for agent invocations; `wi_id` identifies the work item (used for
+    /// session names).
     pub fn new(
         config: Config,
         store: Store,
         runner: Box<dyn AgentRunner>,
         workspace: PathBuf,
+        wi_id: impl Into<String>,
     ) -> Result<Coordinator, CoordinatorError> {
         let state = store.current_state()?.unwrap_or(State::Intake);
         Ok(Coordinator {
@@ -101,6 +105,7 @@ impl Coordinator {
             store,
             runner,
             workspace,
+            wi_id: wi_id.into(),
             state,
         })
     }
@@ -123,6 +128,29 @@ impl Coordinator {
     /// The intake questions surfaced to the human, if the WI is awaiting answers.
     pub fn questions(&self) -> Result<Option<String>, CoordinatorError> {
         Ok(self.store.questions()?)
+    }
+
+    /// The HI session name for the current state, if it is a blocked
+    /// (human-intervention) state. Deterministic from the WI id and state
+    /// (`quorum/<wi-id>/<state>`), so it survives crashes (see `docs/sessions.md`).
+    pub fn session_name(&self) -> Option<String> {
+        if self.state.is_blocked() {
+            Some(format!("quorum/{}/{}", self.wi_id, self.state))
+        } else {
+            None
+        }
+    }
+
+    /// If the WI is at a blocked state, ensure its named session is recorded
+    /// (idempotent) and return the session name. No-op for non-blocked states.
+    pub fn ensure_session(&mut self) -> Result<Option<String>, CoordinatorError> {
+        match self.session_name() {
+            Some(name) => {
+                self.store.record_session(self.state, &name)?;
+                Ok(Some(name))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Perform a single validated, persisted transition to `next`.
@@ -528,11 +556,15 @@ impl Coordinator {
     }
 
     /// Step repeatedly until the WI is blocked on HI or reaches a terminal state.
+    ///
+    /// When it stops at a blocked (HI) state, the named session is recorded so
+    /// the human can resume it (see `docs/sessions.md`).
     pub fn run_until_blocked(&mut self) -> Result<State, CoordinatorError> {
         loop {
             let before = self.state;
             let after = self.step()?;
             if after == before {
+                self.ensure_session()?;
                 return Ok(after);
             }
         }
@@ -550,8 +582,14 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let mut store = Store::open_in_memory().unwrap();
         store.set_work_item("# WI\ndo the thing").unwrap();
-        let co =
-            Coordinator::new(config, store, Box::new(EchoRunner), workspace.path().into()).unwrap();
+        let co = Coordinator::new(
+            config,
+            store,
+            Box::new(EchoRunner),
+            workspace.path().into(),
+            "test-wi",
+        )
+        .unwrap();
         (co, workspace)
     }
 
@@ -611,6 +649,7 @@ mod tests {
             store,
             Box::new(EchoRunner),
             PathBuf::from("."),
+            "test-wi",
         )
         .unwrap();
         // A missing work item is unrecoverable: the WI moves to Failed with the
@@ -630,6 +669,25 @@ mod tests {
             path,
             vec![State::Planning, State::Converging, State::PlanReview]
         );
+    }
+
+    #[test]
+    fn blocking_records_a_named_session() {
+        let (mut co, _tmp) = coordinator_with_wi(Config::default());
+        assert_eq!(co.run_until_blocked().unwrap(), State::PlanReview);
+
+        // The session name is deterministic and derived from the WI id + state.
+        let expected = "quorum/test-wi/PlanReview".to_string();
+        assert_eq!(co.session_name(), Some(expected.clone()));
+        // And it was persisted (recoverable across a crash).
+        assert_eq!(co.store.session(State::PlanReview).unwrap(), Some(expected));
+    }
+
+    #[test]
+    fn non_blocked_state_has_no_session() {
+        let (co, _tmp) = coordinator_with_wi(Config::default());
+        // At Intake (autonomous), there is no HI session.
+        assert_eq!(co.session_name(), None);
     }
 
     #[test]
@@ -664,6 +722,7 @@ mod tests {
             store,
             Box::new(runner),
             PathBuf::from("."),
+            "test-wi",
         )
         .unwrap();
 
@@ -692,7 +751,14 @@ mod tests {
         let merges = runner.merges.clone();
         let mut store = Store::open_in_memory().unwrap();
         store.set_work_item("# WI").unwrap();
-        let mut co = Coordinator::new(config, store, Box::new(runner), PathBuf::from(".")).unwrap();
+        let mut co = Coordinator::new(
+            config,
+            store,
+            Box::new(runner),
+            PathBuf::from("."),
+            "test-wi",
+        )
+        .unwrap();
 
         assert_eq!(co.run_until_blocked().unwrap(), State::PlanReview);
         // Bounded to 2 planning iterations (0, 1).
@@ -743,7 +809,7 @@ mod tests {
         let path = workspace.keep();
         let mut store = Store::open_in_memory().unwrap();
         store.set_work_item("# WI").unwrap();
-        Coordinator::new(config, store, runner, path).unwrap()
+        Coordinator::new(config, store, runner, path, "test-wi").unwrap()
     }
 
     /// A runner that errors for the first `fail_times` calls, then delegates to
@@ -981,6 +1047,7 @@ mod tests {
             store,
             Box::new(EchoRunner),
             workspace.path().into(),
+            "test-wi",
         )
         .unwrap();
 
@@ -1014,6 +1081,7 @@ mod tests {
             store,
             Box::new(EchoRunner),
             workspace.path().into(),
+            "test-wi",
         )
         .unwrap();
         assert_eq!(co.state(), State::Implementing);
@@ -1104,6 +1172,7 @@ mod tests {
                 store,
                 Box::new(EchoRunner),
                 dir.path().into(),
+                "test-wi",
             )
             .unwrap();
             assert_eq!(co.run_until_blocked().unwrap(), State::PlanReview);
@@ -1116,6 +1185,7 @@ mod tests {
             store,
             Box::new(EchoRunner),
             dir.path().into(),
+            "test-wi",
         )
         .unwrap();
         assert_eq!(co.state(), State::PlanReview);
