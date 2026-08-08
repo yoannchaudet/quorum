@@ -56,6 +56,9 @@ limits:
 
 CLI flag > config file > built-in default.
 
+Repository selection is runtime context rather than configuration:
+`--context <folder>` > current working directory. See [repositories](repositories.md).
+
 ## Notes
 
 - Model IDs are the only vendor-specific values; the *roster size and roles* are fixed in

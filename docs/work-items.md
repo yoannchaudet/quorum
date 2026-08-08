@@ -1,6 +1,8 @@
 # Work Items
 
 A WI is a **local markdown file**. It is the single input Quorum processes.
+Every WI is scoped to a registered Git repository (see
+[repositories](repositories.md)); its user-facing ID is unique within that repository.
 
 ## Sources
 

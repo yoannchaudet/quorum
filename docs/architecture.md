@@ -33,7 +33,7 @@ cli/                  # thin binary: parse args, call Core, render state
 
 | Layer | Owns | Does NOT own |
 |-------|------|--------------|
-| Core | State machine, agent orchestration (CO/PL/IM/RV), persistence, config load, GitHub + `copilot` invocation | Argument parsing, terminal rendering |
+| Core | State machine, agent orchestration (CO/PL/IM/RV), persistence, repository discovery/registry, config load, GitHub + `copilot` invocation | Argument parsing, terminal rendering |
 | CLI | One WI: start/resume, print current state + HI resume commands | Any business logic; multi-WI orchestration |
 | Tauri (future) | Windowing, launching a terminal for HI | Any logic not already in Core |
 
@@ -42,5 +42,6 @@ cli/                  # thin binary: parse args, call Core, render state
 - **Core is headless and deterministic** given its on-disk state; both frontends are interchangeable drivers.
 - **CLI is light**: it drives exactly one WI. Orchestrating many WIs is a future UX concern.
 - **No logic in frontends**: anything a human would call "how Quorum works" lives in Core.
+- **Registered context**: every WI is scoped to an allow-listed Git repository.
 
 See [glossary](glossary.md) for terms, [state-machine](state-machine.md) for the Core's control flow.

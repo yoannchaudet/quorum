@@ -21,7 +21,8 @@ will be associated in the database; it does not determine the filesystem path.
 
 | Table | Holds |
 |-------|-------|
-| `work_items` | Stable ID, slug, normalized markdown, and source metadata. |
+| `repositories` | Stable ID, canonical root, and active registration status. |
+| `work_items` | Stable ID, repository, slug, normalized markdown, and source metadata. |
 | `states` | Current state per WI. |
 | `transitions` | Append-only transition history per WI. |
 | `candidates` | PL candidate plans by WI, planner, and iteration. |
@@ -32,9 +33,9 @@ will be associated in the database; it does not determine the filesystem path.
 | `sessions` | HI session records by WI and blocked state. |
 | `events` | Append-only audit events per WI. |
 
-Every WI-owned row has a foreign key to `work_items` with cascading deletion. Composite
-keys include the WI ID, preventing planners, iterations, sessions, or reviews from
-colliding across WIs.
+Every WI-owned row has a foreign key to `work_items` with cascading deletion. WI slugs
+are unique per repository. Composite keys include the WI ID, preventing planners,
+iterations, sessions, or reviews from colliding across WIs.
 
 ## Connection policy
 
@@ -57,11 +58,12 @@ colliding across WIs.
 
 ## Resume after crash
 
-1. Find the WI by its user-facing ID in the global catalog.
-2. Read its scoped `states` row.
-3. Verify the outputs required by that state.
-4. Advance when complete; otherwise re-run the idempotent step.
-5. For blocked states, re-derive and surface the persisted Session name.
+1. Resolve and validate the registered repository context.
+2. Find the WI by repository and user-facing ID in the global catalog.
+3. Read its scoped `states` row.
+4. Verify the outputs required by that state.
+5. Advance when complete; otherwise re-run the idempotent step.
+6. For blocked states, re-derive and surface the persisted Session name.
 
 ## Failure
 
