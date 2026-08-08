@@ -11,7 +11,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The current schema version. Bump when `migrate` changes.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Errors from the persistence layer.
 #[derive(Debug, thiserror::Error)]
@@ -105,6 +105,12 @@ impl Store {
                 ts        TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS intake (
+                id        INTEGER PRIMARY KEY CHECK (id = 1),
+                questions TEXT NOT NULL,
+                ts        TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS reviews (
                 iteration INTEGER PRIMARY KEY,
                 text      TEXT NOT NULL,
@@ -126,7 +132,8 @@ impl Store {
             "#,
         )?;
         self.conn.execute(
-            "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?1)",
+            "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [SCHEMA_VERSION.to_string()],
         )?;
         Ok(())
@@ -386,6 +393,45 @@ impl Store {
             .conn
             .query_row("SELECT COUNT(*) FROM reviews", [], |r| r.get(0))?;
         Ok(n as u32)
+    }
+
+    /// All human answers provided at IntakeReview, in the order given, joined by
+    /// blank lines. Empty when none have been provided.
+    pub fn answers(&self) -> Result<String, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT data FROM events WHERE kind = 'hi_answer' ORDER BY id ASC")?;
+        let rows = stmt.query_map([], |r| r.get::<_, Option<String>>(0))?;
+        let mut parts = Vec::new();
+        for row in rows {
+            if let Some(text) = row? {
+                parts.push(text);
+            }
+        }
+        Ok(parts.join("\n\n"))
+    }
+
+    /// Store the planner questions surfaced at intake (single row). Idempotent.
+    pub fn set_questions(&mut self, questions: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO intake (id, questions, ts) VALUES (1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET questions = excluded.questions, ts = excluded.ts",
+            params![questions, now_millis()],
+        )?;
+        Ok(())
+    }
+
+    /// The stored intake questions, if any.
+    pub fn questions(&self) -> Result<Option<String>, StoreError> {
+        match self
+            .conn
+            .query_row("SELECT questions FROM intake WHERE id = 1", [], |r| {
+                r.get::<_, String>(0)
+            }) {
+            Ok(q) => Ok(Some(q)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Save the Reviewer's verdict and findings for a given iteration. Idempotent.

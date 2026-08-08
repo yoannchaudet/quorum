@@ -120,6 +120,11 @@ impl Coordinator {
         Ok(self.store.history()?)
     }
 
+    /// The intake questions surfaced to the human, if the WI is awaiting answers.
+    pub fn questions(&self) -> Result<Option<String>, CoordinatorError> {
+        Ok(self.store.questions()?)
+    }
+
     /// Perform a single validated, persisted transition to `next`.
     pub fn transition_to(&mut self, next: State, reason: &str) -> Result<State, CoordinatorError> {
         if !self.state.can_transition_to(next) {
@@ -186,12 +191,49 @@ impl Coordinator {
     /// Run the planner roster for the current planning iteration, in isolation,
     /// and persist each candidate plan. Each pass uses a fresh iteration so the
     /// convergence loop can compare successive rounds.
+    /// Ask each planner, in isolation, whether the WI needs clarification before
+    /// planning (see `prompts/intake-questions.md`). Returns the aggregated
+    /// questions when any planner raises some, or `None` when all are satisfied.
+    fn run_intake_questions(&mut self) -> Result<Option<String>, CoordinatorError> {
+        let work_item = self
+            .store
+            .work_item()?
+            .ok_or(CoordinatorError::NoWorkItem)?;
+        let answers = self.store.answers()?;
+        let prompt = Prompt::intake_questions();
+        let slots: Vec<String> = self.config.planners.keys().cloned().collect();
+        let mut blocks = Vec::new();
+        for slot in slots {
+            let rendered = prompt.render(&[("work_item", &work_item), ("answers", &answers)])?;
+            let model = self.config.planners.get(&slot).cloned().unwrap_or_default();
+            let req = AgentRequest {
+                role: format!("PL-intake:{slot}"),
+                prompt: rendered,
+                cwd: self.workspace.clone(),
+                filesystem: Filesystem::ReadOnly,
+                model,
+            };
+            let output = self.invoke(&req)?;
+            let trimmed = output.trim();
+            // `NONE` (any case) means this planner has no questions.
+            if !trimmed.eq_ignore_ascii_case("NONE") && !trimmed.is_empty() {
+                blocks.push(format!("### {slot}\n{trimmed}"));
+            }
+        }
+        if blocks.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(blocks.join("\n\n")))
+        }
+    }
+
     fn run_planners(&mut self) -> Result<(), CoordinatorError> {
         let work_item = self
             .store
             .work_item()?
             .ok_or(CoordinatorError::NoWorkItem)?;
         let previous_plan = self.store.plan()?.unwrap_or_default();
+        let answers = self.store.answers()?;
         let prompt = Prompt::planner();
         let iteration = match self.store.max_candidate_iteration()? {
             Some(prev) => prev + 1,
@@ -201,7 +243,7 @@ impl Coordinator {
         for slot in slots {
             let rendered = prompt.render(&[
                 ("work_item", &work_item),
-                ("answers", ""),
+                ("answers", &answers),
                 ("previous_plan", &previous_plan),
             ])?;
             let model = self.config.planners.get(&slot).cloned().unwrap_or_default();
@@ -415,8 +457,21 @@ impl Coordinator {
                 Planning
             }
             Planning => {
-                self.run_planners()?;
-                Converging
+                // Intake questions gate: only on the first planning pass (before
+                // any candidates exist). If any planner needs clarification, block
+                // for human intervention; otherwise produce candidate plans.
+                if self.store.max_candidate_iteration()?.is_none() {
+                    if let Some(questions) = self.run_intake_questions()? {
+                        self.store.set_questions(&questions)?;
+                        IntakeReview
+                    } else {
+                        self.run_planners()?;
+                        Converging
+                    }
+                } else {
+                    self.run_planners()?;
+                    Converging
+                }
             }
             Converging => {
                 if self.run_merge()? {
@@ -488,7 +543,7 @@ impl Coordinator {
 mod tests {
     use super::*;
     use crate::agent::{AgentError, AgentRequest, EchoRunner};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     fn coordinator_with_wi(config: Config) -> (Coordinator, tempfile::TempDir) {
@@ -521,6 +576,9 @@ mod tests {
 
     impl AgentRunner for IteratingRunner {
         fn run(&self, req: &AgentRequest) -> Result<String, AgentError> {
+            if req.role.contains("intake") {
+                return Ok("NONE".to_string());
+            }
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if req.role.starts_with("CO:merge") {
                 let m = self.merges.fetch_add(1, Ordering::SeqCst);
@@ -661,7 +719,9 @@ mod tests {
 
     impl AgentRunner for ReviewRunner {
         fn run(&self, req: &AgentRequest) -> Result<String, AgentError> {
-            if req.role.starts_with("CO:merge") {
+            if req.role.contains("intake") {
+                Ok("NONE".to_string())
+            } else if req.role.starts_with("CO:merge") {
                 Ok("## Plan\nthe plan\n\n## Convergence\nCONVERGED".to_string())
             } else if req.role == "RV" {
                 let n = self.reviews.fetch_add(1, Ordering::SeqCst);
@@ -743,6 +803,67 @@ mod tests {
 
         // Despite the initial transient failures, the WI completes normally.
         assert_eq!(co.run_until_blocked().unwrap(), State::Done);
+    }
+
+    /// A runner that raises intake questions while `needs_answers` is set, and
+    /// otherwise delegates to the EchoRunner stub.
+    struct IntakeRunner {
+        needs_answers: Arc<AtomicBool>,
+    }
+
+    impl AgentRunner for IntakeRunner {
+        fn run(&self, req: &AgentRequest) -> Result<String, AgentError> {
+            if req.role.contains("intake") {
+                if self.needs_answers.load(Ordering::SeqCst) {
+                    Ok("1. Please clarify the scope?".to_string())
+                } else {
+                    Ok("NONE".to_string())
+                }
+            } else {
+                EchoRunner.run(req)
+            }
+        }
+    }
+
+    #[test]
+    fn no_questions_proceeds_past_intake() {
+        // EchoRunner returns NONE for intake, so the WI never blocks there.
+        let (mut co, _tmp) = coordinator_with_wi(Config::default());
+        assert_eq!(co.run_until_blocked().unwrap(), State::PlanReview);
+        assert!(co.store.questions().unwrap().is_none());
+    }
+
+    #[test]
+    fn questions_block_at_intake_review_then_answer_proceeds() {
+        let needs = Arc::new(AtomicBool::new(true));
+        let mut config = Config::default();
+        config.reviews.plan_review = false;
+        config.reviews.work_review = false;
+        let mut co = coordinator_with_runner(
+            config,
+            Box::new(IntakeRunner {
+                needs_answers: needs.clone(),
+            }),
+        );
+
+        // Planners have questions: block at IntakeReview with questions stored.
+        assert_eq!(co.run_until_blocked().unwrap(), State::IntakeReview);
+        let questions = co.store.questions().unwrap();
+        assert!(questions.unwrap().contains("clarify the scope"));
+
+        // Human answers; planners are now satisfied.
+        needs.store(false, Ordering::SeqCst);
+        assert_eq!(
+            co.resolve(Decision::Answer("scope is X".into())).unwrap(),
+            State::Planning
+        );
+
+        // No more questions: the WI runs to completion, and the answer is stored
+        // (and fed to planners).
+        assert_eq!(co.run_until_blocked().unwrap(), State::Done);
+        assert!(co.store.answers().unwrap().contains("scope is X"));
+        // No candidates were produced during the blocked first pass.
+        assert!(co.store.max_candidate_iteration().unwrap().is_some());
     }
 
     #[test]

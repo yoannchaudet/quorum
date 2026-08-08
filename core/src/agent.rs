@@ -128,6 +128,11 @@ pub struct EchoRunner;
 
 impl AgentRunner for EchoRunner {
     fn run(&self, req: &AgentRequest) -> Result<String, AgentError> {
+        // Intake-questions asks whether clarification is needed; the stub never
+        // has questions, so it returns NONE (no blocking under --dry-run).
+        if req.role.contains("intake") {
+            return Ok("NONE".to_string());
+        }
         // A universal stub: a `## Plan`, a `CONVERGED` convergence signal, and an
         // `ACCEPT` verdict, so the whole pipeline advances in a single pass under
         // `--dry-run`.
