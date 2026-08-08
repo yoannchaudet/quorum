@@ -92,15 +92,19 @@ fn run_advances_to_plan_review_and_status_reads_it_back() {
         "register failed: {registration:?}"
     );
 
-    let wi = repo.join("mywi.md");
-    std::fs::write(&wi, "# My WI\n").unwrap();
-    let out = quorum(home, &repo, &["run", "--dry-run", wi.to_str().unwrap()]);
+    let work_item = repo.join("my-work-item.md");
+    std::fs::write(&work_item, "# My Work Item\n").unwrap();
+    let out = quorum(
+        home,
+        &repo,
+        &["run", "--dry-run", work_item.to_str().unwrap()],
+    );
     assert!(out.status.success(), "run failed: {out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("PlanReview"), "unexpected output: {stdout}");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("PL-intake:planner-a started"),
+        stderr.contains("Intake Planner:planner-a started"),
         "missing live progress: {stderr}"
     );
     assert!(
@@ -108,7 +112,7 @@ fn run_advances_to_plan_review_and_status_reads_it_back() {
         "missing completion progress: {stderr}"
     );
     assert!(
-        stdout.contains("copilot --resume quorum/mywi/PlanReview"),
+        stdout.contains("copilot --resume quorum/my-work-item/PlanReview"),
         "missing resume command: {stdout}"
     );
 
@@ -117,7 +121,7 @@ fn run_advances_to_plan_review_and_status_reads_it_back() {
     let state_dir = worktree.parent().unwrap();
     assert_ne!(
         state_dir.file_name().unwrap().to_string_lossy(),
-        "mywi",
+        "my-work-item",
         "filesystem state must use the stable internal id"
     );
     assert!(worktree.join(".git").is_file());
@@ -125,14 +129,17 @@ fn run_advances_to_plan_review_and_status_reads_it_back() {
     let root = RepositoryRoot::discover(&repo).unwrap();
     let db = Database::open(&home.join(".quorum/quorum.db")).unwrap();
     let registered = db.registered_repository(&root).unwrap().unwrap();
-    let internal_id = db.work_item_id(&registered.id, "mywi").unwrap().unwrap();
+    let internal_id = db
+        .work_item_id(&registered.id, "my-work-item")
+        .unwrap()
+        .unwrap();
     let mut store = db.into_store(internal_id.clone()).unwrap();
     let long_plan = "0123456789".repeat(25);
     store.set_plan(&long_plan, "iteration=0").unwrap();
     let activity_count = store.activities().unwrap().len();
     drop(store);
 
-    let out = quorum(home, &repo, &["status", "mywi"]);
+    let out = quorum(home, &repo, &["status", "my-work-item"]);
     assert!(out.status.success(), "status failed: {out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("PlanReview"), "unexpected output: {stdout}");
@@ -147,21 +154,34 @@ fn run_advances_to_plan_review_and_status_reads_it_back() {
         "default status should abbreviate the plan"
     );
 
-    let out = quorum(home, &repo, &["status", "mywi", "--verbose"]);
+    let out = quorum(home, &repo, &["status", "my-work-item", "--verbose"]);
     assert!(out.status.success(), "verbose status failed: {out:?}");
     assert!(
         String::from_utf8_lossy(&out.stdout).contains(&long_plan),
         "verbose status omitted the full plan"
     );
 
-    let out = quorum(home, &repo, &["status", "mywi", "--json"]);
+    let out = quorum(home, &repo, &["status", "my-work-item", "--json"]);
     assert!(out.status.success(), "JSON status failed: {out:?}");
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(value["version"], 1);
-    assert_eq!(value["identity"]["slug"], "mywi");
+    assert_eq!(value["version"], 2);
+    assert_eq!(value["identity"]["slug"], "my-work-item");
     assert_eq!(value["state"]["current"], "plan_review");
     assert_eq!(value["planning"]["iterations"], 1);
     assert_eq!(value["planning"]["plan"], long_plan);
+    let roles = value["activities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|activity| activity["role"].as_str())
+        .collect::<Vec<_>>();
+    assert!(roles.iter().any(|role| role.starts_with("Planner:")));
+    assert!(roles.contains(&"Coordinator:merge"));
+    assert!(roles.iter().all(|role| {
+        !["PL", "CO", "IM", "RV"]
+            .iter()
+            .any(|legacy| role.starts_with(legacy))
+    }));
 
     let activity_count_after = Database::open(&home.join(".quorum/quorum.db"))
         .unwrap()
@@ -180,13 +200,13 @@ fn quiet_suppresses_live_progress_but_not_final_report() {
     let repo = home.join("repo");
     init_repo(&repo);
     assert!(register(home, &repo).status.success());
-    let wi = repo.join("quiet.md");
-    std::fs::write(&wi, "# Quiet\n").unwrap();
+    let work_item = repo.join("quiet.md");
+    std::fs::write(&work_item, "# Quiet\n").unwrap();
 
     let out = quorum(
         home,
         &repo,
-        &["run", "--dry-run", "--quiet", wi.to_str().unwrap()],
+        &["run", "--dry-run", "--quiet", work_item.to_str().unwrap()],
     );
     assert!(out.status.success(), "quiet run failed: {out:?}");
     assert!(
@@ -205,18 +225,22 @@ fn approve_gates_drive_work_item_to_done() {
     init_repo(&repo);
     assert!(register(home, &repo).status.success());
 
-    let wi = repo.join("done-wi.md");
-    std::fs::write(&wi, "# WI\ndo it\n").unwrap();
+    let work_item = repo.join("done-work-item.md");
+    std::fs::write(&work_item, "# Work Item\ndo it\n").unwrap();
 
-    let out = quorum(home, &repo, &["run", wi.to_str().unwrap(), "--dry-run"]);
+    let out = quorum(
+        home,
+        &repo,
+        &["run", work_item.to_str().unwrap(), "--dry-run"],
+    );
     assert!(out.status.success(), "run failed: {out:?}");
     assert!(String::from_utf8_lossy(&out.stdout).contains("PlanReview"));
 
-    let out = quorum(home, &repo, &["approve", "done-wi", "--dry-run"]);
+    let out = quorum(home, &repo, &["approve", "done-work-item", "--dry-run"]);
     assert!(out.status.success(), "approve failed: {out:?}");
     assert!(String::from_utf8_lossy(&out.stdout).contains("WorkReview"));
 
-    let out = quorum(home, &repo, &["approve", "done-wi", "--dry-run"]);
+    let out = quorum(home, &repo, &["approve", "done-work-item", "--dry-run"]);
     assert!(out.status.success(), "approve failed: {out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("Done"), "unexpected output: {stdout}");
@@ -245,8 +269,8 @@ fn context_overrides_cwd_and_nested_paths_resolve_to_root() {
     assert!(stdout.contains(canonical_registered.to_str().unwrap()));
     assert!(!stdout.contains(canonical_other.to_str().unwrap()));
 
-    let wi = registered.join("context-wi.md");
-    std::fs::write(&wi, "# Context WI\n").unwrap();
+    let work_item = registered.join("context-work-item.md");
+    std::fs::write(&work_item, "# Context Work Item\n").unwrap();
     let out = quorum(
         home,
         &other,
@@ -255,7 +279,7 @@ fn context_overrides_cwd_and_nested_paths_resolve_to_root() {
             registered.to_str().unwrap(),
             "run",
             "--dry-run",
-            wi.to_str().unwrap(),
+            work_item.to_str().unwrap(),
         ],
     );
     assert!(out.status.success(), "context run failed: {out:?}");
@@ -301,7 +325,7 @@ fn explicit_repo_path_overrides_context_and_bare_repositories_are_rejected() {
 }
 
 #[test]
-fn unregister_blocks_wi_commands_and_reregister_keeps_identity() {
+fn unregister_blocks_work_item_commands_and_reregister_keeps_identity() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path();
     let repo = home.join("repo");
@@ -316,17 +340,19 @@ fn unregister_blocks_wi_commands_and_reregister_keeps_identity() {
         .unwrap()
         .to_string();
 
-    let wi = repo.join("mywi.md");
-    std::fs::write(&wi, "# WI\n").unwrap();
-    assert!(
-        quorum(home, &repo, &["run", "--dry-run", wi.to_str().unwrap()])
-            .status
-            .success()
-    );
+    let work_item = repo.join("my-work-item.md");
+    std::fs::write(&work_item, "# Work Item\n").unwrap();
+    assert!(quorum(
+        home,
+        &repo,
+        &["run", "--dry-run", work_item.to_str().unwrap()]
+    )
+    .status
+    .success());
 
     let out = quorum(home, &repo, &["repo", "unregister"]);
     assert!(out.status.success(), "unregister failed: {out:?}");
-    let out = quorum(home, &repo, &["status", "mywi"]);
+    let out = quorum(home, &repo, &["status", "my-work-item"]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("is not registered"));
 
@@ -336,11 +362,13 @@ fn unregister_blocks_wi_commands_and_reregister_keeps_identity() {
         String::from_utf8_lossy(&reregistered.stdout).contains(&repository_id),
         "repository identity changed after re-registration"
     );
-    assert!(quorum(home, &repo, &["status", "mywi"]).status.success());
+    assert!(quorum(home, &repo, &["status", "my-work-item"])
+        .status
+        .success());
 }
 
 #[test]
-fn identical_wi_slugs_are_scoped_by_repository() {
+fn identical_work_item_slugs_are_scoped_by_repository() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path();
     let one = home.join("one");
@@ -351,9 +379,13 @@ fn identical_wi_slugs_are_scoped_by_repository() {
     assert!(register(home, &two).status.success());
 
     for repo in [&one, &two] {
-        let wi = repo.join("same.md");
-        std::fs::write(&wi, format!("# {}\n", repo.display())).unwrap();
-        let out = quorum(home, repo, &["run", "--dry-run", wi.to_str().unwrap()]);
+        let work_item = repo.join("same.md");
+        std::fs::write(&work_item, format!("# {}\n", repo.display())).unwrap();
+        let out = quorum(
+            home,
+            repo,
+            &["run", "--dry-run", work_item.to_str().unwrap()],
+        );
         assert!(
             out.status.success(),
             "run failed in {}: {out:?}",
@@ -378,10 +410,14 @@ fn worktree_pins_committed_head_and_resumes_without_user_changes() {
     assert!(register(home, &repo).status.success());
 
     let base = git_stdout(&repo, &["rev-parse", "HEAD"]);
-    let wi = repo.join("pinned.md");
-    std::fs::write(&wi, "# Pinned\n").unwrap();
+    let work_item = repo.join("pinned.md");
+    std::fs::write(&work_item, "# Pinned\n").unwrap();
     std::fs::write(repo.join("local-only.txt"), "uncommitted\n").unwrap();
-    let out = quorum(home, &repo, &["run", "--dry-run", wi.to_str().unwrap()]);
+    let out = quorum(
+        home,
+        &repo,
+        &["run", "--dry-run", work_item.to_str().unwrap()],
+    );
     assert!(out.status.success(), "run failed: {out:?}");
 
     let worktree = only_worktree(home);
@@ -405,7 +441,11 @@ fn worktree_pins_committed_head_and_resumes_without_user_changes() {
     }
     assert_ne!(git_stdout(&repo, &["rev-parse", "HEAD"]), base);
 
-    let out = quorum(home, &repo, &["run", "--dry-run", wi.to_str().unwrap()]);
+    let out = quorum(
+        home,
+        &repo,
+        &["run", "--dry-run", work_item.to_str().unwrap()],
+    );
     assert!(out.status.success(), "resume failed: {out:?}");
     assert_eq!(git_stdout(&worktree, &["rev-parse", "HEAD"]), base);
     let listed = git_stdout(&repo, &["worktree", "list", "--porcelain"]);
@@ -485,9 +525,13 @@ fn run_requires_a_committed_head() {
     assert!(output.status.success());
     assert!(register(home, &repo).status.success());
 
-    let wi = repo.join("unborn.md");
-    std::fs::write(&wi, "# Unborn\n").unwrap();
-    let out = quorum(home, &repo, &["run", "--dry-run", wi.to_str().unwrap()]);
+    let work_item = repo.join("unborn.md");
+    std::fs::write(&work_item, "# Unborn\n").unwrap();
+    let out = quorum(
+        home,
+        &repo,
+        &["run", "--dry-run", work_item.to_str().unwrap()],
+    );
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("has no committed HEAD"));
 }
@@ -518,9 +562,13 @@ fn creating_record_resumes_worktree_setup_after_crash() {
         .unwrap();
     drop(database);
 
-    let wi = repo.join("crash.md");
-    std::fs::write(&wi, "# Crash recovery\n").unwrap();
-    let out = quorum(home, &repo, &["run", "--dry-run", wi.to_str().unwrap()]);
+    let work_item = repo.join("crash.md");
+    std::fs::write(&work_item, "# Crash recovery\n").unwrap();
+    let out = quorum(
+        home,
+        &repo,
+        &["run", "--dry-run", work_item.to_str().unwrap()],
+    );
     assert!(out.status.success(), "recovery failed: {out:?}");
     assert!(path.join(".git").is_file());
     assert_eq!(git_stdout(&path, &["rev-parse", "HEAD"]), base);
@@ -574,9 +622,13 @@ fn creating_record_rejects_a_branch_that_moved_off_base() {
         .unwrap();
     assert!(output.status.success());
 
-    let wi = repo.join("moved.md");
-    std::fs::write(&wi, "# Moved\n").unwrap();
-    let out = quorum(home, &repo, &["run", "--dry-run", wi.to_str().unwrap()]);
+    let work_item = repo.join("moved.md");
+    std::fs::write(&work_item, "# Moved\n").unwrap();
+    let out = quorum(
+        home,
+        &repo,
+        &["run", "--dry-run", work_item.to_str().unwrap()],
+    );
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("expected base"));
     assert_eq!(
@@ -593,13 +645,15 @@ fn reconcile_rejects_a_worktree_switched_to_another_branch() {
     let repo = home.join("repo");
     init_repo(&repo);
     assert!(register(home, &repo).status.success());
-    let wi = repo.join("switched.md");
-    std::fs::write(&wi, "# Switched\n").unwrap();
-    assert!(
-        quorum(home, &repo, &["run", "--dry-run", wi.to_str().unwrap()])
-            .status
-            .success()
-    );
+    let work_item = repo.join("switched.md");
+    std::fs::write(&work_item, "# Switched\n").unwrap();
+    assert!(quorum(
+        home,
+        &repo,
+        &["run", "--dry-run", work_item.to_str().unwrap()]
+    )
+    .status
+    .success());
 
     let worktree = only_worktree(home);
     let output = Command::new("git")
@@ -610,7 +664,11 @@ fn reconcile_rejects_a_worktree_switched_to_another_branch() {
         .unwrap();
     assert!(output.status.success());
 
-    let out = quorum(home, &repo, &["run", "--dry-run", wi.to_str().unwrap()]);
+    let out = quorum(
+        home,
+        &repo,
+        &["run", "--dry-run", work_item.to_str().unwrap()],
+    );
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("uses branch"));
     assert_eq!(

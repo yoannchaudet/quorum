@@ -2,7 +2,7 @@
 //!
 //! Quorum stores all structured state in one database. [`Database`] owns
 //! catalog-level operations, while [`Store`] scopes every coordinator query to
-//! one work item so WI data cannot leak across runs.
+//! one work item so data cannot leak across runs.
 
 use crate::observability::{
     ActivityEvent, ActivityKind, ImplementationSnapshot, PlanningSnapshot, ReviewSnapshot,
@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 /// The global database schema version.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Stable internal identity for a work item.
@@ -73,7 +73,7 @@ pub struct RegisteredRepository {
     pub root: std::path::PathBuf,
 }
 
-/// Persisted intent and lifecycle state for a WI's linked Git worktree.
+/// Persisted intent and lifecycle state for a work item's linked Git worktree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeRecord {
     pub work_item_id: WorkItemId,
@@ -201,11 +201,52 @@ impl Database {
         }
 
         self.create_schema_v2()?;
+        if (1..6).contains(&stored_version) {
+            self.migrate_activity_role_names()?;
+        }
         self.conn.execute(
             "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [SCHEMA_VERSION.to_string()],
         )?;
+        Ok(())
+    }
+
+    fn migrate_activity_role_names(&self) -> Result<(), StoreError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT id, data FROM activities ORDER BY id")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+
+        let transaction = self.conn.unchecked_transaction()?;
+        for (id, data) in rows {
+            let mut event: ActivityEvent = serde_json::from_str(&data)?;
+            normalize_legacy_activity(&mut event);
+            transaction.execute(
+                "UPDATE activities SET data = ?1 WHERE id = ?2",
+                params![serde_json::to_string(&event)?, id],
+            )?;
+        }
+        transaction.execute(
+            "UPDATE events SET kind = 'human_answer' WHERE kind = 'hi_answer'",
+            [],
+        )?;
+        transaction.execute(
+            "UPDATE events SET kind = 'human_decision' WHERE kind = 'hi_decision'",
+            [],
+        )?;
+        transaction.execute(
+            "UPDATE transitions
+             SET reason = 'human:' || substr(reason, 4)
+             WHERE reason LIKE 'hi:%'",
+            [],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -435,7 +476,7 @@ impl Database {
         })
     }
 
-    /// Deactivate a repository without deleting its identity or WI history.
+    /// Deactivate a repository without deleting its identity or work-item history.
     pub fn unregister_repository(
         &mut self,
         root: &RepositoryRoot,
@@ -519,7 +560,7 @@ impl Database {
         }
     }
 
-    /// Return the existing WI for `(repository, slug)`, or create an empty one.
+    /// Return the existing work item for `(repository, slug)`, or create an empty one.
     pub fn get_or_create_work_item(
         &mut self,
         repository_id: &RepositoryId,
@@ -540,7 +581,7 @@ impl Database {
             .map_err(Into::into)
     }
 
-    /// The persisted worktree intent for a WI, if setup has begun.
+    /// The persisted worktree intent for a work item, if setup has begun.
     pub fn worktree(
         &self,
         work_item_id: &WorkItemId,
@@ -625,16 +666,16 @@ pub struct Store {
 }
 
 impl Store {
-    /// Open a fresh in-memory database with one empty WI. Intended for tests.
+    /// Open a fresh in-memory database with one empty work item. Intended for tests.
     pub fn open_in_memory() -> Result<Store, StoreError> {
         let mut db = Database::open_in_memory()?;
         let root = RepositoryRoot::from_canonical("/test/repository");
         let repository = db.register_repository(&root)?;
-        let id = db.get_or_create_work_item(&repository.id, "test-wi")?;
+        let id = db.get_or_create_work_item(&repository.id, "test-work-item")?;
         db.into_store(id)
     }
 
-    /// The stable internal identity of this store's WI.
+    /// The stable internal identity of this store's work item.
     pub fn work_item_id(&self) -> &WorkItemId {
         &self.work_item_id
     }
@@ -644,7 +685,7 @@ impl Store {
         schema_version(&self.conn)
     }
 
-    /// Read the current state for this WI.
+    /// Read the current state for this work item.
     pub fn current_state(&self) -> Result<Option<State>, StoreError> {
         let row = self.conn.query_row(
             "SELECT state FROM states WHERE work_item_id = ?1",
@@ -677,33 +718,33 @@ impl Store {
         extra: &[(&str, &str)],
     ) -> Result<(), StoreError> {
         let ts = now_millis();
-        let wi = self.work_item_id.as_str();
+        let work_item_id = self.work_item_id.as_str();
         let from_s = from.map(|s| s.as_str());
         let to_s = to.as_str();
         let tx = self.conn.transaction()?;
         for (kind, data) in extra {
             tx.execute(
                 "INSERT INTO events (work_item_id, ts, kind, data) VALUES (?1, ?2, ?3, ?4)",
-                params![wi, ts, kind, data],
+                params![work_item_id, ts, kind, data],
             )?;
         }
         tx.execute(
             "INSERT INTO states (work_item_id, state, updated_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(work_item_id) DO UPDATE
              SET state = excluded.state, updated_at = excluded.updated_at",
-            params![wi, to_s, ts],
+            params![work_item_id, to_s, ts],
         )?;
         tx.execute(
             "INSERT INTO transitions
              (work_item_id, from_state, to_state, reason, ts)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![wi, from_s, to_s, reason, ts],
+            params![work_item_id, from_s, to_s, reason, ts],
         )?;
         let data = format!("{}->{}", from_s.unwrap_or("-"), to_s);
         tx.execute(
             "INSERT INTO events (work_item_id, ts, kind, data)
              VALUES (?1, ?2, 'transition', ?3)",
-            params![wi, ts, data],
+            params![work_item_id, ts, data],
         )?;
         tx.commit()?;
         Ok(())
@@ -930,7 +971,7 @@ impl Store {
         }
 
         Ok(StatusSnapshot {
-            version: 1,
+            version: 2,
             identity: WorkItemIdentitySnapshot {
                 id,
                 slug: slug.clone(),
@@ -1197,7 +1238,7 @@ impl Store {
     pub fn answers(&self) -> Result<String, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT data FROM events
-             WHERE work_item_id = ?1 AND kind = 'hi_answer' ORDER BY id ASC",
+             WHERE work_item_id = ?1 AND kind = 'human_answer' ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(params![self.work_item_id.as_str()], |row| {
             row.get::<_, Option<String>>(0)
@@ -1328,6 +1369,35 @@ fn activity_kind_name(kind: ActivityKind) -> &'static str {
     }
 }
 
+fn normalize_legacy_activity(event: &mut ActivityEvent) {
+    event.role = event.role.take().map(|role| expand_role_name(&role));
+    if matches!(
+        event.kind,
+        ActivityKind::AgentStarted
+            | ActivityKind::AgentRetrying
+            | ActivityKind::AgentCompleted
+            | ActivityKind::AgentFailed
+    ) {
+        event.message = expand_role_name(&event.message);
+    }
+    event.message = event.message.replace("hi: ", "human: ");
+}
+
+fn expand_role_name(value: &str) -> String {
+    for (legacy, expanded) in [
+        ("PL-intake:", "Intake Planner:"),
+        ("PL:", "Planner:"),
+        ("CO:merge", "Coordinator:merge"),
+        ("IM", "Implementer"),
+        ("RV", "Reviewer"),
+    ] {
+        if let Some(suffix) = value.strip_prefix(legacy) {
+            return format!("{expanded}{suffix}");
+        }
+    }
+    value.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1411,16 +1481,18 @@ mod tests {
              );
              INSERT INTO work_items
                  (id, slug, text, created_at, updated_at)
-             VALUES ('legacy-wi', 'legacy', '# Legacy', '1', '1');
+             VALUES ('legacy-work-item', 'legacy', '# Legacy', '1', '1');
              INSERT INTO states (work_item_id, state, updated_at)
-             VALUES ('legacy-wi', 'Planning', '1');",
+             VALUES ('legacy-work-item', 'Planning', '1');",
         )
         .unwrap();
         drop(conn);
 
         let db = Database::open(&path).unwrap();
         assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
-        let store = db.into_store(WorkItemId("legacy-wi".to_string())).unwrap();
+        let store = db
+            .into_store(WorkItemId("legacy-work-item".to_string()))
+            .unwrap();
         assert_eq!(store.work_item().unwrap().as_deref(), Some("# Legacy"));
         assert_eq!(store.current_state().unwrap(), Some(State::Planning));
     }
@@ -1484,6 +1556,101 @@ mod tests {
             )
             .unwrap();
         assert_eq!(table, "activities");
+    }
+
+    #[test]
+    fn migrates_v5_activity_roles_to_full_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quorum.db");
+        let mut db = Database::open(&path).unwrap();
+        let repository = register(&mut db, "/repo");
+        let work_item = db
+            .get_or_create_work_item(&repository.id, "terminology")
+            .unwrap();
+        for (role, message) in [
+            ("PL-intake:planner-a", "PL-intake:planner-a started"),
+            ("PL:planner-a", "PL:planner-a completed"),
+            ("CO:merge", "CO:merge started"),
+            ("IM", "IM failed; retrying"),
+            ("RV", "RV completed"),
+        ] {
+            let data = serde_json::json!({
+                "timestamp_ms": 1,
+                "kind": "agent_started",
+                "message": message,
+                "role": role
+            });
+            db.conn
+                .execute(
+                    "INSERT INTO activities (work_item_id, ts, kind, data)
+                     VALUES (?1, 1, 'agent_started', ?2)",
+                    params![work_item.as_str(), data.to_string()],
+                )
+                .unwrap();
+        }
+        let free_text = ActivityEvent::new(ActivityKind::Failed, "RVM error remains literal");
+        db.conn
+            .execute(
+                "INSERT INTO activities (work_item_id, ts, kind, data)
+                 VALUES (?1, 1, 'failed', ?2)",
+                params![
+                    work_item.as_str(),
+                    serde_json::to_string(&free_text).unwrap()
+                ],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO events (work_item_id, ts, kind, data)
+                 VALUES (?1, '1', 'hi_answer', 'legacy answer'),
+                        (?1, '1', 'hi_decision', 'legacy decision')",
+                params![work_item.as_str()],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO transitions
+                 (work_item_id, from_state, to_state, reason, ts)
+                 VALUES (?1, 'PlanReview', 'Implementing',
+                         'hi: approve PlanReview -> Implementing', '1')",
+                params![work_item.as_str()],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE meta SET value = '5' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        drop(db);
+
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        let store = db.into_store(work_item).unwrap();
+        let activities = store.activities().unwrap();
+        assert_eq!(
+            activities
+                .iter()
+                .filter_map(|event| event.role.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                "Intake Planner:planner-a",
+                "Planner:planner-a",
+                "Coordinator:merge",
+                "Implementer",
+                "Reviewer"
+            ]
+        );
+        assert_eq!(activities[3].message, "Implementer failed; retrying");
+        assert_eq!(activities[5].message, "RVM error remains literal");
+        assert_eq!(store.count_events_of_kind("hi_answer").unwrap(), 0);
+        assert_eq!(store.count_events_of_kind("hi_decision").unwrap(), 0);
+        assert_eq!(store.count_events_of_kind("human_answer").unwrap(), 1);
+        assert_eq!(store.count_events_of_kind("human_decision").unwrap(), 1);
+        assert_eq!(
+            store.history().unwrap()[0].reason,
+            "human: approve PlanReview -> Implementing"
+        );
     }
 
     #[test]
@@ -1623,8 +1790,11 @@ mod tests {
     fn stores_work_item_and_candidates() {
         let mut store = Store::open_in_memory().unwrap();
         assert_eq!(store.work_item().unwrap(), None);
-        store.set_work_item("# WI\nbody").unwrap();
-        assert_eq!(store.work_item().unwrap().as_deref(), Some("# WI\nbody"));
+        store.set_work_item("# Work Item\nbody").unwrap();
+        assert_eq!(
+            store.work_item().unwrap().as_deref(),
+            Some("# Work Item\nbody")
+        );
 
         store.save_candidate("planner-b", 0, "plan B").unwrap();
         store.save_candidate("planner-a", 0, "plan A").unwrap();
@@ -1699,13 +1869,13 @@ mod tests {
             .record_activity(
                 &ActivityEvent::new(ActivityKind::AgentStarted, "planner-a started")
                     .phase(State::Planning)
-                    .role("PL:planner-a")
+                    .role("Planner:planner-a")
                     .iteration(0),
             )
             .unwrap();
 
         let snapshot = store.status_snapshot().unwrap();
-        assert_eq!(snapshot.version, 1);
+        assert_eq!(snapshot.version, 2);
         assert_eq!(snapshot.identity.id, work_item.as_str());
         assert_eq!(snapshot.identity.slug, "observable");
         assert_eq!(snapshot.identity.repository_root, "/repo");

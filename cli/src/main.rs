@@ -1,4 +1,4 @@
-//! Quorum CLI — a thin driver over `quorum-core` for a single work item (WI).
+//! Quorum CLI — a thin driver over `quorum-core` for a single work item.
 //!
 //! See `docs/architecture.md`. This binary parses arguments, calls the Core,
 //! and renders state. It holds no business logic.
@@ -52,8 +52,8 @@ enum Command {
     },
     /// Print the current state of a work item.
     Status {
-        /// The work item id.
-        wi: String,
+        /// The user-facing work-item slug.
+        work_item: String,
         /// Include full plans, summaries, findings, errors, and activity history.
         #[arg(long)]
         verbose: bool,
@@ -63,24 +63,24 @@ enum Command {
     },
     /// Approve the current review gate (PlanReview/WorkReview) and continue.
     Approve {
-        /// The work item id.
-        wi: String,
+        /// The user-facing work-item slug.
+        work_item: String,
         /// Continue with stub agents instead of invoking copilot.
         #[arg(long)]
         dry_run: bool,
     },
     /// Reject the current review gate and send the work back a phase.
     Reject {
-        /// The work item id.
-        wi: String,
+        /// The user-facing work-item slug.
+        work_item: String,
         /// Continue with stub agents instead of invoking copilot.
         #[arg(long)]
         dry_run: bool,
     },
     /// Answer planner questions at IntakeReview and continue.
     Answer {
-        /// The work item id.
-        wi: String,
+        /// The user-facing work-item slug.
+        work_item: String,
         /// The answer text (mutually exclusive with --file).
         #[arg(conflicts_with = "file")]
         text: Option<String>,
@@ -93,8 +93,8 @@ enum Command {
     },
     /// Abandon the work item (from any blocked state).
     Abandon {
-        /// The work item id.
-        wi: String,
+        /// The user-facing work-item slug.
+        work_item: String,
     },
 }
 
@@ -137,23 +137,28 @@ fn run() -> Result<()> {
             run_repo_command(&config, context.as_deref(), command)?;
         }
         Command::Run { work_item, dry_run } => {
-            let wi_id = work_item_id(&work_item);
-            validate_wi_id(&wi_id)?;
+            let work_item_slug = work_item_slug(&work_item);
+            validate_work_item_slug(&work_item_slug)?;
             let (mut database, repository) = open_registered_context(&config, context.as_deref())?;
             let internal_id = database
-                .get_or_create_work_item(&repository.id, &wi_id)
+                .get_or_create_work_item(&repository.id, &work_item_slug)
                 .context("creating work item state")?;
             let workspace = config
                 .work_item_dir(internal_id.as_str())
                 .join("implementation");
-            let worktree =
-                ensure_worktree(&mut database, &repository, &internal_id, &wi_id, &workspace)
-                    .context("preparing work item checkout")?;
+            let worktree = ensure_worktree(
+                &mut database,
+                &repository,
+                &internal_id,
+                &work_item_slug,
+                &workspace,
+            )
+            .context("preparing work item checkout")?;
 
             let mut store = database
                 .into_store(internal_id)
                 .context("opening work item state")?;
-            // Intake: load the WI markdown once, if not already stored.
+            // Intake: load the work-item markdown once, if not already stored.
             if store.work_item().context("reading work item")?.is_none() {
                 let text = std::fs::read_to_string(&work_item)
                     .with_context(|| format!("reading work item {}", work_item.display()))?;
@@ -173,16 +178,20 @@ fn run() -> Result<()> {
                 runner,
                 Box::new(GitImplementationWorkspace),
                 worktree.path,
-                wi_id.clone(),
+                work_item_slug.clone(),
             )
             .context("initializing coordinator")?
             .with_implementation_allowed_dirs(vec![common_git_dir])
             .with_observer(progress_observer(quiet));
             co.run_until_blocked().context("advancing work item")?;
-            report(&wi_id, &co)?;
+            report(&work_item_slug, &co)?;
         }
-        Command::Status { wi, verbose, json } => {
-            let (store, _, _) = open_work_item(&config, context.as_deref(), &wi, false)?;
+        Command::Status {
+            work_item,
+            verbose,
+            json,
+        } => {
+            let (store, _, _) = open_work_item(&config, context.as_deref(), &work_item, false)?;
             let snapshot = StatusSnapshot::load(&store).context("assembling work item status")?;
             if json {
                 println!(
@@ -193,28 +202,28 @@ fn run() -> Result<()> {
                 report_status(&snapshot, verbose);
             }
         }
-        Command::Approve { wi, dry_run } => {
+        Command::Approve { work_item, dry_run } => {
             resolve_and_continue(
                 config,
                 context.as_deref(),
-                &wi,
+                &work_item,
                 Decision::Approve,
                 dry_run,
                 quiet,
             )?;
         }
-        Command::Reject { wi, dry_run } => {
+        Command::Reject { work_item, dry_run } => {
             resolve_and_continue(
                 config,
                 context.as_deref(),
-                &wi,
+                &work_item,
                 Decision::Reject,
                 dry_run,
                 quiet,
             )?;
         }
         Command::Answer {
-            wi,
+            work_item,
             text,
             file,
             dry_run,
@@ -228,18 +237,18 @@ fn run() -> Result<()> {
             resolve_and_continue(
                 config,
                 context.as_deref(),
-                &wi,
+                &work_item,
                 Decision::Answer(answer),
                 dry_run,
                 quiet,
             )?;
         }
-        Command::Abandon { wi } => {
+        Command::Abandon { work_item } => {
             // Abandon is terminal; no autonomous continuation, so agents are unused.
             resolve_and_continue(
                 config,
                 context.as_deref(),
-                &wi,
+                &work_item,
                 Decision::Abandon,
                 true,
                 quiet,
@@ -250,19 +259,19 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-/// Open the WI, apply the human `decision`, then continue autonomously until the
+/// Open the work item, apply the human `decision`, then continue autonomously until the
 /// next blocked or terminal state.
 fn resolve_and_continue(
     config: Config,
     context: Option<&std::path::Path>,
-    wi_id: &str,
+    work_item_slug: &str,
     decision: Decision,
     dry_run: bool,
     quiet: bool,
 ) -> Result<()> {
-    validate_wi_id(wi_id)?;
+    validate_work_item_slug(work_item_slug)?;
     let require_worktree = !matches!(decision, Decision::Abandon);
-    let (store, _, workspace) = open_work_item(&config, context, wi_id, require_worktree)?;
+    let (store, _, workspace) = open_work_item(&config, context, work_item_slug, require_worktree)?;
     let runner: Box<dyn AgentRunner> = if dry_run {
         Box::new(EchoRunner)
     } else {
@@ -279,7 +288,7 @@ fn resolve_and_continue(
         runner,
         Box::new(GitImplementationWorkspace),
         workspace,
-        wi_id,
+        work_item_slug,
     )
     .context("initializing coordinator")?
     .with_implementation_allowed_dirs(additional_dirs)
@@ -287,7 +296,7 @@ fn resolve_and_continue(
     co.resolve(decision)
         .context("resolving human intervention")?;
     co.run_until_blocked().context("advancing work item")?;
-    report(wi_id, &co)?;
+    report(work_item_slug, &co)?;
     Ok(())
 }
 
@@ -371,21 +380,21 @@ fn open_registered_context(
 fn open_work_item(
     config: &Config,
     context: Option<&std::path::Path>,
-    wi_id: &str,
+    work_item_slug: &str,
     require_worktree: bool,
 ) -> Result<(Store, WorkItemId, PathBuf)> {
-    validate_wi_id(wi_id)?;
+    validate_work_item_slug(work_item_slug)?;
     let (mut database, repository) = open_registered_context(config, context)?;
     let internal_id = database
-        .work_item_id(&repository.id, wi_id)
+        .work_item_id(&repository.id, work_item_slug)
         .context("looking up work item")?
-        .with_context(|| format!("no work item {wi_id}"))?;
+        .with_context(|| format!("no work item {work_item_slug}"))?;
     let workspace = if require_worktree {
         ensure_worktree(
             &mut database,
             &repository,
             &internal_id,
-            wi_id,
+            work_item_slug,
             &config
                 .work_item_dir(internal_id.as_str())
                 .join("implementation"),
@@ -662,9 +671,10 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-/// Render the current state and, when blocked, the HI resume command (and any
+/// Render the current state and, when blocked, the human-intervention resume command
+/// (and any
 /// intake questions awaiting answers).
-fn report(wi_id: &str, co: &Coordinator) -> Result<()> {
+fn report(work_item_slug: &str, co: &Coordinator) -> Result<()> {
     let state = co.state();
     if let Some(session) = co.session_name() {
         println!("state: {state} (stuck — awaiting human intervention)");
@@ -675,11 +685,11 @@ fn report(wi_id: &str, co: &Coordinator) -> Result<()> {
         }
         // copilot cannot create a named session non-interactively, so the human
         // names it once via /rename, then resumes by that name (see docs/sessions.md).
-        println!("HI session: {session}");
+        println!("human-intervention session: {session}");
         println!("  first time: run `copilot`, then `/rename {session}`");
         println!("  resume:     copilot --resume {session}");
         if let Some(hint) = resolve_hint(state) {
-            println!("resolve with: quorum {hint} {wi_id}");
+            println!("resolve with: quorum {hint} {work_item_slug}");
         }
     } else if state == State::Failed {
         println!("state: {state} (failed — inspect the work item event history)");
@@ -700,22 +710,26 @@ fn resolve_hint(state: State) -> Option<&'static str> {
     }
 }
 
-/// Derive a stable WI id from the work item file name (stem).
-fn work_item_id(path: &std::path::Path) -> String {
+/// Derive a stable work-item slug from the input file name.
+fn work_item_slug(path: &std::path::Path) -> String {
     path.file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("work-item")
         .to_string()
 }
 
-/// Ensure a WI id is safe to embed in commands and deterministic session names.
-fn validate_wi_id(wi_id: &str) -> Result<()> {
-    let mut components = std::path::Path::new(wi_id).components();
+/// Ensure a work-item slug is safe in commands and deterministic session names.
+fn validate_work_item_slug(work_item_slug: &str) -> Result<()> {
+    let mut components = std::path::Path::new(work_item_slug).components();
     let first = components.next();
     let is_single_normal =
         matches!(first, Some(std::path::Component::Normal(_))) && components.next().is_none();
-    if wi_id.is_empty() || wi_id == "." || wi_id == ".." || !is_single_normal {
-        anyhow::bail!("invalid work item id {wi_id:?}: must be a single path component");
+    if work_item_slug.is_empty()
+        || work_item_slug == "."
+        || work_item_slug == ".."
+        || !is_single_normal
+    {
+        anyhow::bail!("invalid work-item slug {work_item_slug:?}: must be a single path component");
     }
     Ok(())
 }

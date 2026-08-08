@@ -1,27 +1,60 @@
 //! Agent invocation. Mirrors `docs/isolation.md`.
 //!
-//! Agents (PL/IM/RV) run as non-interactive `copilot` calls inside a local
+//! Agents run as non-interactive `copilot` calls inside a local
 //! sandbox. The [`AgentRunner`] trait abstracts the invocation so tests and the
 //! `--dry-run` path can substitute a fake without spawning any process.
 
 use crate::config::Sandbox;
+use std::fmt;
 use std::path::PathBuf;
 use std::process::Command;
 
 /// Filesystem posture for a sandboxed agent (see `docs/isolation.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Filesystem {
-    /// PL and RV: analysis only.
+    /// Planners and the Reviewer: analysis only.
     ReadOnly,
-    /// IM: may write within its workspace.
+    /// Implementer: may write within its workspace.
     ReadWrite,
+}
+
+/// Canonical role for one agent invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentRole {
+    IntakePlanner { slot: String },
+    Planner { slot: String },
+    CoordinatorMerge,
+    Implementer,
+    Reviewer,
+}
+
+impl AgentRole {
+    pub fn intake_planner(slot: impl Into<String>) -> AgentRole {
+        AgentRole::IntakePlanner { slot: slot.into() }
+    }
+
+    pub fn planner(slot: impl Into<String>) -> AgentRole {
+        AgentRole::Planner { slot: slot.into() }
+    }
+}
+
+impl fmt::Display for AgentRole {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AgentRole::IntakePlanner { slot } => write!(formatter, "Intake Planner:{slot}"),
+            AgentRole::Planner { slot } => write!(formatter, "Planner:{slot}"),
+            AgentRole::CoordinatorMerge => formatter.write_str("Coordinator:merge"),
+            AgentRole::Implementer => formatter.write_str("Implementer"),
+            AgentRole::Reviewer => formatter.write_str("Reviewer"),
+        }
+    }
 }
 
 /// A single agent invocation request.
 #[derive(Debug, Clone)]
 pub struct AgentRequest {
-    /// Role label, for logging/diagnostics (e.g. "PL:planner-a").
-    pub role: String,
+    /// Typed role used for behavior, logging, and diagnostics.
+    pub role: AgentRole,
     /// The fully rendered prompt.
     pub prompt: String,
     /// Working directory the agent runs in (its sandbox cwd).
@@ -65,8 +98,8 @@ pub trait AgentRunner: Send + Sync {
 /// Because the run is non-interactive (`--no-ask-user`), copilot cannot prompt
 /// for tool approval and would otherwise deny every action. We therefore grant
 /// tools up front, scoped by the request's filesystem posture: read/write agents
-/// (IM) get `--allow-all-tools` (the sandbox is the boundary, and the deny-list
-/// still blocks destructive ops); read-only agents (PL, RV) get only
+/// (the Implementer) get `--allow-all-tools` (the sandbox is the boundary, and the
+/// deny-list still blocks destructive ops); read-only Planners and Reviewers get only
 /// `--allow-tool read` so they can inspect but not modify.
 pub struct CopilotRunner {
     sandbox: Sandbox,
@@ -133,12 +166,12 @@ impl AgentRunner for CopilotRunner {
             .current_dir(&req.cwd)
             .output()
             .map_err(|source| AgentError::Spawn {
-                role: req.role.clone(),
+                role: req.role.to_string(),
                 source,
             })?;
         if !output.status.success() {
             return Err(AgentError::NonZeroExit {
-                role: req.role.clone(),
+                role: req.role.to_string(),
                 code: output
                     .status
                     .code()
@@ -159,7 +192,7 @@ impl AgentRunner for EchoRunner {
     fn run(&self, req: &AgentRequest) -> Result<String, AgentError> {
         // Intake-questions asks whether clarification is needed; the stub never
         // has questions, so it returns NONE (no blocking under --dry-run).
-        if req.role.contains("intake") {
+        if matches!(req.role, AgentRole::IntakePlanner { .. }) {
             return Ok("NONE".to_string());
         }
         // A universal stub: a `## Plan`, a `CONVERGED` convergence signal, and an
@@ -178,7 +211,7 @@ mod tests {
 
     fn req() -> AgentRequest {
         AgentRequest {
-            role: "PL:planner-a".to_string(),
+            role: AgentRole::planner("planner-a"),
             prompt: "do the thing".to_string(),
             cwd: PathBuf::from("/tmp"),
             filesystem: Filesystem::ReadOnly,
@@ -293,6 +326,21 @@ mod tests {
     fn echo_runner_returns_stub() {
         let out = EchoRunner.run(&req()).unwrap();
         assert!(out.contains("Dry-run stub"));
-        assert!(out.contains("PL:planner-a"));
+        assert!(out.contains("Planner:planner-a"));
+    }
+
+    #[test]
+    fn role_labels_use_full_names() {
+        assert_eq!(
+            AgentRole::intake_planner("planner-a").to_string(),
+            "Intake Planner:planner-a"
+        );
+        assert_eq!(
+            AgentRole::planner("planner-b").to_string(),
+            "Planner:planner-b"
+        );
+        assert_eq!(AgentRole::CoordinatorMerge.to_string(), "Coordinator:merge");
+        assert_eq!(AgentRole::Implementer.to_string(), "Implementer");
+        assert_eq!(AgentRole::Reviewer.to_string(), "Reviewer");
     }
 }

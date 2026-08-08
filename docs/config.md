@@ -9,7 +9,7 @@ Unknown keys are rejected. The global persistence model uses `data_dir`; the for
 ## Schema
 
 ```yaml
-# Root for the global database and per-WI filesystem state.
+# Root for the global database and per-work-item filesystem state.
 data_dir: ~/.quorum
 
 # Planner roster override (see agents.md). Keys are slots; values are model IDs.
@@ -31,7 +31,7 @@ sandbox:
   # Destructive tools denied even inside the sandbox (defense in depth).
   deny_tools:
     - shell(rm)
-  # Per-role filesystem posture. IM is the only writer.
+  # Per-role filesystem posture. The Implementer is the only writer.
   roles:
     planner:      { filesystem: read-only,  network: true }
     reviewer:     { filesystem: read-only,  network: true }
@@ -64,5 +64,5 @@ Repository selection is runtime context rather than configuration:
 - Model IDs are the only vendor-specific values; the *roster size and roles* are fixed in
   the [docs](agents.md).
 - `reviewer` MUST differ from `implementer` for the adversarial loop to be meaningful.
-- `sandbox.cloud` is reserved for the future; the unattended CO can only use the local
+- `sandbox.cloud` is reserved for the future; the unattended Coordinator can only use the local
   sandbox (see [isolation](isolation.md)).

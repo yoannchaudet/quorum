@@ -6,16 +6,16 @@ Specifications for Quorum's **Core** and **CLI**. Design-on-paper; no code yet.
 
 1. [glossary.md](glossary.md) — terms and acronyms (read first).
 2. [architecture.md](architecture.md) — Core vs CLI, Rust workspace, future Tauri.
-3. [work-items.md](work-items.md) — what a WI is; GitHub pull; images.
+3. [work-items.md](work-items.md) — work-item inputs, GitHub pull, and images.
 4. [repositories.md](repositories.md) — repository context and registration.
-5. [state-machine.md](state-machine.md) — the backbone: states, loops, HI signaling.
-6. [agents.md](agents.md) — CO, PL quorum, IM↔RV, convergence, HI.
+5. [state-machine.md](state-machine.md) — the backbone: states, loops, and human intervention.
+6. [agents.md](agents.md) — Coordinator, Planner quorum, Implementer, and Reviewer.
 7. [isolation.md](isolation.md) — execution isolation: local sandbox + per-role profiles.
 8. [prompts.md](prompts.md) — prompts as markdown files with frontmatter.
-9. [sessions.md](sessions.md) — HI via resumable `copilot` sessions.
+9. [sessions.md](sessions.md) — human intervention through resumable `copilot` sessions.
 10. [config.md](config.md) — `~/.quorum/config.yaml` schema.
 11. [persistence.md](persistence.md) — crash resilience and recovery.
-12. [observability.md](observability.md) — live progress and rich WI status.
+12. [observability.md](observability.md) — live progress and rich work-item status.
 13. [dev-lifecycle.md](dev-lifecycle.md) — Makefile: `verify` / `verify-full`.
 
 ## Doc style rules

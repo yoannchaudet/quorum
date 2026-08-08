@@ -1,4 +1,4 @@
-//! State machine for a single work item (WI).
+//! State machine for a single work item.
 //!
 //! Mirrors `docs/state-machine.md` exactly. That doc is the source of truth;
 //! keep this module and the diagram in lockstep.
@@ -10,15 +10,15 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
-    /// The Coordinator (CO) makes progress unattended.
+    /// The Coordinator makes progress unattended.
     Autonomous,
-    /// Blocked awaiting Human Intervention (HI).
+    /// Blocked awaiting human intervention.
     Blocked,
     /// End state; no further transitions.
     Terminal,
 }
 
-/// The states a WI moves through. See `docs/state-machine.md`.
+/// The states a work item moves through. See `docs/state-machine.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum State {
@@ -36,7 +36,7 @@ pub enum State {
 }
 
 impl State {
-    /// The kind of this state (autonomous / blocked on HI / terminal).
+    /// The kind of this state (autonomous, blocked, or terminal).
     pub fn kind(self) -> Kind {
         use State::*;
         match self {
@@ -46,12 +46,12 @@ impl State {
         }
     }
 
-    /// True when the WI is stuck awaiting a human.
+    /// True when the work item is stuck awaiting a human.
     pub fn is_blocked(self) -> bool {
         self.kind() == Kind::Blocked
     }
 
-    /// True when the WI has reached an end state.
+    /// True when the work item has reached an end state.
     pub fn is_terminal(self) -> bool {
         self.kind() == Kind::Terminal
     }

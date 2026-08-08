@@ -1,26 +1,27 @@
 # State Machine
 
-The CO drives one WI through this state machine. It is the backbone: [agents](agents.md),
+The Coordinator drives one work item through this state machine. It is the backbone: [agents](agents.md),
 [sessions](sessions.md), and [persistence](persistence.md) all reference these state names.
 
-Every state is either **autonomous** (CO makes progress unattended) or **blocked**
-(CO is stuck, awaiting HI). The CLI and future UX MUST surface this distinction.
+Every state is either **autonomous** (the Coordinator makes progress unattended) or
+**blocked** (the Coordinator is awaiting human intervention). The CLI and future UX
+MUST surface this distinction.
 
 ## States
 
 | State | Kind | Meaning |
 |-------|------|---------|
-| `Intake` | autonomous | Load the WI (local markdown or pulled from GitHub), resolve images, validate. |
-| `IntakeReview` | blocked (HI) | PLs raised follow-up questions; a human answers them via a Session. |
-| `Planning` | autonomous | Each PL produces a candidate plan in isolation. |
-| `Converging` | autonomous | CO merges candidate plans; re-runs PLs until the Plan stabilizes (see convergence loop). |
-| `PlanReview` | blocked (HI, optional) | Human reviews the converged Plan. Approve, or send back to `Planning`. |
-| `Implementing` | autonomous | IM produces the implementation from the Plan. |
-| `Reviewing` | autonomous | RV adversarially reviews the IM output. |
-| `WorkReview` | blocked (HI, optional) | Human reviews the accepted work. Approve, or send back to `Implementing`. |
+| `Intake` | autonomous | Load the work item, resolve images, and validate. |
+| `IntakeReview` | blocked | Planners raised follow-up questions; a human answers them through a Session. |
+| `Planning` | autonomous | Each Planner produces a candidate plan in isolation. |
+| `Converging` | autonomous | The Coordinator merges candidate plans and re-runs Planners until the Plan stabilizes. |
+| `PlanReview` | blocked, optional | A human reviews the converged Plan. Approve, or send it back to `Planning`. |
+| `Implementing` | autonomous | The Implementer produces the implementation from the Plan. |
+| `Reviewing` | autonomous | The Reviewer adversarially reviews the Implementer's output. |
+| `WorkReview` | blocked, optional | A human reviews the accepted work. Approve, or send it back to `Implementing`. |
 | `Done` | terminal | Work accepted. |
 | `Failed` | terminal | Unrecoverable error (see [persistence](persistence.md) for retry/recovery first). |
-| `Abandoned` | terminal | Human canceled the WI. |
+| `Abandoned` | terminal | A human canceled the work item. |
 
 ## Diagram
 
@@ -28,21 +29,21 @@ Every state is either **autonomous** (CO makes progress unattended) or **blocked
 stateDiagram-v2
   [*] --> Intake
   Intake --> Planning
-  Planning --> IntakeReview: PLs have questions
-  IntakeReview --> Planning: answers provided (HI)
+  Planning --> IntakeReview: Planners have questions
+  IntakeReview --> Planning: answers provided
   Planning --> Converging: candidate plans ready
-  Converging --> Planning: not converged (re-run PLs)
+  Converging --> Planning: not converged (re-run Planners)
   Converging --> PlanReview: converged
-  PlanReview --> Planning: changes requested (HI)
-  PlanReview --> Implementing: approved (HI)
+  PlanReview --> Planning: changes requested
+  PlanReview --> Implementing: approved
   Converging --> Implementing: converged, review disabled
   Implementing --> Reviewing
-  Reviewing --> Implementing: RV rejects (adversarial loop)
-  Reviewing --> WorkReview: RV accepts
+  Reviewing --> Implementing: Reviewer rejects
+  Reviewing --> WorkReview: Reviewer accepts
   Reviewing --> WorkReview: unchanged tree or iteration bound
-  WorkReview --> Implementing: changes requested (HI)
-  WorkReview --> Done: approved (HI)
-  Reviewing --> Done: RV accepts, review disabled
+  WorkReview --> Implementing: changes requested
+  WorkReview --> Done: approved
+  Reviewing --> Done: Reviewer accepts, review disabled
   Intake --> Failed
   Planning --> Failed
   Converging --> Failed
@@ -58,20 +59,20 @@ stateDiagram-v2
 
 ## Loops
 
-1. **Intake loop** — `Planning` → `IntakeReview` → `Planning`, until PLs have no open questions.
+1. **Intake loop** — `Planning` → `IntakeReview` → `Planning`, until Planners have no open questions.
 2. **Convergence loop** — `Planning` → `Converging` → `Planning`, until the Plan stabilizes. See [agents](agents.md) for convergence criteria.
-3. **Adversarial loop** — `Implementing` → `Reviewing` → `Implementing`, until RV accepts.
+3. **Adversarial loop** — `Implementing` → `Reviewing` → `Implementing`, until the Reviewer accepts.
    After a rejection, equal consecutive Git tree SHAs or the configured iteration bound
    force `WorkReview`, even when the normal work-review gate is disabled.
 
 `PlanReview` and `WorkReview` are optional gates (toggled in [config](config.md)); when
-disabled the CO transitions straight through.
+disabled the Coordinator transitions straight through.
 
 ## Progressing vs. stuck
 
-- **Autonomous** states: the WI is progressing on its own. The CLI reports the current state and last activity.
-- **Blocked (HI)** states: the WI is stuck awaiting a human. The CLI prints the exact
+- **Autonomous** states: the work item is progressing on its own. The CLI reports the current state and last activity.
+- **Blocked** states: the work item is awaiting a human. The CLI prints the exact
   Session resume command (see [sessions](sessions.md)); the UX offers a one-click terminal.
 
-Each state and every transition is persisted so the CO can resume after a crash
+Each state and every transition is persisted so the Coordinator can resume after a crash
 (see [persistence](persistence.md)).

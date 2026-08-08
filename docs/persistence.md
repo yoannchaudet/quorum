@@ -8,13 +8,13 @@ Coordinator is scoped to a stable internal work-item ID.
 
 ```
 ~/.quorum/
-  quorum.db                     # structured state for every WI
+  quorum.db                     # structured state for every work item
   state/<work-item-id>/
-    assets/                     # binary image files referenced by the WI
+    assets/                     # binary image files referenced by the work item
     implementation/             # linked Git worktree
 ```
 
-The internal ID is a UUID, independent of the user-facing WI slug. Repository ownership
+The internal ID is a UUID, independent of the user-facing work-item slug. Repository ownership
 is associated in the database; it does not determine the filesystem path.
 
 ## Schema
@@ -23,22 +23,22 @@ is associated in the database; it does not determine the filesystem path.
 |-------|-------|
 | `repositories` | Stable ID, canonical root, and active registration status. |
 | `work_items` | Stable ID, repository, slug, normalized markdown, and source metadata. |
-| `states` | Current state per WI. |
-| `transitions` | Append-only transition history per WI. |
-| `candidates` | PL candidate plans by WI, planner, and iteration. |
-| `plans` | Converged Plan and metrics per WI. |
-| `implementations` | IM summary by WI and adversarial iteration. |
-| `implementation_rounds` | Start/result commits, tree SHA, and recovery status per IM round. |
-| `intake` | Current planner questions per WI. |
-| `reviews` | RV feedback and verdict by WI and iteration. |
-| `sessions` | HI session records by WI and blocked state. |
-| `events` | Append-only audit events per WI. |
+| `states` | Current state per work item. |
+| `transitions` | Append-only transition history per work item. |
+| `candidates` | Planner candidate plans by work item, Planner, and iteration. |
+| `plans` | Converged Plan and metrics per work item. |
+| `implementations` | Implementer summary by work item and adversarial iteration. |
+| `implementation_rounds` | Start/result commits, tree SHA, and recovery status per Implementer round. |
+| `intake` | Current Planner questions per work item. |
+| `reviews` | Reviewer feedback and verdict by work item and iteration. |
+| `sessions` | Human-intervention session records by work item and blocked state. |
+| `events` | Append-only audit events per work item. |
 | `activities` | Structured phase, agent, retry, Git-round, review, and outcome events. |
-| `worktrees` | Pinned base commit, branch, path, and setup status per WI. |
+| `worktrees` | Pinned base commit, branch, path, and setup status per work item. |
 
-Every WI-owned row has a foreign key to `work_items` with cascading deletion. WI slugs
-are unique per repository. Composite keys include the WI ID, preventing planners,
-iterations, sessions, or reviews from colliding across WIs.
+Every work-item-owned row has a foreign key to `work_items` with cascading deletion.
+Work-item slugs are unique per repository. Composite keys include the work-item ID,
+preventing Planners, iterations, sessions, or reviews from colliding across work items.
 
 ## Connection policy
 
@@ -51,17 +51,17 @@ iterations, sessions, or reviews from colliding across WIs.
 
 - **Atomic transitions**: state, transition history, and authorizing events commit in one
   transaction.
-- **Scoped access**: the Coordinator receives a WI-scoped store rather than unrestricted
+- **Scoped access**: the Coordinator receives a work-item-scoped store rather than unrestricted
   catalog access.
-- **Single source of truth**: the `states` row for a WI is authoritative.
+- **Single source of truth**: the `states` row for a work item is authoritative.
 - **Idempotent outputs**: deterministic composite keys let a retry replace the same
   planner, implementation, or review iteration.
 - **Recoverable worktree setup**: creation intent is persisted before Git is changed;
   restart reconciles only matching branches and paths.
-- **Recoverable implementation rounds**: `running` records are created before IM,
+- **Recoverable implementation rounds**: `running` records are created before the Implementer,
   summaries and `agent_complete` are persisted atomically, and `committed` records hold
   the resulting commit and tree SHA.
-- **Attributable Git history**: the CO stages with `git add -A` and creates marked
+- **Attributable Git history**: the Coordinator stages with `git add -A` and creates marked
   commits using a fixed Quorum identity. Empty rounds record the unchanged tree without
   creating an empty commit.
 - **Inspectable long work**: activity starts are committed before agent invocations and
@@ -72,7 +72,7 @@ iterations, sessions, or reviews from colliding across WIs.
 ## Resume after crash
 
 1. Resolve and validate the registered repository context.
-2. Find the WI by repository and user-facing ID in the global catalog.
+2. Find the work item by repository and user-facing slug in the global catalog.
 3. Read its scoped `states` row.
 4. Verify the outputs required by that state.
 5. Advance when complete; otherwise re-run the idempotent step.
@@ -80,16 +80,16 @@ iterations, sessions, or reviews from colliding across WIs.
 
 For an implementation round, restart behavior depends on its status:
 
-- `running`: require the original HEAD and rerun IM over any partial file edits.
+- `running`: require the original HEAD and rerun the Implementer over any partial file edits.
 - `agent_complete`: stage/finalize the edits, or adopt an already-created commit whose
   parent and Quorum markers match the round.
-- `committed`: skip IM and continue from the persisted result.
+- `committed`: skip the Implementer and continue from the persisted result.
 
-An unrelated commit or unexpected HEAD is never reset or overwritten; the WI fails with
+An unrelated commit or unexpected HEAD is never reset or overwritten; the work item fails with
 the checkout left intact for inspection.
 
 ## Failure
 
-A step retries up to `limits.step_retries` before the CO moves the WI to `Failed`.
+A step retries up to `limits.step_retries` before the Coordinator moves the work item to `Failed`.
 `Failed` is terminal, but its structured history and filesystem workspace remain
 available for inspection.

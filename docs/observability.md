@@ -1,7 +1,7 @@
 # Observability
 
 Quorum exposes the same typed Core data to the CLI and future frontends. It never relies
-on parsing terminal prose to understand a WI.
+on parsing terminal prose to understand a work item.
 
 ## Live progress
 
@@ -12,7 +12,7 @@ on parsing terminal prose to understand a WI.
 - convergence outcomes;
 - implementation-round reservation, recovery, commit, or empty result;
 - review verdicts and escalation;
-- HI blocking and terminal outcomes.
+- human-intervention blocking and terminal outcomes.
 
 The start event is persisted and printed before a long agent invocation. Full prompts
 and model output are not included. Pass global `--quiet` to suppress live rendering;
@@ -20,10 +20,10 @@ events are still persisted.
 
 ## Rich status
 
-`quorum status <wi>` is read-only and reports:
+`quorum status <work-item>` is read-only and reports:
 
-- WI/repository identity and current state;
-- latest activity and HI instructions;
+- work-item/repository identity and current state;
+- latest activity and human-intervention instructions;
 - planning iterations, planners, convergence, and Plan;
 - implementation round states, commits, trees, and summaries;
 - review verdicts/findings and failures;
