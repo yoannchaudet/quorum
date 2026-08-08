@@ -378,6 +378,15 @@ impl Store {
             Err(e) => Err(e.into()),
         }
     }
+
+    /// The number of reviews recorded so far. Doubles as the next adversarial
+    /// iteration index (reviews are keyed by 0-based iteration).
+    pub fn review_count(&self) -> Result<u32, StoreError> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM reviews", [], |r| r.get(0))?;
+        Ok(n as u32)
+    }
 }
 fn now_millis() -> String {
     SystemTime::now()

@@ -28,6 +28,11 @@ pub enum CoordinatorError {
     NoWorkItem,
     #[error("no plan is available to implement")]
     NoPlan,
+    #[error("failed to create workspace {path}: {source}")]
+    Workspace {
+        path: String,
+        source: std::io::Error,
+    },
     #[error("cannot {decision} in state {state} (not an applicable human-intervention state)")]
     InvalidResolution { state: State, decision: Decision },
 }
@@ -270,8 +275,8 @@ impl Coordinator {
 
         // The IM's writable sandbox cwd is the workspace's implementation/ dir.
         let impl_dir = self.workspace.join("implementation");
-        std::fs::create_dir_all(&impl_dir).map_err(|source| AgentError::Spawn {
-            role: "IM".to_string(),
+        std::fs::create_dir_all(&impl_dir).map_err(|source| CoordinatorError::Workspace {
+            path: impl_dir.display().to_string(),
             source,
         })?;
 
@@ -288,11 +293,10 @@ impl Coordinator {
         };
         let output = self.runner.run(&req)?;
 
-        // The IM iteration tracks adversarial rounds: one past the latest review.
-        let iteration = match self.store.latest_implementation()? {
-            Some((prev, _)) => prev + 1,
-            None => 0,
-        };
+        // Derive the adversarial iteration from committed review progress, so a
+        // retry before the next review is recorded reuses the same iteration
+        // (idempotent) rather than creating a phantom unreviewed iteration.
+        let iteration = self.store.review_count()?;
         self.store.save_implementation(iteration, &output)?;
         Ok(())
     }
@@ -558,6 +562,38 @@ mod tests {
 
         // The IM's writable workspace was created.
         assert!(tmp.path().join("implementation").is_dir());
+    }
+
+    #[test]
+    fn implementer_retry_reuses_iteration_until_reviewed() {
+        // Set up a coordinator sitting at Implementing with a plan present.
+        let mut store = Store::open_in_memory().unwrap();
+        store.set_work_item("# WI").unwrap();
+        store.set_plan("the plan", "").unwrap();
+        for (f, t) in [
+            (State::Intake, State::Planning),
+            (State::Planning, State::Converging),
+            (State::Converging, State::Implementing),
+        ] {
+            store.record_transition(Some(f), t, "x").unwrap();
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let mut co = Coordinator::new(
+            Config::default(),
+            store,
+            Box::new(EchoRunner),
+            workspace.path().into(),
+        )
+        .unwrap();
+
+        // Run the IM twice with no review recorded (simulating a crash-retry
+        // before the transition): the iteration must stay 0, not grow.
+        co.run_implementer().unwrap();
+        co.run_implementer().unwrap();
+        assert_eq!(
+            co.store.latest_implementation().unwrap().map(|(i, _)| i),
+            Some(0)
+        );
     }
 
     #[test]
