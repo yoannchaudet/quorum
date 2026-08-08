@@ -30,15 +30,17 @@ Images are first-class — they will be used extensively.
   quorum.db           # structured state for every WI
   state/<work-item-id>/
     assets/           # downloaded/embedded images
-    implementation/   # IM output
+    implementation/   # linked Git worktree
 ```
 
 The WI's normalized markdown and stable internal id are stored in the global database.
 Only binary images and implementation files live under the WI's UUID-keyed state
 directory.
 
-`implementation/` is the IM's **writable sandbox workspace** (its cwd). PL and RV run
-read-only against the WI, assets, and IM output. See [isolation](isolation.md).
+`implementation/` is a linked Git worktree on a dedicated Quorum branch. Its base is the
+context repository's committed `HEAD` when the WI first runs; uncommitted changes in the
+user's checkout are deliberately excluded. PL and RV use the worktree read-only, while
+IM uses it read/write. See [isolation](isolation.md).
 
 ## Validation (during Intake)
 

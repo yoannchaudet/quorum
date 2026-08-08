@@ -11,13 +11,15 @@ pub mod persistence;
 pub mod prompt;
 pub mod repository;
 pub mod state;
+pub mod worktree;
 
 pub use agent::{AgentRunner, CopilotRunner, EchoRunner};
 pub use config::Config;
 pub use coordinator::{Coordinator, Decision};
 pub use persistence::{
-    Database, RegisteredRepository, RepositoryId, Store, Transition, WorkItemId,
+    Database, RegisteredRepository, RepositoryId, Store, Transition, WorkItemId, WorktreeRecord,
 };
 pub use prompt::Prompt;
 pub use repository::{RepositoryError, RepositoryRoot};
 pub use state::{Kind, State};
+pub use worktree::{branch_name, ensure_worktree, worktree_record, WorktreeError};

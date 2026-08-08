@@ -30,11 +30,6 @@ pub enum CoordinatorError {
     NoPlan,
     #[error("no implementation is available to review")]
     NoImplementation,
-    #[error("failed to create workspace {path}: {source}")]
-    Workspace {
-        path: String,
-        source: std::io::Error,
-    },
     #[error("cannot {decision} in state {state} (not an applicable human-intervention state)")]
     InvalidResolution { state: State, decision: Decision },
 }
@@ -343,9 +338,9 @@ impl Coordinator {
     /// Run the Implementer (IM) against the accepted Plan, in its writable
     /// workspace, and persist the summary it returns.
     ///
-    /// The IM runs read/write, confined to the `implementation/` subdirectory of
-    /// the WI workspace (its sandbox cwd, see `docs/isolation.md`). On re-entry
-    /// from the adversarial loop, the latest review feedback is fed back in.
+    /// The IM runs read/write at the worktree root (its sandbox cwd, see
+    /// `docs/isolation.md`). On re-entry from the adversarial loop, the latest
+    /// review feedback is fed back in.
     fn run_implementer(&mut self) -> Result<(), CoordinatorError> {
         let work_item = self
             .store
@@ -359,13 +354,6 @@ impl Coordinator {
             .map(|(text, _)| text)
             .unwrap_or_default();
 
-        // The IM's writable sandbox cwd is the workspace's implementation/ dir.
-        let impl_dir = self.workspace.join("implementation");
-        std::fs::create_dir_all(&impl_dir).map_err(|source| CoordinatorError::Workspace {
-            path: impl_dir.display().to_string(),
-            source,
-        })?;
-
         let rendered = Prompt::implementer().render(&[
             ("work_item", &work_item),
             ("plan", &plan),
@@ -374,7 +362,7 @@ impl Coordinator {
         let req = AgentRequest {
             role: "IM".to_string(),
             prompt: rendered,
-            cwd: impl_dir,
+            cwd: self.workspace.clone(),
             filesystem: Filesystem::ReadWrite,
             model: self.config.models.implementer.clone(),
         };
@@ -1011,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn implementer_persists_summary_and_creates_workspace() {
+    fn implementer_persists_summary_in_supplied_workspace() {
         let mut config = Config::default();
         config.reviews.plan_review = false;
         config.reviews.work_review = false;
@@ -1025,8 +1013,7 @@ mod tests {
         assert_eq!(iteration, 0);
         assert!(summary.contains("IM"));
 
-        // The IM's writable workspace was created.
-        assert!(tmp.path().join("implementation").is_dir());
+        assert!(tmp.path().is_dir());
     }
 
     #[test]
