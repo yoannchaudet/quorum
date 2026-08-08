@@ -1011,7 +1011,7 @@ impl Store {
             .and_then(|value| crate::ExecutionCapabilities::parse_plan(&value.0).ok());
 
         Ok(StatusSnapshot {
-            version: 4,
+            version: 5,
             identity: WorkItemIdentitySnapshot {
                 id,
                 slug: slug.clone(),
@@ -1031,6 +1031,7 @@ impl Store {
                 plan: plan.as_ref().map(|value| value.0.clone()),
                 metrics: plan.and_then(|value| value.1),
                 execution,
+                feedback: self.plan_feedback()?,
             },
             implementations,
             reviews,
@@ -1341,6 +1342,29 @@ impl Store {
             }
         }
         Ok(parts.join("\n\n"))
+    }
+
+    pub fn plan_feedback(&self) -> Result<Option<String>, StoreError> {
+        self.latest_human_feedback("plan_feedback")
+    }
+
+    pub fn work_feedback(&self) -> Result<Option<String>, StoreError> {
+        self.latest_human_feedback("work_feedback")
+    }
+
+    fn latest_human_feedback(&self, kind: &str) -> Result<Option<String>, StoreError> {
+        let feedback = self
+            .conn
+            .query_row(
+                "SELECT data FROM events
+                 WHERE work_item_id = ?1 AND kind = ?2 AND data IS NOT NULL
+                 ORDER BY id DESC LIMIT 1",
+                params![self.work_item_id.as_str(), kind],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)?;
+        Ok(feedback.filter(|text: &String| !text.trim().is_empty()))
     }
 
     pub fn set_questions(&mut self, questions: &str) -> Result<(), StoreError> {
@@ -2026,7 +2050,12 @@ mod tests {
         store.save_candidate("planner-a", 0, "candidate").unwrap();
         store.set_plan("the plan", "iteration=0").unwrap();
         store
-            .record_transition(Some(State::Intake), State::Planning, "start")
+            .record_transition_with_events(
+                Some(State::Intake),
+                State::Planning,
+                "start",
+                &[("plan_feedback", "add rollback")],
+            )
             .unwrap();
         store
             .record_activity(
@@ -2038,7 +2067,7 @@ mod tests {
             .unwrap();
 
         let snapshot = store.status_snapshot().unwrap();
-        assert_eq!(snapshot.version, 4);
+        assert_eq!(snapshot.version, 5);
         assert_eq!(snapshot.identity.id, work_item.as_str());
         assert_eq!(snapshot.identity.slug, "observable");
         assert_eq!(snapshot.identity.repository_root, "/repo");
@@ -2046,6 +2075,7 @@ mod tests {
         assert_eq!(snapshot.planning.iterations, 1);
         assert_eq!(snapshot.planning.candidate_count, 1);
         assert_eq!(snapshot.planning.plan.as_deref(), Some("the plan"));
+        assert_eq!(snapshot.planning.feedback.as_deref(), Some("add rollback"));
         assert_eq!(snapshot.activities.len(), 1);
         assert_eq!(
             snapshot.workspace.branch.as_deref(),

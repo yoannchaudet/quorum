@@ -85,8 +85,8 @@ The Coordinator pulls humans in at exactly three points, each a blocked state:
 | State | What the human does |
 |-------|---------------------|
 | `IntakeReview` | Answers Planner follow-up questions. |
-| `PlanReview` (optional) | Approves or rejects the converged Plan. |
-| `WorkReview` (optional) | Approves or rejects the accepted work. |
+| `PlanReview` (optional) | Approves the converged Plan, or rejects it with optional feedback for the next planning pass. |
+| `WorkReview` (optional) | Approves the accepted work, or rejects it with optional feedback for the next implementation pass. |
 
 All human intervention happens through a resumable [Session](sessions.md). All prompts
 the Coordinator gives any

@@ -15,7 +15,7 @@ MUST surface this distinction.
 | `IntakeReview` | blocked | Planners raised follow-up questions; a human answers them through a Session. |
 | `Planning` | autonomous | Each Planner produces a candidate plan in isolation. |
 | `Converging` | autonomous | The Coordinator merges candidate plans and re-runs Planners until the Plan stabilizes. |
-| `PlanReview` | blocked, optional | A human reviews the converged Plan. Approve, or send it back to `Planning`. |
+| `PlanReview` | blocked, optional | A human reviews the converged Plan. Approve, or send it back to `Planning` with optional feedback. |
 | `Implementing` | autonomous | The Implementer produces the implementation from the Plan. |
 | `Reviewing` | autonomous | The Reviewer adversarially reviews the Implementer's output. |
 | `WorkReview` | blocked, optional | A human reviews the accepted work. Approve, or send it back to `Implementing`. |

@@ -30,6 +30,8 @@ When a work item enters a blocked state, the CLI:
    > name to use so it stays consistent for the block.
 3. The human resolves the block with a Quorum command (`quorum approve` /
    `reject` / `answer` / `abandon`), and the Coordinator resumes autonomous progress.
+   `quorum reject <work-item> ["feedback"]` (or `--file`) carries revision guidance
+   into the next planning or implementation pass.
 
 ## Tauri UX (future)
 

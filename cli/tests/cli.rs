@@ -164,7 +164,7 @@ fn run_advances_to_plan_review_and_status_reads_it_back() {
     let out = quorum(home, &repo, &["status", "my-work-item", "--json"]);
     assert!(out.status.success(), "JSON status failed: {out:?}");
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(value["version"], 4);
+    assert_eq!(value["version"], 5);
     assert_eq!(value["identity"]["slug"], "my-work-item");
     assert_eq!(value["state"]["current"], "plan_review");
     assert_eq!(value["planning"]["iterations"], 1);
@@ -191,6 +191,46 @@ fn run_advances_to_plan_review_and_status_reads_it_back() {
         .unwrap()
         .len();
     assert_eq!(activity_count_after, activity_count);
+}
+
+#[test]
+fn reject_feedback_is_preserved_for_replanning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let repo = home.join("repo");
+    init_repo(&repo);
+    assert!(register(home, &repo).status.success());
+
+    let work_item = repo.join("feedback.md");
+    std::fs::write(&work_item, "# Feedback\n").unwrap();
+    let run = quorum(
+        home,
+        &repo,
+        &["run", "--dry-run", work_item.to_str().unwrap()],
+    );
+    assert!(run.status.success(), "run failed: {run:?}");
+
+    let reject = quorum(
+        home,
+        &repo,
+        &[
+            "reject",
+            "--dry-run",
+            "feedback",
+            "Add an explicit rollback step.",
+        ],
+    );
+    assert!(reject.status.success(), "reject failed: {reject:?}");
+
+    let status = quorum(home, &repo, &["status", "feedback", "--json"]);
+    assert!(status.status.success(), "status failed: {status:?}");
+    let value: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(value["version"], 5);
+    assert_eq!(
+        value["planning"]["feedback"],
+        "Add an explicit rollback step."
+    );
+    assert_eq!(value["state"]["current"], "plan_review");
 }
 
 #[test]

@@ -2,7 +2,7 @@
 id: planner
 role: Planner
 model-target: planners
-version: 3
+version: 4
 purpose: Produce a candidate plan for a work item in isolation.
 ---
 
@@ -24,6 +24,8 @@ You are a **Planner**. Produce a **candidate plan** for the work item below.
 - **Work item**: `{{work_item}}`
 - **Human answers** (may be empty): `{{answers}}`
 - **Previous merged plan** (may be empty; refine toward it if present): `{{previous_plan}}`
+- **Human rejection feedback** (may be empty; address every requested change):
+  `{{human_feedback}}`
 
 ## Output
 

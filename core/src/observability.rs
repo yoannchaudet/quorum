@@ -128,6 +128,7 @@ pub struct PlanningSnapshot {
     pub plan: Option<String>,
     pub metrics: Option<String>,
     pub execution: Option<ExecutionCapabilities>,
+    pub feedback: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
