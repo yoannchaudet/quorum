@@ -16,6 +16,7 @@ pub enum ActivityKind {
     Convergence,
     ImplementationRound,
     Review,
+    Artifact,
     Transition,
     HumanIntervention,
     Completed,
@@ -146,6 +147,14 @@ pub struct ReviewSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactSnapshot {
+    pub iteration: u32,
+    pub path: String,
+    pub media_type: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceSnapshot {
     pub path: String,
     pub branch: Option<String>,
@@ -166,6 +175,7 @@ pub struct StatusSnapshot {
     pub planning: PlanningSnapshot,
     pub implementations: Vec<ImplementationSnapshot>,
     pub reviews: Vec<ReviewSnapshot>,
+    pub artifacts: Vec<ArtifactSnapshot>,
     pub errors: Vec<ActivityEvent>,
     pub activities: Vec<ActivityEvent>,
     pub workspace: WorkspaceSnapshot,

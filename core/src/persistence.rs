@@ -5,8 +5,8 @@
 //! one work item so data cannot leak across runs.
 
 use crate::observability::{
-    ActivityEvent, ActivityKind, ImplementationSnapshot, PlanningSnapshot, ReviewSnapshot,
-    StateSnapshot, StatusSnapshot, WorkItemIdentitySnapshot, WorkspaceSnapshot,
+    ActivityEvent, ActivityKind, ArtifactSnapshot, ImplementationSnapshot, PlanningSnapshot,
+    ReviewSnapshot, StateSnapshot, StatusSnapshot, WorkItemIdentitySnapshot, WorkspaceSnapshot,
 };
 use crate::repository::RepositoryRoot;
 use crate::state::State;
@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 /// The global database schema version.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Stable internal identity for a work item.
@@ -118,6 +118,14 @@ pub struct ImplementationRound {
     pub tree_sha: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Artifact {
+    pub iteration: u32,
+    pub path: String,
+    pub media_type: String,
+    pub created_at: String,
+}
+
 /// Errors from the persistence layer.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -135,6 +143,11 @@ pub enum StoreError {
     InvalidRoundStatus(String),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error("artifact filesystem error at {path}: {source}")]
+    ArtifactIo {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
 }
 
 /// A recorded state transition, in insertion order.
@@ -381,6 +394,19 @@ impl Database {
                 updated_at    TEXT NOT NULL,
                 PRIMARY KEY (work_item_id, iteration)
             );
+
+            CREATE TABLE IF NOT EXISTS artifacts (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                iteration    INTEGER NOT NULL,
+                path         TEXT NOT NULL,
+                media_type   TEXT NOT NULL,
+                created_at   TEXT NOT NULL,
+                UNIQUE(work_item_id, path)
+            );
+
+            CREATE INDEX IF NOT EXISTS artifacts_work_item
+                ON artifacts(work_item_id, id);
             "#,
         )?;
         Ok(())
@@ -909,6 +935,16 @@ impl Store {
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        let artifacts = self
+            .artifacts()?
+            .into_iter()
+            .map(|artifact| ArtifactSnapshot {
+                iteration: artifact.iteration,
+                path: artifact.path,
+                media_type: artifact.media_type,
+                created_at: artifact.created_at,
+            })
+            .collect();
 
         let worktree = self
             .conn
@@ -971,7 +1007,7 @@ impl Store {
         }
 
         Ok(StatusSnapshot {
-            version: 2,
+            version: 3,
             identity: WorkItemIdentitySnapshot {
                 id,
                 slug: slug.clone(),
@@ -993,6 +1029,7 @@ impl Store {
             },
             implementations,
             reviews,
+            artifacts,
             errors,
             activities,
             workspace: worktree,
@@ -1015,6 +1052,55 @@ impl Store {
                 |row| row.get::<_, Option<String>>(0),
             )
             .map_err(Into::into)
+    }
+
+    pub fn sync_artifacts(&mut self, iteration: u32, root: &Path) -> Result<usize, StoreError> {
+        if !root.exists() {
+            return Ok(0);
+        }
+        let files = artifact_files(root)?;
+        let created_at = now_millis().to_string();
+        for path in &files {
+            let path_text = path
+                .to_str()
+                .ok_or_else(|| StoreError::NonUtf8Path(path.clone()))?;
+            self.conn.execute(
+                "INSERT INTO artifacts
+                 (work_item_id, iteration, path, media_type, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(work_item_id, path) DO UPDATE SET
+                   iteration = excluded.iteration,
+                   media_type = excluded.media_type,
+                   created_at = excluded.created_at",
+                params![
+                    self.work_item_id.as_str(),
+                    iteration,
+                    path_text,
+                    artifact_media_type(path),
+                    created_at
+                ],
+            )?;
+        }
+        Ok(files.len())
+    }
+
+    pub fn artifacts(&self) -> Result<Vec<Artifact>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT iteration, path, media_type, created_at
+             FROM artifacts WHERE work_item_id = ?1 ORDER BY id",
+        )?;
+        let artifacts = statement
+            .query_map(params![self.work_item_id.as_str()], |row| {
+                Ok(Artifact {
+                    iteration: row.get::<_, i64>(0)? as u32,
+                    path: row.get(1)?,
+                    media_type: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)?;
+        Ok(artifacts)
     }
 
     pub fn save_candidate(
@@ -1362,10 +1448,61 @@ fn activity_kind_name(kind: ActivityKind) -> &'static str {
         ActivityKind::Convergence => "convergence",
         ActivityKind::ImplementationRound => "implementation_round",
         ActivityKind::Review => "review",
+        ActivityKind::Artifact => "artifact",
         ActivityKind::Transition => "transition",
         ActivityKind::HumanIntervention => "human_intervention",
         ActivityKind::Completed => "completed",
         ActivityKind::Failed => "failed",
+    }
+}
+
+fn artifact_files(root: &Path) -> Result<Vec<std::path::PathBuf>, StoreError> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).map_err(|source| StoreError::ArtifactIo {
+            path: directory.clone(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| StoreError::ArtifactIo {
+                path: directory.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            let file_type = entry.file_type().map_err(|source| StoreError::ArtifactIo {
+                path: path.clone(),
+                source,
+            })?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                pending.push(path);
+            } else if file_type.is_file() {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn artifact_media_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "json" => "application/json",
+        "zip" => "application/zip",
+        "html" => "text/html",
+        "txt" | "log" | "md" => "text/plain",
+        _ => "application/octet-stream",
     }
 }
 
@@ -1844,6 +1981,27 @@ mod tests {
     }
 
     #[test]
+    fn persists_execution_artifacts_without_following_symlinks() {
+        let mut store = Store::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let screenshot = root.path().join("page.png");
+        std::fs::write(&screenshot, b"png").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/etc", root.path().join("outside")).unwrap();
+
+        assert_eq!(store.sync_artifacts(2, root.path()).unwrap(), 1);
+        assert_eq!(
+            store.artifacts().unwrap(),
+            vec![Artifact {
+                iteration: 2,
+                path: screenshot.display().to_string(),
+                media_type: "image/png".to_string(),
+                created_at: store.artifacts().unwrap()[0].created_at.clone(),
+            }]
+        );
+    }
+
+    #[test]
     fn status_snapshot_assembles_scoped_observability_data() {
         let mut db = Database::open_in_memory().unwrap();
         let repository = register(&mut db, "/repo");
@@ -1875,7 +2033,7 @@ mod tests {
             .unwrap();
 
         let snapshot = store.status_snapshot().unwrap();
-        assert_eq!(snapshot.version, 2);
+        assert_eq!(snapshot.version, 3);
         assert_eq!(snapshot.identity.id, work_item.as_str());
         assert_eq!(snapshot.identity.slug, "observable");
         assert_eq!(snapshot.identity.repository_root, "/repo");

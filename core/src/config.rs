@@ -66,6 +66,21 @@ pub struct Sandbox {
     pub experimental: bool,
     /// Destructive tools denied even inside the sandbox (defense in depth).
     pub deny_tools: Vec<String>,
+    /// Allow outbound internet access from Implementer tools.
+    pub allow_outbound: bool,
+    /// Browser automation available to the Implementer.
+    pub browser: Browser,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Browser {
+    /// Enable the pinned Playwright MCP sidecar.
+    pub enabled: bool,
+    /// Open a visible isolated browser when the host has a graphical display.
+    pub headed: bool,
+    /// Exact npm package spec used to start Playwright MCP.
+    pub package: String,
 }
 
 /// Errors surfaced while loading or validating configuration.
@@ -101,6 +116,18 @@ impl Default for Sandbox {
             enabled: true,
             experimental: true,
             deny_tools: vec!["shell(rm)".to_string()],
+            allow_outbound: true,
+            browser: Browser::default(),
+        }
+    }
+}
+
+impl Default for Browser {
+    fn default() -> Self {
+        Browser {
+            enabled: true,
+            headed: true,
+            package: "@playwright/mcp@0.0.79".to_string(),
         }
     }
 }
@@ -121,7 +148,7 @@ impl Default for Limits {
             convergence_diff_threshold: 0.1,
             adversarial_max_iters: 5,
             step_retries: 3,
-            step_timeout_secs: 600,
+            step_timeout_secs: 1800,
         }
     }
 }
@@ -204,6 +231,17 @@ impl Config {
                 "limits.convergence_max_iters must be at least 1".to_string(),
             ));
         }
+        if self.limits.step_timeout_secs < 1 {
+            return Err(ConfigError::Invalid(
+                "limits.step_timeout_secs must be at least 1".to_string(),
+            ));
+        }
+        if self.sandbox.browser.enabled && self.sandbox.browser.package.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "sandbox.browser.package must be set when browser automation is enabled"
+                    .to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -220,13 +258,17 @@ mod tests {
         assert_eq!(c.limits.convergence_max_iters, 5);
         assert_eq!(c.limits.adversarial_max_iters, 5);
         assert_eq!(c.limits.step_retries, 3);
-        assert_eq!(c.limits.step_timeout_secs, 600);
+        assert_eq!(c.limits.step_timeout_secs, 1800);
         assert!(c.planners.contains_key("planner-a"));
         assert!(c.planners.contains_key("planner-b"));
         assert!(c.planners.contains_key("planner-c"));
         assert!(c.sandbox.enabled);
         assert!(c.sandbox.experimental);
         assert_eq!(c.sandbox.deny_tools, vec!["shell(rm)".to_string()]);
+        assert!(c.sandbox.allow_outbound);
+        assert!(c.sandbox.browser.enabled);
+        assert!(c.sandbox.browser.headed);
+        assert_eq!(c.sandbox.browser.package, "@playwright/mcp@0.0.79");
         assert_eq!(c.database_path(), c.data_dir.join("quorum.db"));
         assert_eq!(c.state_dir(), c.data_dir.join("state"));
     }
@@ -271,5 +313,16 @@ mod tests {
         let path = dir.path().join("config.yaml");
         std::fs::write(&path, "limits:\n  adversarial_max_iters: 0\n").unwrap();
         assert!(Config::load(&path).is_err());
+    }
+
+    #[test]
+    fn invalid_execution_limits_are_rejected() {
+        let mut config = Config::default();
+        config.limits.step_timeout_secs = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.sandbox.browser.package.clear();
+        assert!(config.validate().is_err());
     }
 }

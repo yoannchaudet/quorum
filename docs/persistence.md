@@ -12,6 +12,8 @@ Coordinator is scoped to a stable internal work-item ID.
   state/<work-item-id>/
     assets/                     # binary image files referenced by the work item
     implementation/             # linked Git worktree
+    runtime/
+      artifacts/                # retained screenshots and browser diagnostics
 ```
 
 The internal ID is a UUID, independent of the user-facing work-item slug. Repository ownership
@@ -29,6 +31,7 @@ is associated in the database; it does not determine the filesystem path.
 | `plans` | Converged Plan and metrics per work item. |
 | `implementations` | Implementer summary by work item and adversarial iteration. |
 | `implementation_rounds` | Start/result commits, tree SHA, and recovery status per Implementer round. |
+| `artifacts` | Retained screenshot and execution artifact metadata per implementation round. |
 | `intake` | Current Planner questions per work item. |
 | `reviews` | Reviewer feedback and verdict by work item and iteration. |
 | `sessions` | Human-intervention session records by work item and blocked state. |
@@ -68,6 +71,8 @@ preventing Planners, iterations, sessions, or reviews from colliding across work
   completions/failures afterward, so another process can read the latest known activity.
 - **Confined agent writes**: Local Sandbox restricts file writes to the linked worktree
   (see [isolation](isolation.md)).
+- **Step-scoped runtime**: temporary server/browser state lives outside the Git
+  worktree. Retained files are indexed in `artifacts`; runtime state is never committed.
 
 ## Resume after crash
 

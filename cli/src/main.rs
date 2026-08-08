@@ -168,7 +168,13 @@ fn run() -> Result<()> {
             let runner: Box<dyn AgentRunner> = if dry_run {
                 Box::new(EchoRunner)
             } else {
-                Box::new(CopilotRunner::new(config.sandbox.clone()))
+                Box::new(CopilotRunner::new(
+                    config.sandbox.clone(),
+                    std::time::Duration::from_secs(config.limits.step_timeout_secs),
+                    config
+                        .work_item_dir(store.work_item_id().as_str())
+                        .join("runtime"),
+                ))
             };
             let common_git_dir =
                 git_common_dir(&worktree.path).context("resolving worktree Git directory")?;
@@ -271,11 +277,16 @@ fn resolve_and_continue(
 ) -> Result<()> {
     validate_work_item_slug(work_item_slug)?;
     let require_worktree = !matches!(decision, Decision::Abandon);
-    let (store, _, workspace) = open_work_item(&config, context, work_item_slug, require_worktree)?;
+    let (store, internal_id, workspace) =
+        open_work_item(&config, context, work_item_slug, require_worktree)?;
     let runner: Box<dyn AgentRunner> = if dry_run {
         Box::new(EchoRunner)
     } else {
-        Box::new(CopilotRunner::new(config.sandbox.clone()))
+        Box::new(CopilotRunner::new(
+            config.sandbox.clone(),
+            std::time::Duration::from_secs(config.limits.step_timeout_secs),
+            config.work_item_dir(internal_id.as_str()).join("runtime"),
+        ))
     };
     let additional_dirs = if require_worktree {
         vec![git_common_dir(&workspace).context("resolving worktree Git directory")?]
@@ -548,6 +559,19 @@ fn report_status(snapshot: &StatusSnapshot, verbose: bool) {
             review.iteration + 1,
             if review.accepted { "ACCEPT" } else { "REJECT" },
             display_text(&review.findings, verbose)
+        );
+    }
+
+    println!("\nartifacts:");
+    if snapshot.artifacts.is_empty() {
+        println!("  no artifacts");
+    }
+    for artifact in &snapshot.artifacts {
+        println!(
+            "  round {}: {} ({})",
+            artifact.iteration + 1,
+            artifact.path,
+            artifact.media_type
         );
     }
 
