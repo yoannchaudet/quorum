@@ -75,4 +75,5 @@ disabled the Coordinator transitions straight through.
   Session resume command (see [sessions](sessions.md)); the UX offers a one-click terminal.
 
 Each state and every transition is persisted so the Coordinator can resume after a crash
-(see [persistence](persistence.md)).
+(see [persistence](persistence.md)). Blocked-state output prints exact `intake`, `plan`,
+or `implementation` review commands rather than a state-polymorphic action.

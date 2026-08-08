@@ -5,7 +5,8 @@ on parsing terminal prose to understand a work item.
 
 ## Live progress
 
-`run`, `approve`, `reject`, and `answer` print concise timestamped activity to stderr:
+`work-item start|resume`, `intake answer`, and Plan/implementation review decisions
+print concise timestamped activity to stderr:
 
 - phase and state transitions;
 - agent role/model, attempt, retry, completion, failure, and duration;
@@ -20,7 +21,7 @@ events are still persisted.
 
 ## Rich status
 
-`quorum status <work-item>` is read-only and reports:
+`quorum work-item show <work-item>` is read-only and reports:
 
 - work-item/repository identity and current state;
 - latest activity and human-intervention instructions;
@@ -37,6 +38,9 @@ and future UI clients.
 The current document version is `5`; version 5 adds the latest human Plan rejection
 feedback under `planning.feedback`. Version 4 added the human-approved execution
 capability grant.
+
+`quorum plan show --json` and `quorum implementation show --json` expose smaller,
+independently versioned focused documents.
 
 An unmatched old `agent_started` record is reported only as the latest known activity;
 it is not proof that the process is still running.
