@@ -5,6 +5,7 @@
 
 pub mod agent;
 pub mod config;
+pub mod convergence;
 pub mod coordinator;
 pub mod persistence;
 pub mod prompt;

@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use crate::agent::{AgentError, AgentRequest, AgentRunner, Filesystem};
 use crate::config::Config;
+use crate::convergence;
 use crate::persistence::{Store, StoreError, Transition};
 use crate::prompt::{Prompt, PromptError};
 use crate::state::State;
@@ -163,18 +164,26 @@ impl Coordinator {
     }
 
     /// Run the planner roster for the current planning iteration, in isolation,
-    /// and persist each candidate plan.
+    /// and persist each candidate plan. Each pass uses a fresh iteration so the
+    /// convergence loop can compare successive rounds.
     fn run_planners(&mut self) -> Result<(), CoordinatorError> {
         let work_item = self
             .store
             .work_item()?
             .ok_or(CoordinatorError::NoWorkItem)?;
+        let previous_plan = self.store.plan()?.unwrap_or_default();
         let prompt = Prompt::planner();
-        // Convergence loop is not yet implemented, so there is a single pass.
-        let iteration = 0;
+        let iteration = match self.store.max_candidate_iteration()? {
+            Some(prev) => prev + 1,
+            None => 0,
+        };
         let slots: Vec<String> = self.config.planners.keys().cloned().collect();
         for slot in slots {
-            let rendered = prompt.render(&[("work_item", &work_item), ("answers", "")])?;
+            let rendered = prompt.render(&[
+                ("work_item", &work_item),
+                ("answers", ""),
+                ("previous_plan", &previous_plan),
+            ])?;
             let req = AgentRequest {
                 role: format!("PL:{slot}"),
                 prompt: rendered,
@@ -185,6 +194,57 @@ impl Coordinator {
             self.store.save_candidate(&slot, iteration, &output)?;
         }
         Ok(())
+    }
+
+    /// Merge the latest candidates into a Plan and decide convergence.
+    ///
+    /// Runs the merge (CO) prompt over the current iteration's candidates and the
+    /// previous merged plan, persists the merged plan, and returns whether the
+    /// loop has converged — either because the model reported `CONVERGED`, the
+    /// merged plan is materially unchanged (diff within the configured
+    /// threshold), or the max-iterations bound has been reached.
+    fn run_merge(&mut self) -> Result<bool, CoordinatorError> {
+        let work_item = self
+            .store
+            .work_item()?
+            .ok_or(CoordinatorError::NoWorkItem)?;
+        let iteration = self.store.max_candidate_iteration()?.unwrap_or(0);
+        let candidates = self.store.candidates(iteration)?;
+        let joined = candidates
+            .iter()
+            .map(|(slot, text)| format!("### {slot}\n{text}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let previous_plan = self.store.plan()?.unwrap_or_default();
+
+        let rendered = Prompt::merge().render(&[
+            ("work_item", &work_item),
+            ("candidates", &joined),
+            ("previous_plan", &previous_plan),
+        ])?;
+        let req = AgentRequest {
+            role: "CO:merge".to_string(),
+            prompt: rendered,
+            cwd: self.workspace.clone(),
+            filesystem: Filesystem::ReadOnly,
+        };
+        let output = self.runner.run(&req)?;
+        let merged = convergence::parse_merge(&output);
+
+        // Fallback signal: a plan materially unchanged from the previous one is
+        // treated as converged even if the model said otherwise.
+        let unchanged = !previous_plan.is_empty()
+            && convergence::diff_ratio(&merged.plan, &previous_plan)
+                <= self.config.limits.convergence_diff_threshold;
+        let at_max = iteration + 1 >= self.config.limits.convergence_max_iters;
+        let converged = merged.converged || unchanged || at_max;
+
+        let metrics = format!(
+            "iteration={iteration};model_converged={};unchanged={unchanged};at_max={at_max}",
+            merged.converged
+        );
+        self.store.set_plan(&merged.plan, &metrics)?;
+        Ok(converged)
     }
 
     /// Advance the WI by one autonomous step, performing any agent work the
@@ -210,10 +270,16 @@ impl Coordinator {
                 Converging
             }
             Converging => {
-                if self.config.reviews.plan_review {
-                    PlanReview
+                if self.run_merge()? {
+                    // Converged: proceed to the plan gate (or straight to build).
+                    if self.config.reviews.plan_review {
+                        PlanReview
+                    } else {
+                        Implementing
+                    }
                 } else {
-                    Implementing
+                    // Not converged: loop back for another planning round.
+                    Planning
                 }
             }
             Implementing => Reviewing,
@@ -248,12 +314,53 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::EchoRunner;
+    use crate::agent::{AgentError, AgentRequest, EchoRunner};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     fn coordinator_with_wi(config: Config) -> Coordinator {
         let mut store = Store::open_in_memory().unwrap();
         store.set_work_item("# WI\ndo the thing").unwrap();
         Coordinator::new(config, store, Box::new(EchoRunner), PathBuf::from(".")).unwrap()
+    }
+
+    /// A runner whose merge output reports `ITERATE` for the first `iterate_times`
+    /// merge calls, then `CONVERGED`. Planner outputs vary per call so the plan is
+    /// never "unchanged". Used to exercise the convergence loop.
+    struct IteratingRunner {
+        iterate_times: usize,
+        merges: Arc<AtomicUsize>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl IteratingRunner {
+        fn new(iterate_times: usize) -> IteratingRunner {
+            IteratingRunner {
+                iterate_times,
+                merges: Arc::new(AtomicUsize::new(0)),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl AgentRunner for IteratingRunner {
+        fn run(&self, req: &AgentRequest) -> Result<String, AgentError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if req.role.starts_with("CO:merge") {
+                let m = self.merges.fetch_add(1, Ordering::SeqCst);
+                let verdict = if m < self.iterate_times {
+                    "ITERATE — differs"
+                } else {
+                    "CONVERGED"
+                };
+                Ok(format!(
+                    "## Plan\nplan revision {m}\n\n## Convergence\n{verdict}"
+                ))
+            } else {
+                // Distinct planner output each call so plans are never unchanged.
+                Ok(format!("## Summary\ncandidate {n} from {}", req.role))
+            }
+        }
     }
 
     #[test]
@@ -295,9 +402,65 @@ mod tests {
         let candidates = co.store.candidates(0).unwrap();
         // Default roster has three planner slots.
         assert_eq!(candidates.len(), 3);
-        assert!(candidates
+        assert!(candidates.iter().all(|(_, text)| text.contains("stub")));
+    }
+
+    #[test]
+    fn single_pass_convergence_persists_a_plan() {
+        // EchoRunner reports CONVERGED, so one pass suffices.
+        let mut co = coordinator_with_wi(Config::default());
+        assert_eq!(co.run_until_blocked().unwrap(), State::PlanReview);
+        let plan = co.store.plan().unwrap();
+        assert!(plan.is_some(), "a converged plan must be persisted");
+        // Only one planning iteration.
+        assert_eq!(co.store.max_candidate_iteration().unwrap(), Some(0));
+    }
+
+    #[test]
+    fn iterates_then_converges() {
+        let runner = IteratingRunner::new(2); // ITERATE twice, then CONVERGE
+        let merges = runner.merges.clone();
+        let mut store = Store::open_in_memory().unwrap();
+        store.set_work_item("# WI").unwrap();
+        let mut co = Coordinator::new(
+            Config::default(),
+            store,
+            Box::new(runner),
+            PathBuf::from("."),
+        )
+        .unwrap();
+
+        assert_eq!(co.run_until_blocked().unwrap(), State::PlanReview);
+        // 3 merge calls: ITERATE, ITERATE, CONVERGED.
+        assert_eq!(merges.load(Ordering::SeqCst), 3);
+        // 3 planning iterations: 0, 1, 2.
+        assert_eq!(co.store.max_candidate_iteration().unwrap(), Some(2));
+
+        // History shows the Planning<->Converging loop.
+        let converging = co
+            .history()
+            .unwrap()
             .iter()
-            .all(|(_, text)| text.contains("Dry-run stub")));
+            .filter(|t| t.to == State::Converging)
+            .count();
+        assert_eq!(converging, 3);
+    }
+
+    #[test]
+    fn convergence_stops_at_max_iters() {
+        let mut config = Config::default();
+        config.limits.convergence_max_iters = 2;
+        // Never reports CONVERGED, so only the max-iters bound stops the loop.
+        let runner = IteratingRunner::new(usize::MAX);
+        let merges = runner.merges.clone();
+        let mut store = Store::open_in_memory().unwrap();
+        store.set_work_item("# WI").unwrap();
+        let mut co = Coordinator::new(config, store, Box::new(runner), PathBuf::from(".")).unwrap();
+
+        assert_eq!(co.run_until_blocked().unwrap(), State::PlanReview);
+        // Bounded to 2 planning iterations (0, 1).
+        assert_eq!(merges.load(Ordering::SeqCst), 2);
+        assert_eq!(co.store.max_candidate_iteration().unwrap(), Some(1));
     }
 
     #[test]

@@ -305,6 +305,37 @@ impl Store {
         }
         Ok(out)
     }
+
+    /// The highest candidate iteration recorded so far, if any.
+    pub fn max_candidate_iteration(&self) -> Result<Option<u32>, StoreError> {
+        let v: Option<i64> =
+            self.conn
+                .query_row("SELECT MAX(iteration) FROM candidates", [], |r| r.get(0))?;
+        Ok(v.map(|n| n as u32))
+    }
+
+    /// Store the converged Plan (single row) with optional metrics. Idempotent.
+    pub fn set_plan(&mut self, text: &str, metrics: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO plan (id, text, metrics) VALUES (1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET text = excluded.text, metrics = excluded.metrics",
+            params![text, metrics],
+        )?;
+        Ok(())
+    }
+
+    /// The stored Plan text, if any.
+    pub fn plan(&self) -> Result<Option<String>, StoreError> {
+        match self
+            .conn
+            .query_row("SELECT text FROM plan WHERE id = 1", [], |r| {
+                r.get::<_, String>(0)
+            }) {
+            Ok(t) => Ok(Some(t)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 fn now_millis() -> String {
     SystemTime::now()

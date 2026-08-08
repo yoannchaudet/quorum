@@ -122,8 +122,10 @@ pub struct EchoRunner;
 
 impl AgentRunner for EchoRunner {
     fn run(&self, req: &AgentRequest) -> Result<String, AgentError> {
+        // Includes a `## Plan` and a `CONVERGED` convergence section so the merge
+        // step converges in a single pass under `--dry-run`.
         Ok(format!(
-            "## Summary\nDry-run stub for {}; no model was called.\n\n## Steps\n1. TODO\n\n## Risks & assumptions\n- Dry run.",
+            "## Plan\nDry-run stub for {}; no model was called.\n\n## Steps\n1. TODO\n\n## Risks & assumptions\n- Dry run.\n\n## Convergence\nCONVERGED",
             req.role
         ))
     }
