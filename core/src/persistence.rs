@@ -387,6 +387,21 @@ impl Store {
             .query_row("SELECT COUNT(*) FROM reviews", [], |r| r.get(0))?;
         Ok(n as u32)
     }
+
+    /// Save the Reviewer's verdict and findings for a given iteration. Idempotent.
+    pub fn save_review(
+        &mut self,
+        iteration: u32,
+        text: &str,
+        accepted: bool,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO reviews (iteration, text, accepted) VALUES (?1, ?2, ?3)
+             ON CONFLICT(iteration) DO UPDATE SET text = excluded.text, accepted = excluded.accepted",
+            params![iteration, text, accepted as i64],
+        )?;
+        Ok(())
+    }
 }
 fn now_millis() -> String {
     SystemTime::now()

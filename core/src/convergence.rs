@@ -1,9 +1,10 @@
-//! Parsing the Coordinator merge output (see `prompts/merge.md`).
+//! Parsing Coordinator/Reviewer agent outputs.
 //!
-//! The merge prompt returns a `## Plan` section and a `## Convergence` line that
-//! is either `CONVERGED` or `ITERATE ...`. These helpers extract the plan text
-//! and the convergence verdict, plus a line-based diff ratio used to apply the
-//! configured convergence threshold as a fallback signal.
+//! The merge prompt (`prompts/merge.md`) returns a `## Plan` section and a
+//! `## Convergence` line (`CONVERGED` / `ITERATE ...`). The reviewer prompt
+//! (`prompts/reviewer.md`) returns a `## Verdict` line (`ACCEPT` / `REJECT`) and
+//! a `## Findings` section. These helpers extract those, plus a line-based diff
+//! ratio used to apply the configured convergence threshold.
 
 /// The parsed result of a merge invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +28,34 @@ pub fn parse_merge(output: &str) -> Merge {
         None => false,
     };
     Merge { plan, converged }
+}
+
+/// The parsed result of a reviewer invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Review {
+    /// Whether the reviewer returned an `ACCEPT` verdict.
+    pub accepted: bool,
+    /// The findings section (actionable issues on reject; notes on accept).
+    pub findings: String,
+}
+
+/// Parse a reviewer agent's output into a verdict and findings. Defaults to
+/// **not accepted** when no clear `ACCEPT` verdict is present (fail-safe: an
+/// unparseable review keeps the adversarial loop going rather than passing bad
+/// work).
+pub fn parse_review(output: &str) -> Review {
+    let accepted = extract_section(output, "## Verdict")
+        .and_then(|section| {
+            section
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .map(|first| first.to_ascii_uppercase().starts_with("ACCEPT"))
+        })
+        .unwrap_or(false);
+    let findings =
+        extract_section(output, "## Findings").unwrap_or_else(|| output.trim().to_string());
+    Review { accepted, findings }
 }
 
 /// Extract the body of a `## Heading` section: the lines after the heading up to
@@ -100,6 +129,26 @@ mod tests {
         let m = parse_merge(ITERATE_OUTPUT);
         assert!(!m.converged);
         assert!(m.plan.contains("do Y"));
+    }
+
+    #[test]
+    fn parses_accept_verdict() {
+        let r = parse_review("## Verdict\nACCEPT\n\n## Findings\nNONE");
+        assert!(r.accepted);
+        assert_eq!(r.findings, "NONE");
+    }
+
+    #[test]
+    fn parses_reject_verdict_with_findings() {
+        let r = parse_review("## Verdict\nREJECT\n\n## Findings\n1. missing step\n2. bug");
+        assert!(!r.accepted);
+        assert!(r.findings.contains("missing step"));
+    }
+
+    #[test]
+    fn missing_verdict_is_not_accepted() {
+        let r = parse_review("no structure here");
+        assert!(!r.accepted);
     }
 
     #[test]

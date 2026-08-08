@@ -28,6 +28,8 @@ pub enum CoordinatorError {
     NoWorkItem,
     #[error("no plan is available to implement")]
     NoPlan,
+    #[error("no implementation is available to review")]
+    NoImplementation,
     #[error("failed to create workspace {path}: {source}")]
     Workspace {
         path: String,
@@ -48,6 +50,17 @@ pub enum Decision {
     Answer(String),
     /// Cancel the work item entirely (any blocked state).
     Abandon,
+}
+
+/// The outcome of one adversarial review round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewOutcome {
+    /// The Reviewer accepted the work.
+    Accepted,
+    /// The Reviewer rejected; loop back to the Implementer.
+    Rejected,
+    /// Too many rejected rounds; give up.
+    Exhausted,
 }
 
 impl std::fmt::Display for Decision {
@@ -301,15 +314,57 @@ impl Coordinator {
         Ok(())
     }
 
+    /// Run the Reviewer (RV) adversarially over the latest implementation and
+    /// record the verdict. Returns the outcome so the caller can drive the loop.
+    ///
+    /// The RV runs read-only and is a different model from the IM (see
+    /// `docs/agents.md`). Its review is keyed to the implementation's iteration.
+    fn run_reviewer(&mut self) -> Result<ReviewOutcome, CoordinatorError> {
+        let work_item = self
+            .store
+            .work_item()?
+            .ok_or(CoordinatorError::NoWorkItem)?;
+        let plan = self.store.plan()?.ok_or(CoordinatorError::NoPlan)?;
+        let (iteration, implementation) = self
+            .store
+            .latest_implementation()?
+            .ok_or(CoordinatorError::NoImplementation)?;
+
+        let rendered = Prompt::reviewer().render(&[
+            ("work_item", &work_item),
+            ("plan", &plan),
+            ("implementation", &implementation),
+        ])?;
+        let req = AgentRequest {
+            role: "RV".to_string(),
+            prompt: rendered,
+            cwd: self.workspace.clone(),
+            filesystem: Filesystem::ReadOnly,
+        };
+        let output = self.runner.run(&req)?;
+        let review = convergence::parse_review(&output);
+        self.store
+            .save_review(iteration, &review.findings, review.accepted)?;
+
+        if review.accepted {
+            Ok(ReviewOutcome::Accepted)
+        } else if iteration + 1 >= self.config.limits.adversarial_max_iters {
+            // Too many rejected rounds: give up.
+            Ok(ReviewOutcome::Exhausted)
+        } else {
+            Ok(ReviewOutcome::Rejected)
+        }
+    }
+
     /// Advance the WI by one autonomous step, performing any agent work the
     /// current state requires before transitioning.
     ///
     /// Returns the (possibly unchanged) state. The state is unchanged when the
     /// WI is blocked on HI or terminal — the caller must resolve HI to proceed.
     ///
-    /// Agent-driven branches (PLs raising questions, RV rejecting) are not yet
-    /// wired, so autonomous states move forward on the happy path. Review gates
-    /// from config decide whether the optional human-review states are entered.
+    /// Review gates from config decide whether the optional human-review states
+    /// are entered. The `IntakeReview` (planner questions) branch is not yet
+    /// wired; that is a separate change.
     pub fn step(&mut self) -> Result<State, CoordinatorError> {
         use State::*;
         let next = match self.state {
@@ -340,13 +395,17 @@ impl Coordinator {
                 self.run_implementer()?;
                 Reviewing
             }
-            Reviewing => {
-                if self.config.reviews.work_review {
-                    WorkReview
-                } else {
-                    Done
+            Reviewing => match self.run_reviewer()? {
+                ReviewOutcome::Accepted => {
+                    if self.config.reviews.work_review {
+                        WorkReview
+                    } else {
+                        Done
+                    }
                 }
-            }
+                ReviewOutcome::Rejected => Implementing,
+                ReviewOutcome::Exhausted => Failed,
+            },
             // Blocked (HI) or terminal: no autonomous progress.
             IntakeReview | PlanReview | WorkReview | Done | Failed | Abandoned => {
                 return Ok(self.state)
@@ -521,6 +580,105 @@ mod tests {
         // Bounded to 2 planning iterations (0, 1).
         assert_eq!(merges.load(Ordering::SeqCst), 2);
         assert_eq!(co.store.max_candidate_iteration().unwrap(), Some(1));
+    }
+
+    /// A runner that converges immediately at merge, and for the reviewer rejects
+    /// the first `reject_times` rounds then accepts. Planner/IM outputs are
+    /// generic. Used to drive the adversarial loop.
+    struct ReviewRunner {
+        reject_times: usize,
+        reviews: Arc<AtomicUsize>,
+    }
+
+    impl ReviewRunner {
+        fn new(reject_times: usize) -> ReviewRunner {
+            ReviewRunner {
+                reject_times,
+                reviews: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl AgentRunner for ReviewRunner {
+        fn run(&self, req: &AgentRequest) -> Result<String, AgentError> {
+            if req.role.starts_with("CO:merge") {
+                Ok("## Plan\nthe plan\n\n## Convergence\nCONVERGED".to_string())
+            } else if req.role == "RV" {
+                let n = self.reviews.fetch_add(1, Ordering::SeqCst);
+                let verdict = if n < self.reject_times {
+                    "REJECT"
+                } else {
+                    "ACCEPT"
+                };
+                Ok(format!("## Verdict\n{verdict}\n\n## Findings\nfinding {n}"))
+            } else {
+                Ok("## Summary\ncandidate".to_string())
+            }
+        }
+    }
+
+    fn coordinator_with_runner(config: Config, runner: Box<dyn AgentRunner>) -> Coordinator {
+        let workspace = tempfile::tempdir().unwrap();
+        // Leak the tempdir so the workspace path stays valid for the test.
+        let path = workspace.keep();
+        let mut store = Store::open_in_memory().unwrap();
+        store.set_work_item("# WI").unwrap();
+        Coordinator::new(config, store, runner, path).unwrap()
+    }
+
+    #[test]
+    fn reviewer_accept_records_review_and_gates_to_work_review() {
+        // Default gates on: accept -> WorkReview.
+        let mut co = coordinator_with_runner(Config::default(), Box::new(ReviewRunner::new(0)));
+        assert_eq!(co.run_until_blocked().unwrap(), State::PlanReview);
+        assert_eq!(co.resolve(Decision::Approve).unwrap(), State::Implementing);
+        assert_eq!(co.run_until_blocked().unwrap(), State::WorkReview);
+        let review = co.store.latest_review().unwrap().unwrap();
+        assert!(review.1, "review should be accepted");
+    }
+
+    #[test]
+    fn reviewer_reject_then_accept_loops_then_completes() {
+        let mut config = Config::default();
+        config.reviews.plan_review = false;
+        config.reviews.work_review = false;
+        let runner = ReviewRunner::new(1); // reject once, then accept
+        let reviews = runner.reviews.clone();
+        let mut co = coordinator_with_runner(config, Box::new(runner));
+
+        assert_eq!(co.run_until_blocked().unwrap(), State::Done);
+        // Two review rounds (reject@0, accept@1) and two implementations.
+        assert_eq!(reviews.load(Ordering::SeqCst), 2);
+        assert_eq!(co.store.review_count().unwrap(), 2);
+        assert_eq!(
+            co.store.latest_implementation().unwrap().map(|(i, _)| i),
+            Some(1)
+        );
+        // The adversarial loop shows Implementing entered twice.
+        let implementing = co
+            .history()
+            .unwrap()
+            .iter()
+            .filter(|t| t.to == State::Implementing)
+            .count();
+        assert_eq!(implementing, 2);
+    }
+
+    #[test]
+    fn reviewer_exhausts_to_failed() {
+        let mut config = Config::default();
+        config.reviews.plan_review = false;
+        config.reviews.work_review = false;
+        config.limits.adversarial_max_iters = 2;
+        // Always rejects.
+        let runner = ReviewRunner::new(usize::MAX);
+        let reviews = runner.reviews.clone();
+        let mut co = coordinator_with_runner(config, Box::new(runner));
+
+        assert_eq!(co.run_until_blocked().unwrap(), State::Failed);
+        // Bounded to 2 review rounds (0, 1), both rejected.
+        assert_eq!(reviews.load(Ordering::SeqCst), 2);
+        assert!(co.state().is_terminal());
     }
 
     #[test]
