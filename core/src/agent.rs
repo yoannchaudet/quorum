@@ -56,9 +56,14 @@ pub trait AgentRunner: Send + Sync {
 /// Real runner: invokes the `copilot` CLI, sandboxed and non-interactive.
 ///
 /// Command shape (see `docs/isolation.md`):
-/// `copilot --sandbox --experimental --no-ask-user -p <prompt> --deny-tool <...>`.
-/// Per-role filesystem posture is carried on the request; the local sandbox
-/// enforces it via its settings. Finer per-role enforcement is a follow-up.
+/// `copilot --sandbox --experimental --no-ask-user <tool grants> -p <prompt> --deny-tool <...>`.
+///
+/// Because the run is non-interactive (`--no-ask-user`), copilot cannot prompt
+/// for tool approval and would otherwise deny every action. We therefore grant
+/// tools up front, scoped by the request's filesystem posture: read/write agents
+/// (IM) get `--allow-all-tools` (the sandbox is the boundary, and the deny-list
+/// still blocks destructive ops); read-only agents (PL, RV) get only
+/// `--allow-tool read` so they can inspect but not modify.
 pub struct CopilotRunner {
     sandbox: Sandbox,
     program: String,
@@ -83,6 +88,22 @@ impl CopilotRunner {
             }
         }
         args.push("--no-ask-user".to_string());
+        // Grant tools non-interactively, scoped to the role's posture. With the
+        // sandbox as the OS boundary, read/write agents may use broad tools
+        // (`--allow-all-tools`); without it, we never grant blanket tools —
+        // read/write agents are limited to file tools so a disabled sandbox
+        // cannot become arbitrary ambient execution.
+        match (req.filesystem, self.sandbox.enabled) {
+            (Filesystem::ReadWrite, true) => args.push("--allow-all-tools".to_string()),
+            (Filesystem::ReadWrite, false) => {
+                args.push("--allow-tool".to_string());
+                args.push("read,write".to_string());
+            }
+            (Filesystem::ReadOnly, _) => {
+                args.push("--allow-tool".to_string());
+                args.push("read".to_string());
+            }
+        }
         for tool in &self.sandbox.deny_tools {
             args.push("--deny-tool".to_string());
             args.push(tool.clone());
@@ -184,6 +205,27 @@ mod tests {
     }
 
     #[test]
+    fn read_only_role_gets_read_grant_only() {
+        let runner = CopilotRunner::new(Sandbox::default());
+        let args = runner.args(&req()); // req() is ReadOnly
+        assert!(!args.contains(&"--allow-all-tools".to_string()));
+        let a = args.iter().position(|a| a == "--allow-tool").unwrap();
+        assert_eq!(args[a + 1], "read");
+    }
+
+    #[test]
+    fn read_write_role_gets_allow_all_tools() {
+        let runner = CopilotRunner::new(Sandbox::default());
+        let mut r = req();
+        r.filesystem = Filesystem::ReadWrite;
+        let args = runner.args(&r);
+        assert!(args.contains(&"--allow-all-tools".to_string()));
+        assert!(!args.contains(&"--allow-tool".to_string()));
+        // The deny-list still applies even with allow-all.
+        assert!(args.contains(&"shell(rm)".to_string()));
+    }
+
+    #[test]
     fn disabled_sandbox_omits_sandbox_flags() {
         let sandbox = Sandbox {
             enabled: false,
@@ -195,6 +237,23 @@ mod tests {
         assert!(!args.contains(&"--sandbox".to_string()));
         assert!(!args.contains(&"--experimental".to_string()));
         assert!(args.contains(&"--no-ask-user".to_string()));
+    }
+
+    #[test]
+    fn read_write_without_sandbox_scopes_to_file_tools() {
+        // Without the OS boundary we must NOT grant blanket tools.
+        let sandbox = Sandbox {
+            enabled: false,
+            experimental: false,
+            deny_tools: vec![],
+        };
+        let runner = CopilotRunner::new(sandbox);
+        let mut r = req();
+        r.filesystem = Filesystem::ReadWrite;
+        let args = runner.args(&r);
+        assert!(!args.contains(&"--allow-all-tools".to_string()));
+        let a = args.iter().position(|a| a == "--allow-tool").unwrap();
+        assert_eq!(args[a + 1], "read,write");
     }
 
     #[test]
