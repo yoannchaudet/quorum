@@ -57,6 +57,12 @@ impl ExecutionCapabilities {
                 "browser access requires artifacts: true".to_string(),
             ));
         }
+        if self.browser != BrowserCapability::None && !self.internet {
+            return Err(CapabilityError::Invalid(
+                "browser access requires internet: true because the browser sidecar runs outside the network sandbox"
+                    .to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -153,9 +159,14 @@ timeout_minutes: 30
 
     #[test]
     fn validates_capability_dependencies() {
-        let invalid = PLAN.replace("shell: true", "shell: false");
+        let invalid_server = PLAN.replace("shell: true", "shell: false");
         assert!(matches!(
-            ExecutionCapabilities::parse_plan(&invalid),
+            ExecutionCapabilities::parse_plan(&invalid_server),
+            Err(CapabilityError::Invalid(_))
+        ));
+        let invalid_browser = PLAN.replace("internet: true", "internet: false");
+        assert!(matches!(
+            ExecutionCapabilities::parse_plan(&invalid_browser),
             Err(CapabilityError::Invalid(_))
         ));
     }

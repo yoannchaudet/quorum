@@ -74,7 +74,9 @@ Every merged Plan contains an exhaustive `Execution capabilities` YAML section. 
 
 Quorum parses and validates the section before accepting the Plan. The runtime sandbox
 is generated from that persisted grant. Capabilities omitted from the Plan are not
-available to the Implementer.
+available to the Implementer. Browser access requires internet and artifact
+authorization because the trusted browser sidecar cannot run inside the network
+sandbox.
 
 ## Human intervention
 

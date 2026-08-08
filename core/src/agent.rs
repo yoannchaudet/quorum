@@ -413,10 +413,10 @@ impl CopilotRunner {
 
     fn browser_enabled(&self, req: &AgentRequest) -> bool {
         self.sandbox.browser.enabled
-            && req
-                .execution
-                .as_ref()
-                .is_some_and(|grant| grant.browser != BrowserCapability::None && grant.artifacts)
+            && self.sandbox.allow_outbound
+            && req.execution.as_ref().is_some_and(|grant| {
+                grant.browser != BrowserCapability::None && grant.artifacts && grant.internet
+            })
     }
 }
 
@@ -427,7 +427,10 @@ impl AgentRunner for CopilotRunner {
                 role: req.role.to_string(),
             });
         }
-        self.prepare_runtime(req)?;
+        if let Err(error) = self.prepare_runtime(req) {
+            self.cleanup_copilot_home();
+            return Err(error);
+        }
         let mut command = Command::new(&self.program);
         command
             .args(self.args(req))
@@ -437,10 +440,16 @@ impl AgentRunner for CopilotRunner {
         command.env("COPILOT_HOME", self.copilot_home());
         #[cfg(unix)]
         command.process_group(0);
-        let mut child = command.spawn().map_err(|source| AgentError::Spawn {
-            role: req.role.to_string(),
-            source,
-        })?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(source) => {
+                self.cleanup_copilot_home();
+                return Err(AgentError::Spawn {
+                    role: req.role.to_string(),
+                    source,
+                });
+            }
+        };
         let stdout_reader = child.stdout.take().map(read_bounded);
         let stderr_reader = child.stderr.take().map(read_bounded);
         let timeout = req
@@ -449,22 +458,33 @@ impl AgentRunner for CopilotRunner {
             .map(|grant| Duration::from_secs(grant.timeout_seconds()))
             .map(|requested| requested.min(self.timeout))
             .unwrap_or(self.timeout);
-        let status = child
-            .wait_timeout(timeout)
-            .map_err(|source| AgentError::Spawn {
-                role: req.role.to_string(),
-                source,
-            })?;
+        let status = match child.wait_timeout(timeout) {
+            Ok(status) => status,
+            Err(source) => {
+                terminate_process_tree(&mut child);
+                self.cleanup_copilot_home();
+                return Err(AgentError::Spawn {
+                    role: req.role.to_string(),
+                    source,
+                });
+            }
+        };
         let timed_out = status.is_none();
         if timed_out {
             terminate_process_tree(&mut child);
         }
         let status = match status {
             Some(status) => status,
-            None => child.wait().map_err(|source| AgentError::Spawn {
-                role: req.role.to_string(),
-                source,
-            })?,
+            None => match child.wait() {
+                Ok(status) => status,
+                Err(source) => {
+                    self.cleanup_copilot_home();
+                    return Err(AgentError::Spawn {
+                        role: req.role.to_string(),
+                        source,
+                    });
+                }
+            },
         };
         terminate_process_tree(&mut child);
         let stdout = join_output(stdout_reader);
@@ -812,6 +832,29 @@ mod tests {
         assert!(args.iter().any(|value| value == "@playwright/mcp@0.0.79"));
         assert!(args.iter().any(|value| value == "--isolated"));
         assert!(runtime.path().join("artifacts").is_dir());
+        runner.cleanup_copilot_home();
+    }
+
+    #[test]
+    fn implementer_browser_respects_outbound_ceiling() {
+        let runtime = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox {
+            allow_outbound: false,
+            ..Sandbox::default()
+        };
+        let runner = CopilotRunner::new(
+            sandbox,
+            Duration::from_secs(10),
+            runtime.path().to_path_buf(),
+        );
+        let mut request = req();
+        request.role = AgentRole::Implementer;
+        request.filesystem = Filesystem::ReadWrite;
+        request.execution = Some(full_execution());
+
+        assert!(!runner.browser_enabled(&request));
+        runner.prepare_runtime(&request).unwrap();
+        assert!(!runtime.path().join("playwright-mcp.json").exists());
         runner.cleanup_copilot_home();
     }
 

@@ -44,6 +44,8 @@ timeout_minutes: 30
 ```
 
 Allowed values are booleans as shown, `local_server: none|loopback`, and
-`browser: none|headless|headed`. Set the least privilege that still permits the Steps.
+`browser: none|headless|headed`. Browser access requires both `internet: true` and
+`artifacts: true` because the trusted browser sidecar runs outside the network sandbox.
+Set the least privilege that still permits the Steps.
 
 Do not include commentary outside these sections.

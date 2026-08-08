@@ -46,6 +46,12 @@ capability section in the human-approved Plan. Quorum configuration supplies
 administrator ceilings; a Plan cannot grant internet, local-network, or browser access
 that configuration has disabled.
 
+The trusted Playwright sidecar must run outside the Local Sandbox because Chromium
+cannot launch reliably inside nested macOS Seatbelt. Therefore any browser grant also
+requires `internet: true`, `artifacts: true`, and the administrator outbound-network
+ceiling. This makes the sidecar's potential network egress explicit in the reviewed
+Plan rather than allowing browser access to bypass an internet denial.
+
 ## Per-role profiles
 
 | Role | Filesystem | cwd | Rationale |

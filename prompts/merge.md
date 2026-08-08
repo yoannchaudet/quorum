@@ -44,8 +44,10 @@ Return a markdown document with:
   ```
 
 Allowed values are booleans as shown, `local_server: none|loopback`, and
-`browser: none|headless|headed`. Preserve the same capability section across
-convergence iterations unless the implementation Steps materially change.
+`browser: none|headless|headed`. Browser access requires both `internet: true` and
+`artifacts: true` because the trusted browser sidecar runs outside the network sandbox.
+Preserve the same capability section across convergence iterations unless the
+implementation Steps materially change.
 - `## Convergence` — one line: `CONVERGED` if this plan is materially unchanged from the
   previous merged plan (or there was none and candidates agree), otherwise `ITERATE`
   followed by a short note on what still differs.
