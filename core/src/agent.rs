@@ -28,6 +28,8 @@ pub struct AgentRequest {
     pub cwd: PathBuf,
     /// Filesystem posture for this role.
     pub filesystem: Filesystem,
+    /// The model id to run, if configured. Empty means use the CLI default.
+    pub model: String,
 }
 
 /// Errors from running an agent.
@@ -85,6 +87,10 @@ impl CopilotRunner {
             args.push("--deny-tool".to_string());
             args.push(tool.clone());
         }
+        if !req.model.is_empty() {
+            args.push("--model".to_string());
+            args.push(req.model.clone());
+        }
         args.push("-p".to_string());
         args.push(req.prompt.clone());
         args
@@ -122,10 +128,11 @@ pub struct EchoRunner;
 
 impl AgentRunner for EchoRunner {
     fn run(&self, req: &AgentRequest) -> Result<String, AgentError> {
-        // Includes a `## Plan` and a `CONVERGED` convergence section so the merge
-        // step converges in a single pass under `--dry-run`.
+        // A universal stub: a `## Plan`, a `CONVERGED` convergence signal, and an
+        // `ACCEPT` verdict, so the whole pipeline advances in a single pass under
+        // `--dry-run`.
         Ok(format!(
-            "## Plan\nDry-run stub for {}; no model was called.\n\n## Steps\n1. TODO\n\n## Risks & assumptions\n- Dry run.\n\n## Convergence\nCONVERGED",
+            "## Plan\nDry-run stub for {}; no model was called.\n\n## Steps\n1. TODO\n\n## Risks & assumptions\n- Dry run.\n\n## Convergence\nCONVERGED\n\n## Verdict\nACCEPT\n\n## Findings\nNONE",
             req.role
         ))
     }
@@ -141,6 +148,7 @@ mod tests {
             prompt: "do the thing".to_string(),
             cwd: PathBuf::from("/tmp"),
             filesystem: Filesystem::ReadOnly,
+            model: String::new(),
         }
     }
 
@@ -153,9 +161,21 @@ mod tests {
         assert!(args.contains(&"--no-ask-user".to_string()));
         assert!(args.contains(&"--deny-tool".to_string()));
         assert!(args.contains(&"shell(rm)".to_string()));
+        // No model configured: --model is omitted.
+        assert!(!args.contains(&"--model".to_string()));
         // The prompt is passed via -p.
         let p = args.iter().position(|a| a == "-p").unwrap();
         assert_eq!(args[p + 1], "do the thing");
+    }
+
+    #[test]
+    fn command_includes_model_when_set() {
+        let runner = CopilotRunner::new(Sandbox::default());
+        let mut r = req();
+        r.model = "some-model".to_string();
+        let args = runner.args(&r);
+        let m = args.iter().position(|a| a == "--model").unwrap();
+        assert_eq!(args[m + 1], "some-model");
     }
 
     #[test]
