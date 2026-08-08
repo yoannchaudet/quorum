@@ -204,6 +204,8 @@ fn report(wi_id: &str, state: State) {
         let session = format!("quorum/{wi_id}/{state}");
         println!("state: {state} (stuck — awaiting human intervention)");
         println!("resume: copilot --resume {session}");
+    } else if state == State::Failed {
+        println!("state: {state} (failed — see quorum.db for details)");
     } else if state.is_terminal() {
         println!("state: {state} (done)");
     } else {

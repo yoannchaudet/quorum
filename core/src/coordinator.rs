@@ -212,7 +212,7 @@ impl Coordinator {
                 filesystem: Filesystem::ReadOnly,
                 model,
             };
-            let output = self.runner.run(&req)?;
+            let output = self.invoke(&req)?;
             self.store.save_candidate(&slot, iteration, &output)?;
         }
         Ok(())
@@ -251,7 +251,7 @@ impl Coordinator {
             filesystem: Filesystem::ReadOnly,
             model: self.config.models.coordinator.clone(),
         };
-        let output = self.runner.run(&req)?;
+        let output = self.invoke(&req)?;
         let merged = convergence::parse_merge(&output);
 
         // Fallback signal: a plan materially unchanged from the previous one is
@@ -308,7 +308,7 @@ impl Coordinator {
             filesystem: Filesystem::ReadWrite,
             model: self.config.models.implementer.clone(),
         };
-        let output = self.runner.run(&req)?;
+        let output = self.invoke(&req)?;
 
         // Derive the adversarial iteration from committed review progress, so a
         // retry before the next review is recorded reuses the same iteration
@@ -346,7 +346,7 @@ impl Coordinator {
             filesystem: Filesystem::ReadOnly,
             model: self.config.models.reviewer.clone(),
         };
-        let output = self.runner.run(&req)?;
+        let output = self.invoke(&req)?;
         let review = convergence::parse_review(&output);
         self.store
             .save_review(iteration, &review.findings, review.accepted)?;
@@ -361,16 +361,51 @@ impl Coordinator {
         }
     }
 
+    /// Invoke an agent, retrying transient failures up to `limits.step_retries`
+    /// times. Returns the last error if every attempt fails. This is the
+    /// transient boundary: agent runs (process spawn/exit) are what may fail
+    /// intermittently and are safe to re-run (see `docs/persistence.md`).
+    fn invoke(&self, req: &AgentRequest) -> Result<String, AgentError> {
+        // One initial attempt plus up to `step_retries` retries.
+        let attempts = self.config.limits.step_retries.saturating_add(1);
+        let mut last: Option<AgentError> = None;
+        for _ in 0..attempts {
+            match self.runner.run(req) {
+                Ok(output) => return Ok(output),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.expect("attempts >= 1"))
+    }
+
     /// Advance the WI by one autonomous step, performing any agent work the
     /// current state requires before transitioning.
     ///
     /// Returns the (possibly unchanged) state. The state is unchanged when the
     /// WI is blocked on HI or terminal — the caller must resolve HI to proceed.
     ///
-    /// Review gates from config decide whether the optional human-review states
-    /// are entered. The `IntakeReview` (planner questions) branch is not yet
-    /// wired; that is a separate change.
+    /// A step whose agent work fails (after retries) or which cannot proceed is
+    /// moved to `Failed` (terminal), with the cause recorded, rather than
+    /// aborting the process — the CO runs unattended (see `docs/persistence.md`).
+    /// Store (database) errors are not recoverable and propagate.
     pub fn step(&mut self) -> Result<State, CoordinatorError> {
+        if self.state.is_blocked() || self.state.is_terminal() {
+            return Ok(self.state);
+        }
+        match self.compute_next() {
+            Ok(next) => {
+                let reason = format!("auto: {} -> {next}", self.state);
+                self.transition_to(next, &reason)
+            }
+            // Database failures are fundamental — do not mask them as Failed.
+            Err(e @ CoordinatorError::Store(_)) => Err(e),
+            Err(cause) => self.fail(&cause.to_string()),
+        }
+    }
+
+    /// Compute the next state for the current autonomous state, performing the
+    /// agent work that state requires.
+    fn compute_next(&mut self) -> Result<State, CoordinatorError> {
         use State::*;
         let next = match self.state {
             Intake => {
@@ -411,13 +446,30 @@ impl Coordinator {
                 ReviewOutcome::Rejected => Implementing,
                 ReviewOutcome::Exhausted => Failed,
             },
-            // Blocked (HI) or terminal: no autonomous progress.
-            IntakeReview | PlanReview | WorkReview | Done | Failed | Abandoned => {
-                return Ok(self.state)
-            }
+            // Not autonomous; the caller returns early for these.
+            IntakeReview | PlanReview | WorkReview | Done | Failed | Abandoned => self.state,
         };
-        let reason = format!("auto: {} -> {next}", self.state);
-        self.transition_to(next, &reason)
+        Ok(next)
+    }
+
+    /// Move the WI to `Failed`, recording the cause. `Failed` is terminal but the
+    /// database is preserved for inspection (see `docs/persistence.md`).
+    fn fail(&mut self, cause: &str) -> Result<State, CoordinatorError> {
+        // fail() is only reached from autonomous states, all of which permit a
+        // transition to Failed; guard against future regressions.
+        debug_assert!(
+            self.state.can_transition_to(State::Failed),
+            "{} has no transition to Failed",
+            self.state
+        );
+        self.store.record_transition_with_events(
+            Some(self.state),
+            State::Failed,
+            &format!("step failed: {cause}"),
+            &[("error", cause)],
+        )?;
+        self.state = State::Failed;
+        Ok(State::Failed)
     }
 
     /// Step repeatedly until the WI is blocked on HI or reaches a terminal state.
@@ -494,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn intake_without_work_item_errors() {
+    fn intake_without_work_item_moves_to_failed() {
         let store = Store::open_in_memory().unwrap();
         let mut co = Coordinator::new(
             Config::default(),
@@ -503,7 +555,10 @@ mod tests {
             PathBuf::from("."),
         )
         .unwrap();
-        assert!(matches!(co.step(), Err(CoordinatorError::NoWorkItem)));
+        // A missing work item is unrecoverable: the WI moves to Failed with the
+        // cause recorded, rather than aborting the process.
+        assert_eq!(co.step().unwrap(), State::Failed);
+        assert!(co.store.count_events_of_kind("error").unwrap() >= 1);
     }
 
     #[test]
@@ -629,6 +684,65 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         store.set_work_item("# WI").unwrap();
         Coordinator::new(config, store, runner, path).unwrap()
+    }
+
+    /// A runner that errors for the first `fail_times` calls, then delegates to
+    /// the EchoRunner stub. Used to exercise retry/Failed behavior.
+    struct FailingRunner {
+        fail_times: usize,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl FailingRunner {
+        fn new(fail_times: usize) -> FailingRunner {
+            FailingRunner {
+                fail_times,
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl AgentRunner for FailingRunner {
+        fn run(&self, req: &AgentRequest) -> Result<String, AgentError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail_times {
+                Err(AgentError::NonZeroExit {
+                    role: req.role.clone(),
+                    code: "1".to_string(),
+                    stderr: "boom".to_string(),
+                })
+            } else {
+                EchoRunner.run(req)
+            }
+        }
+    }
+
+    #[test]
+    fn persistent_step_failure_moves_to_failed() {
+        // The runner always errors; the first planner exhausts its retries.
+        let config = Config::default(); // step_retries = 3 -> 4 attempts
+        let runner = FailingRunner::new(usize::MAX);
+        let calls = runner.calls.clone();
+        let mut co = coordinator_with_runner(config, Box::new(runner));
+
+        assert_eq!(co.run_until_blocked().unwrap(), State::Failed);
+        // One initial attempt plus step_retries (3) retries = 4 attempts.
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        // The cause was recorded.
+        assert!(co.store.count_events_of_kind("error").unwrap() >= 1);
+    }
+
+    #[test]
+    fn transient_failures_are_retried_then_succeed() {
+        let mut config = Config::default();
+        config.reviews.plan_review = false;
+        config.reviews.work_review = false;
+        // Fail step_retries - 1 times, then every call succeeds.
+        let runner = FailingRunner::new(2);
+        let mut co = coordinator_with_runner(config, Box::new(runner));
+
+        // Despite the initial transient failures, the WI completes normally.
+        assert_eq!(co.run_until_blocked().unwrap(), State::Done);
     }
 
     #[test]
@@ -760,7 +874,7 @@ mod tests {
     }
 
     #[test]
-    fn implementing_without_plan_errors() {
+    fn implementing_without_plan_moves_to_failed() {
         // Jump straight to Implementing with no plan persisted.
         let mut store = Store::open_in_memory().unwrap();
         store.set_work_item("# WI").unwrap();
@@ -782,7 +896,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(co.state(), State::Implementing);
-        assert!(matches!(co.step(), Err(CoordinatorError::NoPlan)));
+        // No plan is unrecoverable here: the WI moves to Failed.
+        assert_eq!(co.step().unwrap(), State::Failed);
     }
 
     #[test]
