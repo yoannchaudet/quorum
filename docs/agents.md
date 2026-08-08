@@ -60,6 +60,24 @@ Exact model IDs are set in config; the docs fix the *number and roles*, not the 
 - All Implementer child processes are step-scoped and terminated before the
   Coordinator finalizes the round.
 
+### Human-approved execution capabilities
+
+Every merged Plan contains an exhaustive `Execution capabilities` YAML section. At
+`PlanReview`, approving the Plan also approves that exact grant:
+
+- shell execution;
+- outbound internet;
+- a loopback development server;
+- no browser, a headless browser, or a visible isolated browser;
+- retained artifacts;
+- a per-step timeout.
+
+Quorum parses and validates the section before accepting the Plan. The runtime sandbox
+is generated from that persisted grant. Capabilities omitted from the Plan are not
+available to the Implementer. Browser access requires internet and artifact
+authorization because the trusted browser sidecar cannot run inside the network
+sandbox.
+
 ## Human intervention
 
 The Coordinator pulls humans in at exactly three points, each a blocked state:

@@ -28,7 +28,8 @@ models:
 sandbox:
   enabled: true                 # run agents inside Copilot's local sandbox
   experimental: true            # local sandbox currently requires --experimental
-  allow_outbound: true          # permit internet-backed tools and browser navigation
+  allow_outbound: true          # ceiling for Plan-authorized internet access
+  allow_local_network: true     # ceiling for Plan-authorized loopback access
   # Destructive tools denied even inside the sandbox (defense in depth).
   deny_tools:
     - shell(rm)
@@ -68,6 +69,6 @@ Repository selection is runtime context rather than configuration:
 - Browser automation uses a pinned Playwright MCP package, an isolated in-memory
   profile, and a work-item artifact directory. It never connects to the user's normal
   browser profile.
-- Outbound internet is capability-first and enabled by default. Turning it off removes
-  Copilot URL permission, but the effective shell network boundary also depends on the
-  configured preview Local Sandbox policy.
+- Outbound internet and local-network access are capability-first and enabled by
+  default as administrative ceilings. The accepted Plan must still request each
+  capability. Disable either setting to prohibit every Plan from granting it.

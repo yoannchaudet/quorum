@@ -47,3 +47,7 @@ purpose: Produce a candidate plan for a work item in isolation.
 - One prompt per file; filename stem == `id`.
 - Bump `version` on any change to the body.
 - Keep the body plain markdown so diffs are readable and reviews are easy.
+
+The Planner and merge prompts require an exhaustive execution-capability YAML section.
+It is part of the Plan reviewed by the human, parsed as structured data, persisted with
+the Plan, and enforced when Quorum constructs the Implementer sandbox.

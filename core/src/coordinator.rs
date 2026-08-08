@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::agent::{AgentError, AgentRequest, AgentRole, AgentRunner, Filesystem};
+use crate::capabilities::{CapabilityError, ExecutionCapabilities};
 use crate::config::Config;
 use crate::convergence;
 use crate::observability::{ActivityEvent, ActivityKind, ActivityObserver, NoopActivityObserver};
@@ -27,6 +28,8 @@ pub enum CoordinatorError {
     Agent(#[from] AgentError),
     #[error(transparent)]
     Worktree(#[from] WorktreeError),
+    #[error(transparent)]
+    Capability(#[from] CapabilityError),
     #[error("illegal transition {from} -> {to}")]
     IllegalTransition { from: State, to: State },
     #[error("no work item has been loaded")]
@@ -205,7 +208,11 @@ impl Coordinator {
         use Decision::*;
         use State::*;
         let (next, answer) = match (self.state, &decision) {
-            (PlanReview, Approve) => (Implementing, None),
+            (PlanReview, Approve) => {
+                let plan = self.store.plan()?.ok_or(CoordinatorError::NoPlan)?;
+                ExecutionCapabilities::parse_plan(&plan)?;
+                (Implementing, None)
+            }
             (PlanReview, Reject) => (Planning, None),
             (WorkReview, Approve) => (Done, None),
             (WorkReview, Reject) => (Implementing, None),
@@ -275,6 +282,7 @@ impl Coordinator {
                 model,
                 iteration: None,
                 additional_dirs: vec![],
+                execution: None,
             };
             let output = self.invoke(&req)?;
             let trimmed = output.trim();
@@ -318,6 +326,7 @@ impl Coordinator {
                 model,
                 iteration: Some(iteration),
                 additional_dirs: vec![],
+                execution: None,
             };
             let output = self.invoke(&req)?;
             self.store.save_candidate(&slot, iteration, &output)?;
@@ -359,9 +368,11 @@ impl Coordinator {
             model: self.config.models.coordinator.clone(),
             iteration: Some(iteration),
             additional_dirs: vec![],
+            execution: None,
         };
         let output = self.invoke(&req)?;
         let merged = convergence::parse_merge(&output);
+        ExecutionCapabilities::parse_plan(&merged.plan)?;
 
         // Fallback signal: a plan materially unchanged from the previous one is
         // treated as converged even if the model said otherwise.
@@ -403,6 +414,7 @@ impl Coordinator {
             .work_item()?
             .ok_or(CoordinatorError::NoWorkItem)?;
         let plan = self.store.plan()?.ok_or(CoordinatorError::NoPlan)?;
+        let execution = ExecutionCapabilities::parse_plan(&plan)?;
         let feedback = self
             .store
             .latest_review()?
@@ -478,12 +490,14 @@ impl Coordinator {
             let artifact_dir = runtime_dir.join("artifacts");
             let runtime_text = runtime_dir.display().to_string();
             let artifact_text = artifact_dir.display().to_string();
+            let execution_text = execution.to_string();
             let rendered = Prompt::implementer().render(&[
                 ("work_item", &work_item),
                 ("plan", &plan),
                 ("feedback", &feedback),
                 ("runtime_dir", &runtime_text),
                 ("artifact_dir", &artifact_text),
+                ("execution_capabilities", &execution_text),
             ])?;
             let req = AgentRequest {
                 role: AgentRole::Implementer,
@@ -493,9 +507,14 @@ impl Coordinator {
                 model: self.config.models.implementer.clone(),
                 iteration: Some(iteration),
                 additional_dirs: self.implementation_allowed_dirs.clone(),
+                execution: Some(execution.clone()),
             };
             let invocation = self.invoke(&req);
-            let artifacts = self.store.sync_artifacts(iteration, &artifact_dir)?;
+            let artifacts = if execution.artifacts {
+                self.store.sync_artifacts(iteration, &artifact_dir)?
+            } else {
+                0
+            };
             if artifacts > 0 {
                 self.record_activity(
                     ActivityEvent::new(
@@ -607,6 +626,7 @@ impl Coordinator {
             } else {
                 vec![]
             },
+            execution: None,
         };
         let output = self.invoke(&req)?;
         let review = convergence::parse_review(&output);
@@ -887,6 +907,12 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
+    const TEST_CAPABILITIES: &str = "### Execution capabilities\n```yaml\nshell: true\ninternet: false\nlocal_server: none\nbrowser: none\nartifacts: false\ntimeout_minutes: 30\n```";
+
+    fn test_plan(summary: &str) -> String {
+        format!("### Summary\n{summary}\n\n{TEST_CAPABILITIES}")
+    }
+
     struct CollectingObserver {
         events: Arc<Mutex<Vec<ActivityEvent>>>,
     }
@@ -993,7 +1019,8 @@ mod tests {
                     "CONVERGED"
                 };
                 Ok(format!(
-                    "## Plan\nplan revision {m}\n\n## Convergence\n{verdict}"
+                    "## Plan\n{}\n\n## Convergence\n{verdict}",
+                    test_plan(&format!("plan revision {m}"))
                 ))
             } else {
                 // Distinct planner output each call so plans are never unchanged.
@@ -1085,8 +1112,10 @@ mod tests {
         let merges = runner.merges.clone();
         let mut store = Store::open_in_memory().unwrap();
         store.set_work_item("# Work Item").unwrap();
+        let mut config = Config::default();
+        config.limits.convergence_diff_threshold = 0.0;
         let mut co = Coordinator::new(
-            Config::default(),
+            config,
             store,
             Box::new(runner),
             fake_workspace(),
@@ -1158,7 +1187,10 @@ mod tests {
             if matches!(req.role, AgentRole::IntakePlanner { .. }) {
                 Ok("NONE".to_string())
             } else if req.role == AgentRole::CoordinatorMerge {
-                Ok("## Plan\nthe plan\n\n## Convergence\nCONVERGED".to_string())
+                Ok(format!(
+                    "## Plan\n{}\n\n## Convergence\nCONVERGED",
+                    test_plan("the plan")
+                ))
             } else if req.role == AgentRole::Reviewer {
                 let n = self.reviews.fetch_add(1, Ordering::SeqCst);
                 let verdict = if n < self.reject_times {
@@ -1463,7 +1495,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut store = Store::open_in_memory().unwrap();
         store.set_work_item("# Work Item").unwrap();
-        store.set_plan("the plan", "").unwrap();
+        store.set_plan(&test_plan("the plan"), "").unwrap();
         store
             .reserve_implementation_round(0, "base-commit")
             .unwrap();
@@ -1539,7 +1571,7 @@ mod tests {
         // Set up a coordinator sitting at Implementing with a plan present.
         let mut store = Store::open_in_memory().unwrap();
         store.set_work_item("# Work Item").unwrap();
-        store.set_plan("the plan", "").unwrap();
+        store.set_plan(&test_plan("the plan"), "").unwrap();
         for (f, t) in [
             (State::Intake, State::Planning),
             (State::Planning, State::Converging),
@@ -1627,6 +1659,20 @@ mod tests {
         let (mut co, _tmp) = coordinator_with_work_item(Config::default());
         assert_eq!(co.run_until_blocked().unwrap(), State::PlanReview);
         assert_eq!(co.resolve(Decision::Approve).unwrap(), State::Implementing);
+    }
+
+    #[test]
+    fn plan_review_rejects_a_missing_capability_grant() {
+        let (mut co, _tmp) = coordinator_with_work_item(Config::default());
+        assert_eq!(co.run_until_blocked().unwrap(), State::PlanReview);
+        co.store.set_plan("### Summary\nNo grant", "").unwrap();
+        assert!(matches!(
+            co.resolve(Decision::Approve),
+            Err(CoordinatorError::Capability(
+                CapabilityError::MissingSection
+            ))
+        ));
+        assert_eq!(co.state(), State::PlanReview);
     }
 
     #[test]

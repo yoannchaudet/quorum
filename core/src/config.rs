@@ -66,8 +66,10 @@ pub struct Sandbox {
     pub experimental: bool,
     /// Destructive tools denied even inside the sandbox (defense in depth).
     pub deny_tools: Vec<String>,
-    /// Allow outbound internet access from Implementer tools.
+    /// Administrative ceiling for Plan-authorized outbound internet access.
     pub allow_outbound: bool,
+    /// Administrative ceiling for Plan-authorized local-network access.
+    pub allow_local_network: bool,
     /// Browser automation available to the Implementer.
     pub browser: Browser,
 }
@@ -117,6 +119,7 @@ impl Default for Sandbox {
             experimental: true,
             deny_tools: vec!["shell(rm)".to_string()],
             allow_outbound: true,
+            allow_local_network: true,
             browser: Browser::default(),
         }
     }
@@ -266,6 +269,7 @@ mod tests {
         assert!(c.sandbox.experimental);
         assert_eq!(c.sandbox.deny_tools, vec!["shell(rm)".to_string()]);
         assert!(c.sandbox.allow_outbound);
+        assert!(c.sandbox.allow_local_network);
         assert!(c.sandbox.browser.enabled);
         assert!(c.sandbox.browser.headed);
         assert_eq!(c.sandbox.browser.package, "@playwright/mcp@0.0.79");
