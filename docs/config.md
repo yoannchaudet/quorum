@@ -3,11 +3,14 @@
 Quorum reads a single YAML config, default `~/.quorum/config.yaml`. It is optional;
 every key has a default. The path is overridable via a CLI flag.
 
+Unknown keys are rejected. The global persistence model uses `data_dir`; the former
+`state_dir` key is no longer supported.
+
 ## Schema
 
 ```yaml
-# Where per-WI state and assets live (see persistence.md).
-state_dir: ~/.quorum/state
+# Root for the global database and per-WI filesystem state.
+data_dir: ~/.quorum
 
 # Planner roster override (see agents.md). Keys are slots; values are model IDs.
 planners:

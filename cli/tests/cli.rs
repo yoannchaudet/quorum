@@ -1,8 +1,8 @@
 //! End-to-end integration test for the `quorum` binary.
 //!
-//! Exercises the engine: `run` on a fresh work item creates the state DB and
+//! Exercises the engine: `run` on a fresh work item persists global state and
 //! advances autonomously until it blocks at the first human-review gate;
-//! `status` reads the persisted state back.
+//! `status` reads the work item state back by id.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -36,14 +36,22 @@ fn run_advances_to_plan_review_and_status_reads_it_back() {
         "missing resume command: {stdout}"
     );
 
-    // The state DB must now exist.
-    let db = home.join(".quorum/state/mywi/quorum.db");
-    assert!(db.exists(), "state db was not created at {}", db.display());
+    assert!(home.join(".quorum/quorum.db").exists());
+    let state_entries = std::fs::read_dir(home.join(".quorum/state"))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(state_entries.len(), 1);
+    assert_ne!(
+        state_entries[0].file_name().to_string_lossy(),
+        "mywi",
+        "filesystem state must use the stable internal id"
+    );
 
     // `status` reads the same persisted state back.
     let out = Command::new(bin())
-        .args(["--config", "/dev/null", "status"])
-        .arg(&db)
+        .args(["status", "mywi"])
+        .env("HOME", home)
         .output()
         .unwrap();
     assert!(out.status.success(), "status failed: {out:?}");

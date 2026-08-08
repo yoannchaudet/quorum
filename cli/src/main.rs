@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use quorum_core::{
     agent::{AgentRunner, EchoRunner},
-    Config, Coordinator, CopilotRunner, Decision, State, Store,
+    Config, Coordinator, CopilotRunner, Database, Decision, State, Store, WorkItemId,
 };
 
 #[derive(Parser)]
@@ -36,12 +36,12 @@ enum Command {
     },
     /// Print the current state of a work item.
     Status {
-        /// Path to the work item's state database (quorum.db).
-        db: PathBuf,
+        /// The work item id.
+        wi: String,
     },
     /// Approve the current review gate (PlanReview/WorkReview) and continue.
     Approve {
-        /// The work item id (the state directory name).
+        /// The work item id.
         wi: String,
         /// Continue with stub agents instead of invoking copilot.
         #[arg(long)]
@@ -49,7 +49,7 @@ enum Command {
     },
     /// Reject the current review gate and send the work back a phase.
     Reject {
-        /// The work item id (the state directory name).
+        /// The work item id.
         wi: String,
         /// Continue with stub agents instead of invoking copilot.
         #[arg(long)]
@@ -57,7 +57,7 @@ enum Command {
     },
     /// Answer planner questions at IntakeReview and continue.
     Answer {
-        /// The work item id (the state directory name).
+        /// The work item id.
         wi: String,
         /// The answer text (mutually exclusive with --file).
         #[arg(conflicts_with = "file")]
@@ -71,7 +71,7 @@ enum Command {
     },
     /// Abandon the work item (from any blocked state).
     Abandon {
-        /// The work item id (the state directory name).
+        /// The work item id.
         wi: String,
     },
 }
@@ -95,15 +95,18 @@ fn run() -> Result<()> {
     match cli.command {
         Command::Run { work_item, dry_run } => {
             let wi_id = work_item_id(&work_item);
-            let db_path = config.state_dir.join(&wi_id).join("quorum.db");
-            let workspace = db_path
-                .parent()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("."));
+            validate_wi_id(&wi_id)?;
+            let mut database = open_database(&config)?;
+            let internal_id = database
+                .get_or_create_work_item(&wi_id)
+                .context("creating work item state")?;
+            let workspace = config.work_item_dir(internal_id.as_str());
             std::fs::create_dir_all(&workspace)
                 .with_context(|| format!("creating {}", workspace.display()))?;
 
-            let mut store = Store::open(&db_path).context("opening state database")?;
+            let mut store = database
+                .into_store(internal_id)
+                .context("opening work item state")?;
             // Intake: load the WI markdown once, if not already stored.
             if store.work_item().context("reading work item")?.is_none() {
                 let text = std::fs::read_to_string(&work_item)
@@ -121,30 +124,16 @@ fn run() -> Result<()> {
             co.run_until_blocked().context("advancing work item")?;
             report(&wi_id, &co)?;
         }
-        Command::Status { db } => {
-            let wi_id = db
-                .parent()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-                .unwrap_or("work-item")
-                .to_string();
-            let workspace = db
-                .parent()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("."));
-            let store = Store::open(&db).context("opening state database")?;
-            let mut co = Coordinator::new(
-                config,
-                store,
-                Box::new(EchoRunner),
-                workspace,
-                wi_id.clone(),
-            )
-            .context("initializing coordinator")?;
+        Command::Status { wi } => {
+            let (store, internal_id) = open_work_item(&config, &wi)?;
+            let workspace = config.work_item_dir(internal_id.as_str());
+            let mut co =
+                Coordinator::new(config, store, Box::new(EchoRunner), workspace, wi.clone())
+                    .context("initializing coordinator")?;
             // Ensure the HI session row exists (deterministic; repairs it if a
             // crash occurred before it was recorded).
             co.ensure_session().context("recording HI session")?;
-            report(&wi_id, &co)?;
+            report(&wi, &co)?;
         }
         Command::Approve { wi, dry_run } => {
             resolve_and_continue(config, &wi, Decision::Approve, dry_run)?;
@@ -175,8 +164,8 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-/// Open the WI for `wi_id` under the configured state dir, apply the human
-/// `decision`, then continue autonomously until the next blocked/terminal state.
+/// Open the WI, apply the human `decision`, then continue autonomously until the
+/// next blocked or terminal state.
 fn resolve_and_continue(
     config: Config,
     wi_id: &str,
@@ -184,20 +173,13 @@ fn resolve_and_continue(
     dry_run: bool,
 ) -> Result<()> {
     validate_wi_id(wi_id)?;
-    let db_path = config.state_dir.join(wi_id).join("quorum.db");
-    if !db_path.exists() {
-        anyhow::bail!("no work item {wi_id} at {}", db_path.display());
-    }
-    let workspace = db_path
-        .parent()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let (store, internal_id) = open_work_item(&config, wi_id)?;
+    let workspace = config.work_item_dir(internal_id.as_str());
     let runner: Box<dyn AgentRunner> = if dry_run {
         Box::new(EchoRunner)
     } else {
         Box::new(CopilotRunner::new(config.sandbox.clone()))
     };
-    let store = Store::open(&db_path).context("opening state database")?;
     let mut co = Coordinator::new(config, store, runner, workspace, wi_id)
         .context("initializing coordinator")?;
     co.resolve(decision)
@@ -205,6 +187,25 @@ fn resolve_and_continue(
     co.run_until_blocked().context("advancing work item")?;
     report(wi_id, &co)?;
     Ok(())
+}
+
+fn open_database(config: &Config) -> Result<Database> {
+    std::fs::create_dir_all(&config.data_dir)
+        .with_context(|| format!("creating {}", config.data_dir.display()))?;
+    Database::open(&config.database_path()).context("opening Quorum state")
+}
+
+fn open_work_item(config: &Config, wi_id: &str) -> Result<(Store, WorkItemId)> {
+    validate_wi_id(wi_id)?;
+    let database = open_database(config)?;
+    let internal_id = database
+        .work_item_id(wi_id)
+        .context("looking up work item")?
+        .with_context(|| format!("no work item {wi_id}"))?;
+    let store = database
+        .into_store(internal_id.clone())
+        .context("opening work item state")?;
+    Ok((store, internal_id))
 }
 
 /// Render the current state and, when blocked, the HI resume command (and any
@@ -227,7 +228,7 @@ fn report(wi_id: &str, co: &Coordinator) -> Result<()> {
             println!("resolve with: quorum {hint} {wi_id}");
         }
     } else if state == State::Failed {
-        println!("state: {state} (failed — see quorum.db for details)");
+        println!("state: {state} (failed — inspect the work item event history)");
     } else if state.is_terminal() {
         println!("state: {state} (done)");
     } else {
@@ -253,8 +254,7 @@ fn work_item_id(path: &std::path::Path) -> String {
         .to_string()
 }
 
-/// Ensure a user-supplied WI id is a single, safe path component so it cannot
-/// escape the configured state directory (e.g. absolute paths or `..`).
+/// Ensure a WI id is safe to embed in commands and deterministic session names.
 fn validate_wi_id(wi_id: &str) -> Result<()> {
     let mut components = std::path::Path::new(wi_id).components();
     let first = components.next();
