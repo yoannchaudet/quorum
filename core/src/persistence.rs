@@ -1006,8 +1006,12 @@ impl Store {
             }
         }
 
+        let execution = plan
+            .as_ref()
+            .and_then(|value| crate::ExecutionCapabilities::parse_plan(&value.0).ok());
+
         Ok(StatusSnapshot {
-            version: 3,
+            version: 4,
             identity: WorkItemIdentitySnapshot {
                 id,
                 slug: slug.clone(),
@@ -1026,6 +1030,7 @@ impl Store {
                 planners,
                 plan: plan.as_ref().map(|value| value.0.clone()),
                 metrics: plan.and_then(|value| value.1),
+                execution,
             },
             implementations,
             reviews,
@@ -2033,7 +2038,7 @@ mod tests {
             .unwrap();
 
         let snapshot = store.status_snapshot().unwrap();
-        assert_eq!(snapshot.version, 3);
+        assert_eq!(snapshot.version, 4);
         assert_eq!(snapshot.identity.id, work_item.as_str());
         assert_eq!(snapshot.identity.slug, "observable");
         assert_eq!(snapshot.identity.repository_root, "/repo");

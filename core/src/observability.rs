@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::persistence::{Store, StoreError};
 use crate::state::{Kind, State};
+use crate::ExecutionCapabilities;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -126,6 +127,7 @@ pub struct PlanningSnapshot {
     pub planners: Vec<String>,
     pub plan: Option<String>,
     pub metrics: Option<String>,
+    pub execution: Option<ExecutionCapabilities>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

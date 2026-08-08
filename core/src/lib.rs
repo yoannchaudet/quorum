@@ -4,6 +4,7 @@
 //! future Tauri UX) are thin drivers over this crate.
 
 pub mod agent;
+pub mod capabilities;
 pub mod config;
 pub mod convergence;
 pub mod coordinator;
@@ -15,6 +16,9 @@ pub mod state;
 pub mod worktree;
 
 pub use agent::{AgentRole, AgentRunner, CopilotRunner, EchoRunner};
+pub use capabilities::{
+    BrowserCapability, CapabilityError, ExecutionCapabilities, LocalServerCapability,
+};
 pub use config::Config;
 pub use coordinator::{Coordinator, Decision};
 pub use observability::{

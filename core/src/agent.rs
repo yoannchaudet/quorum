@@ -5,6 +5,7 @@
 //! `--dry-run` path can substitute a fake without spawning any process.
 
 use crate::config::Sandbox;
+use crate::{BrowserCapability, ExecutionCapabilities, LocalServerCapability};
 use serde_json::json;
 use std::fmt;
 use std::fs;
@@ -79,6 +80,8 @@ pub struct AgentRequest {
     pub iteration: Option<u32>,
     /// Additional sandbox paths required by this invocation.
     pub additional_dirs: Vec<PathBuf>,
+    /// Human-approved execution grant. Present only for the Implementer.
+    pub execution: Option<ExecutionCapabilities>,
 }
 
 /// Errors from running an agent.
@@ -159,11 +162,15 @@ impl CopilotRunner {
             }
             for directory in &req.additional_dirs {
                 args.push("--add-dir".to_string());
-                args.push(directory.display().to_string());
+                args.push(policy_path(directory));
             }
             if req.role == AgentRole::Implementer {
                 args.push("--add-dir".to_string());
-                args.push(self.runtime_dir.display().to_string());
+                args.push(policy_path(&self.runtime_dir));
+                if req.execution.as_ref().is_some_and(|grant| grant.shell) {
+                    args.push("--add-dir".to_string());
+                    args.push(policy_path(&std::env::temp_dir()));
+                }
             }
         }
         args.push("--no-ask-user".to_string());
@@ -176,8 +183,15 @@ impl CopilotRunner {
         // (`--allow-all-tools`); without it, we never grant blanket tools —
         // read/write agents are limited to file tools so a disabled sandbox
         // cannot become arbitrary ambient execution.
+        let execution = req.execution.as_ref();
         match (req.filesystem, self.sandbox.enabled) {
-            (Filesystem::ReadWrite, true) => args.push("--allow-all-tools".to_string()),
+            (Filesystem::ReadWrite, true) if execution.is_some_and(|grant| grant.shell) => {
+                args.push("--allow-all-tools".to_string())
+            }
+            (Filesystem::ReadWrite, true) => {
+                args.push("--allow-tool".to_string());
+                args.push("read,write".to_string());
+            }
             (Filesystem::ReadWrite, false) => {
                 args.push("--allow-tool".to_string());
                 args.push("read,write".to_string());
@@ -191,14 +205,14 @@ impl CopilotRunner {
             args.push("--deny-tool".to_string());
             args.push(tool.clone());
         }
-        if self.sandbox.allow_outbound {
+        if execution.is_some_and(|grant| grant.internet) && self.sandbox.allow_outbound {
             args.push("--allow-all-urls".to_string());
         }
         let secret_names = secret_environment_names();
         if !secret_names.is_empty() {
             args.push(format!("--secret-env-vars={}", secret_names.join(",")));
         }
-        if req.role == AgentRole::Implementer && self.sandbox.browser.enabled {
+        if self.browser_enabled(req) {
             args.push(format!(
                 "--additional-mcp-config=@{}",
                 self.runtime_dir.join("playwright-mcp.json").display()
@@ -214,6 +228,11 @@ impl CopilotRunner {
     }
 
     fn prepare_runtime(&self, req: &AgentRequest) -> Result<(), AgentError> {
+        fs::create_dir_all(&self.runtime_dir).map_err(|source| AgentError::Runtime {
+            role: req.role.to_string(),
+            source,
+        })?;
+        self.prepare_copilot_home(req)?;
         if req.role != AgentRole::Implementer {
             return Ok(());
         }
@@ -223,7 +242,7 @@ impl CopilotRunner {
                 source,
             }
         })?;
-        if !self.sandbox.browser.enabled {
+        if !self.browser_enabled(req) {
             return Ok(());
         }
         let mut playwright_args = vec![
@@ -240,7 +259,11 @@ impl CopilotRunner {
             "--output-max-size=52428800".to_string(),
             "--save-session".to_string(),
         ];
-        if !self.sandbox.browser.headed || !graphical_display_available() {
+        let headed = req
+            .execution
+            .as_ref()
+            .is_some_and(|grant| grant.browser == BrowserCapability::Headed);
+        if !headed || !self.sandbox.browser.headed || !graphical_display_available() {
             playwright_args.push("--headless".to_string());
         }
         let config = json!({
@@ -265,6 +288,136 @@ impl CopilotRunner {
             }
         })
     }
+
+    fn prepare_copilot_home(&self, req: &AgentRequest) -> Result<(), AgentError> {
+        let home = self.copilot_home();
+        match fs::remove_dir_all(&home) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(AgentError::Runtime {
+                    role: req.role.to_string(),
+                    source,
+                })
+            }
+        }
+        fs::create_dir_all(&home).map_err(|source| AgentError::Runtime {
+            role: req.role.to_string(),
+            source,
+        })?;
+        self.link_auth_state(&home, req)?;
+
+        let temporary = std::env::temp_dir();
+        let mut readonly_paths = req
+            .additional_dirs
+            .iter()
+            .map(|path| policy_path(path))
+            .collect::<Vec<_>>();
+        let mut readwrite_paths = vec![policy_path(&temporary)];
+        if req.filesystem == Filesystem::ReadOnly {
+            readonly_paths.push(policy_path(&req.cwd));
+        } else {
+            readwrite_paths.push(policy_path(&req.cwd));
+            readwrite_paths.push(policy_path(&self.runtime_dir));
+        }
+        let denied_paths = sensitive_paths(&home);
+        let settings = json!({
+            "experimental": self.sandbox.experimental,
+            "sandbox": {
+                "enabled": true,
+                "addCurrentWorkingDirectory": false,
+                "allowDevToolAccess": req.execution.as_ref().is_some_and(|grant| grant.shell),
+                "allowBypass": false,
+                "auth": {
+                    "git": false,
+                    "gh": false
+                },
+                "sandboxMcpServers": !self.browser_enabled(req),
+                "sandboxLspServers": true,
+                "userPolicy": {
+                    "filesystem": {
+                        "readwritePaths": readwrite_paths,
+                        "readonlyPaths": readonly_paths,
+                        "deniedPaths": denied_paths,
+                        "clearPolicyOnExit": true
+                    },
+                    "network": {
+                        "allowOutbound": req.execution.as_ref().is_some_and(|grant| grant.internet)
+                            && self.sandbox.allow_outbound,
+                        "allowLocalNetwork": req.execution.as_ref().is_some_and(|grant| {
+                            grant.local_server == LocalServerCapability::Loopback
+                        }) && self.sandbox.allow_local_network
+                    },
+                    "seatbelt": {
+                        "keychainAccess": false
+                    }
+                }
+            }
+        });
+        let text =
+            serde_json::to_vec_pretty(&settings).map_err(|source| AgentError::BrowserConfig {
+                role: req.role.to_string(),
+                source,
+            })?;
+        fs::write(home.join("settings.json"), text).map_err(|source| AgentError::Runtime {
+            role: req.role.to_string(),
+            source,
+        })
+    }
+
+    fn link_auth_state(
+        &self,
+        home: &std::path::Path,
+        req: &AgentRequest,
+    ) -> Result<(), AgentError> {
+        let source_home = std::env::var_os("COPILOT_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|path| PathBuf::from(path).join(".copilot")));
+        let Some(source) = source_home.map(|path| path.join("config.json")) else {
+            return Ok(());
+        };
+        if !source.exists() {
+            return Ok(());
+        }
+        let target = home.join("config.json");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&source, &target).map_err(|source| AgentError::Runtime {
+                role: req.role.to_string(),
+                source,
+            })?;
+        }
+        #[cfg(not(unix))]
+        {
+            fs::copy(&source, &target).map_err(|source| AgentError::Runtime {
+                role: req.role.to_string(),
+                source,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn copilot_home(&self) -> PathBuf {
+        let name = self
+            .runtime_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("runtime");
+        self.runtime_dir
+            .with_file_name(format!(".{name}-copilot-home"))
+    }
+
+    fn cleanup_copilot_home(&self) {
+        let _ = fs::remove_dir_all(self.copilot_home());
+    }
+
+    fn browser_enabled(&self, req: &AgentRequest) -> bool {
+        self.sandbox.browser.enabled
+            && req
+                .execution
+                .as_ref()
+                .is_some_and(|grant| grant.browser != BrowserCapability::None && grant.artifacts)
+    }
 }
 
 impl AgentRunner for CopilotRunner {
@@ -281,6 +434,7 @@ impl AgentRunner for CopilotRunner {
             .current_dir(&req.cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        command.env("COPILOT_HOME", self.copilot_home());
         #[cfg(unix)]
         command.process_group(0);
         let mut child = command.spawn().map_err(|source| AgentError::Spawn {
@@ -289,8 +443,14 @@ impl AgentRunner for CopilotRunner {
         })?;
         let stdout_reader = child.stdout.take().map(read_bounded);
         let stderr_reader = child.stderr.take().map(read_bounded);
+        let timeout = req
+            .execution
+            .as_ref()
+            .map(|grant| Duration::from_secs(grant.timeout_seconds()))
+            .map(|requested| requested.min(self.timeout))
+            .unwrap_or(self.timeout);
         let status = child
-            .wait_timeout(self.timeout)
+            .wait_timeout(timeout)
             .map_err(|source| AgentError::Spawn {
                 role: req.role.to_string(),
                 source,
@@ -309,10 +469,11 @@ impl AgentRunner for CopilotRunner {
         terminate_process_tree(&mut child);
         let stdout = join_output(stdout_reader);
         let stderr = join_output(stderr_reader);
+        self.cleanup_copilot_home();
         if timed_out {
             return Err(AgentError::Timeout {
                 role: req.role.to_string(),
-                seconds: self.timeout.as_secs(),
+                seconds: timeout.as_secs(),
                 stderr,
             });
         }
@@ -416,6 +577,33 @@ fn graphical_display_available() -> bool {
     std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
 }
 
+fn sensitive_paths(isolated_home: &std::path::Path) -> Vec<String> {
+    let mut paths = vec![policy_path(isolated_home)];
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        for relative in [
+            ".copilot",
+            ".ssh",
+            ".aws",
+            ".azure",
+            ".config/gh",
+            ".config/gcloud",
+            "Library/Keychains",
+        ] {
+            paths.push(policy_path(&home.join(relative)));
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn policy_path(path: &std::path::Path) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
+}
+
 /// Fake runner for tests and `--dry-run`: returns a canned response without
 /// spawning any process.
 pub struct EchoRunner;
@@ -431,7 +619,7 @@ impl AgentRunner for EchoRunner {
         // `ACCEPT` verdict, so the whole pipeline advances in a single pass under
         // `--dry-run`.
         Ok(format!(
-            "## Plan\nDry-run stub for {}; no model was called.\n\n## Steps\n1. TODO\n\n## Risks & assumptions\n- Dry run.\n\n## Convergence\nCONVERGED\n\n## Verdict\nACCEPT\n\n## Findings\nNONE",
+            "## Plan\n### Summary\nDry-run stub for {}; no model was called.\n\n### Steps\n1. TODO\n\n### Risks & assumptions\n- Dry run.\n\n### Execution capabilities\n```yaml\nshell: true\ninternet: false\nlocal_server: none\nbrowser: none\nartifacts: false\ntimeout_minutes: 30\n```\n\n## Convergence\nCONVERGED\n\n## Verdict\nACCEPT\n\n## Findings\nNONE",
             req.role
         ))
     }
@@ -459,6 +647,18 @@ mod tests {
             model: String::new(),
             iteration: None,
             additional_dirs: vec![],
+            execution: None,
+        }
+    }
+
+    fn full_execution() -> ExecutionCapabilities {
+        ExecutionCapabilities {
+            shell: true,
+            internet: true,
+            local_server: LocalServerCapability::Loopback,
+            browser: BrowserCapability::Headed,
+            artifacts: true,
+            timeout_minutes: 30,
         }
     }
 
@@ -502,6 +702,7 @@ mod tests {
         let runner = runner(Sandbox::default());
         let mut r = req();
         r.filesystem = Filesystem::ReadWrite;
+        r.execution = Some(full_execution());
         let args = runner.args(&r);
         assert!(args.contains(&"--allow-all-tools".to_string()));
         assert!(!args.contains(&"--allow-tool".to_string()));
@@ -599,6 +800,7 @@ mod tests {
         let mut request = req();
         request.role = AgentRole::Implementer;
         request.filesystem = Filesystem::ReadWrite;
+        request.execution = Some(full_execution());
         runner.prepare_runtime(&request).unwrap();
         let config: serde_json::Value = serde_json::from_slice(
             &std::fs::read(runtime.path().join("playwright-mcp.json")).unwrap(),
@@ -610,6 +812,94 @@ mod tests {
         assert!(args.iter().any(|value| value == "@playwright/mcp@0.0.79"));
         assert!(args.iter().any(|value| value == "--isolated"));
         assert!(runtime.path().join("artifacts").is_dir());
+        runner.cleanup_copilot_home();
+    }
+
+    #[test]
+    fn implementer_policy_allows_runtime_temp_and_loopback() {
+        let runtime = tempfile::tempdir().unwrap();
+        let runner = CopilotRunner::new(
+            Sandbox::default(),
+            Duration::from_secs(10),
+            runtime.path().to_path_buf(),
+        );
+        let mut request = req();
+        request.role = AgentRole::Implementer;
+        request.filesystem = Filesystem::ReadWrite;
+        request.execution = Some(full_execution());
+        request.cwd = runtime.path().join("workspace");
+        request.additional_dirs = vec![runtime.path().join("git-common")];
+        let args = runner.args(&request);
+        let temporary = policy_path(&std::env::temp_dir());
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--add-dir" && pair[1] == temporary));
+        runner.prepare_runtime(&request).unwrap();
+
+        let settings: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(runner.copilot_home().join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        let sandbox = &settings["sandbox"];
+        assert_eq!(sandbox["allowBypass"], false);
+        assert_eq!(sandbox["auth"]["git"], false);
+        assert_eq!(sandbox["auth"]["gh"], false);
+        assert_eq!(sandbox["sandboxMcpServers"], false);
+        assert_eq!(sandbox["userPolicy"]["network"]["allowLocalNetwork"], true);
+        let readwrite = sandbox["userPolicy"]["filesystem"]["readwritePaths"]
+            .as_array()
+            .unwrap();
+        assert!(readwrite
+            .iter()
+            .any(|path| path == &policy_path(&request.cwd)));
+        assert!(readwrite
+            .iter()
+            .any(|path| path == &policy_path(runtime.path())));
+        assert!(readwrite
+            .iter()
+            .any(|path| path == &policy_path(&std::env::temp_dir())));
+        let readonly = sandbox["userPolicy"]["filesystem"]["readonlyPaths"]
+            .as_array()
+            .unwrap();
+        assert!(readonly
+            .iter()
+            .any(|path| path == &policy_path(&request.additional_dirs[0])));
+        assert!(!runner.copilot_home().starts_with(runtime.path()));
+        let denied = sandbox["userPolicy"]["filesystem"]["deniedPaths"]
+            .as_array()
+            .unwrap();
+        assert!(denied
+            .iter()
+            .any(|path| path == &policy_path(&runner.copilot_home())));
+        runner.cleanup_copilot_home();
+    }
+
+    #[test]
+    fn read_only_policy_does_not_grant_workspace_writes() {
+        let runtime = tempfile::tempdir().unwrap();
+        let runner = CopilotRunner::new(
+            Sandbox::default(),
+            Duration::from_secs(10),
+            runtime.path().to_path_buf(),
+        );
+        let request = req();
+        runner.prepare_runtime(&request).unwrap();
+        let settings: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(runner.copilot_home().join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        let filesystem = &settings["sandbox"]["userPolicy"]["filesystem"];
+        assert!(filesystem["readonlyPaths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == &policy_path(&request.cwd)));
+        assert!(!filesystem["readwritePaths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == &policy_path(&request.cwd)));
+        runner.cleanup_copilot_home();
     }
 
     #[test]

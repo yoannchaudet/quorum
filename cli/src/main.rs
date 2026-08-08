@@ -523,6 +523,12 @@ fn report_status(snapshot: &StatusSnapshot, verbose: bool) {
         Some(plan) => println!("  plan: {}", display_text(plan, verbose)),
         None => println!("  plan: not available"),
     }
+    if let Some(execution) = &snapshot.planning.execution {
+        println!("  approved execution:");
+        for line in execution.to_string().lines() {
+            println!("    {line}");
+        }
+    }
     if let Some(metrics) = &snapshot.planning.metrics {
         println!("  convergence: {metrics}");
     }

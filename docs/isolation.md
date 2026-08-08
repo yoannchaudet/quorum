@@ -25,6 +25,27 @@ The **Coordinator itself (the Rust Core) is not sandboxed** — it is the orches
 Quorum refuses to run a real agent when the Local Sandbox is disabled. Dry runs remain
 available because they spawn no agent process.
 
+For each invocation, Quorum creates a temporary isolated Copilot configuration
+directory and writes the complete sandbox policy instead of relying on the user's
+global settings. The policy grants:
+
+- the Implementer worktree, runtime directory, and system temp directory read/write;
+- the shared Git directory read-only;
+- Planner and Reviewer worktrees read-only;
+- Implementer network access only when both the approved Plan and Quorum configuration
+  allow it; Planner and Reviewer network access remains disabled;
+- no sandbox bypass, Git/GitHub CLI credential injection, or keychain access.
+
+Only Copilot's authentication state is linked into that private configuration
+directory. It is created outside the Implementer-writable runtime tree; that directory
+and the user's normal Copilot home are denied to sandboxed commands, and the private
+directory is removed after the invocation.
+
+The Implementer-specific portions of that policy come from the exhaustive execution
+capability section in the human-approved Plan. Quorum configuration supplies
+administrator ceilings; a Plan cannot grant internet, local-network, or browser access
+that configuration has disabled.
+
 ## Per-role profiles
 
 | Role | Filesystem | cwd | Rationale |
@@ -77,13 +98,16 @@ language servers, and other descendants cannot survive the step. Captured output
 bounded to its most recent 1 MiB per stream.
 
 The Implementer may run ordinary repository commands without a Quorum command
-allow-list. Development servers should bind to `127.0.0.1` and exist only long enough
-for tests or browser validation within the same step.
+allow-list. With `sandbox.allow_local_network` enabled, development servers can bind to
+`127.0.0.1` and remain available for browser validation within the same step.
 
 ## Browser isolation
 
 The Implementer receives an official, pinned Playwright MCP sidecar. It runs under the
-same sandbox and process group with:
+same supervised process group, but outside MXC because Chromium cannot launch reliably
+inside the nested macOS Seatbelt policy. This is a narrow exception for the pinned
+browser sidecar only; arbitrary Implementer shell commands remain sandboxed. The
+sidecar uses:
 
 - an isolated in-memory browser profile;
 - a deterministic viewport;
