@@ -59,10 +59,11 @@ enum Command {
     Answer {
         /// The work item id (the state directory name).
         wi: String,
-        /// The answer text (or use --file).
+        /// The answer text (mutually exclusive with --file).
+        #[arg(conflicts_with = "file")]
         text: Option<String>,
         /// Read the answer from a file instead of an argument.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "text")]
         file: Option<PathBuf>,
         /// Continue with stub agents instead of invoking copilot.
         #[arg(long)]
@@ -173,6 +174,7 @@ fn resolve_and_continue(
     decision: Decision,
     dry_run: bool,
 ) -> Result<()> {
+    validate_wi_id(wi_id)?;
     let db_path = config.state_dir.join(wi_id).join("quorum.db");
     if !db_path.exists() {
         anyhow::bail!("no work item {wi_id} at {}", db_path.display());
@@ -215,4 +217,17 @@ fn work_item_id(path: &std::path::Path) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("work-item")
         .to_string()
+}
+
+/// Ensure a user-supplied WI id is a single, safe path component so it cannot
+/// escape the configured state directory (e.g. absolute paths or `..`).
+fn validate_wi_id(wi_id: &str) -> Result<()> {
+    let mut components = std::path::Path::new(wi_id).components();
+    let first = components.next();
+    let is_single_normal =
+        matches!(first, Some(std::path::Component::Normal(_))) && components.next().is_none();
+    if wi_id.is_empty() || wi_id == "." || wi_id == ".." || !is_single_normal {
+        anyhow::bail!("invalid work item id {wi_id:?}: must be a single path component");
+    }
+    Ok(())
 }

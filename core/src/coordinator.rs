@@ -116,22 +116,23 @@ impl Coordinator {
     /// Resolve the current blocked (HI) state with a human `decision`, performing
     /// the corresponding validated, persisted transition (see `docs/agents.md`).
     ///
+    /// The decision (and any answer) is logged in the **same** transaction as the
+    /// transition, so the audit log can never record a decision that did not
+    /// actually advance the state.
+    ///
     /// Errors if the decision does not apply to the current state (e.g. approving
     /// when the WI is not at a review gate).
     pub fn resolve(&mut self, decision: Decision) -> Result<State, CoordinatorError> {
         use Decision::*;
         use State::*;
-        let next = match (self.state, &decision) {
-            (PlanReview, Approve) => Implementing,
-            (PlanReview, Reject) => Planning,
-            (WorkReview, Approve) => Done,
-            (WorkReview, Reject) => Implementing,
-            (IntakeReview, Answer(text)) => {
-                self.store.record_event("hi_answer", text)?;
-                Planning
-            }
+        let (next, answer) = match (self.state, &decision) {
+            (PlanReview, Approve) => (Implementing, None),
+            (PlanReview, Reject) => (Planning, None),
+            (WorkReview, Approve) => (Done, None),
+            (WorkReview, Reject) => (Implementing, None),
+            (IntakeReview, Answer(text)) => (Planning, Some(text.as_str())),
             // Abandoning is allowed from any blocked (HI) state.
-            (s, Abandon) if s.is_blocked() => Abandoned,
+            (s, Abandon) if s.is_blocked() => (Abandoned, None),
             _ => {
                 return Err(CoordinatorError::InvalidResolution {
                     state: self.state,
@@ -139,10 +140,26 @@ impl Coordinator {
                 })
             }
         };
-        self.store
-            .record_event("hi_decision", &format!("{}@{}", decision, self.state))?;
+
+        if !self.state.can_transition_to(next) {
+            return Err(CoordinatorError::IllegalTransition {
+                from: self.state,
+                to: next,
+            });
+        }
+
+        let decision_data = format!("{}@{}", decision, self.state);
+        let mut extra: Vec<(&str, &str)> = Vec::new();
+        if let Some(text) = answer {
+            extra.push(("hi_answer", text));
+        }
+        extra.push(("hi_decision", &decision_data));
+
         let reason = format!("hi: {decision} {} -> {next}", self.state);
-        self.transition_to(next, &reason)
+        self.store
+            .record_transition_with_events(Some(self.state), next, &reason, &extra)?;
+        self.state = next;
+        Ok(self.state)
     }
 
     /// Run the planner roster for the current planning iteration, in isolation,
@@ -361,6 +378,18 @@ mod tests {
         co.run_until_blocked().unwrap(); // PlanReview
         let err = co.resolve(Decision::Answer("nope".into())).unwrap_err();
         assert!(matches!(err, CoordinatorError::InvalidResolution { .. }));
+    }
+
+    #[test]
+    fn rejected_resolution_records_no_events() {
+        let mut co = coordinator_with_wi(Config::default());
+        // At Intake, approve is invalid and must not write any event.
+        let _ = co.resolve(Decision::Approve);
+        let events = co.store.count_events().unwrap();
+        // Only the autonomous transitions so far (none yet) — no HI events.
+        let hi = co.store.count_events_of_kind("hi_decision").unwrap();
+        assert_eq!(hi, 0);
+        assert_eq!(events, 0);
     }
 
     #[test]

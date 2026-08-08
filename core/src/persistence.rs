@@ -163,10 +163,32 @@ impl Store {
         to: State,
         reason: &str,
     ) -> Result<(), StoreError> {
+        self.record_transition_with_events(from, to, reason, &[])
+    }
+
+    /// As [`record_transition`], but also appends `extra` `(kind, data)` events
+    /// in the **same** transaction. Used to log an HI decision atomically with
+    /// the transition it authorizes, so the audit log can never claim a decision
+    /// that did not actually advance the state.
+    pub fn record_transition_with_events(
+        &mut self,
+        from: Option<State>,
+        to: State,
+        reason: &str,
+        extra: &[(&str, &str)],
+    ) -> Result<(), StoreError> {
         let ts = now_millis();
         let from_s = from.map(|s| s.as_str());
         let to_s = to.as_str();
         let tx = self.conn.transaction()?;
+        // Record the authorizing events before the transition so they read in
+        // causal order; all commit together or not at all.
+        for (kind, data) in extra {
+            tx.execute(
+                "INSERT INTO events (ts, kind, data) VALUES (?1, ?2, ?3)",
+                params![ts, kind, data],
+            )?;
+        }
         tx.execute(
             "INSERT INTO state (id, state, updated_at) VALUES (1, ?1, ?2)
              ON CONFLICT(id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at",
@@ -182,16 +204,6 @@ impl Store {
             params![ts, data],
         )?;
         tx.commit()?;
-        Ok(())
-    }
-
-    /// Append an event to the log (e.g. an HI decision). Standalone, not part of
-    /// a transition transaction.
-    pub fn record_event(&mut self, kind: &str, data: &str) -> Result<(), StoreError> {
-        self.conn.execute(
-            "INSERT INTO events (ts, kind, data) VALUES (?1, ?2, ?3)",
-            params![now_millis(), kind, data],
-        )?;
         Ok(())
     }
 
@@ -223,6 +235,22 @@ impl Store {
             });
         }
         Ok(out)
+    }
+
+    /// Total number of logged events.
+    pub fn count_events(&self) -> Result<i64, StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))?)
+    }
+
+    /// Number of logged events of a given kind.
+    pub fn count_events_of_kind(&self, kind: &str) -> Result<i64, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE kind = ?1",
+            params![kind],
+            |r| r.get(0),
+        )?)
     }
 
     /// Store the normalized WI markdown (single row). Idempotent (upsert).
