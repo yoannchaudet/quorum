@@ -28,6 +28,7 @@ is associated in the database; it does not determine the filesystem path.
 | `candidates` | PL candidate plans by WI, planner, and iteration. |
 | `plans` | Converged Plan and metrics per WI. |
 | `implementations` | IM summary by WI and adversarial iteration. |
+| `implementation_rounds` | Start/result commits, tree SHA, and recovery status per IM round. |
 | `intake` | Current planner questions per WI. |
 | `reviews` | RV feedback and verdict by WI and iteration. |
 | `sessions` | HI session records by WI and blocked state. |
@@ -56,6 +57,12 @@ iterations, sessions, or reviews from colliding across WIs.
   planner, implementation, or review iteration.
 - **Recoverable worktree setup**: creation intent is persisted before Git is changed;
   restart reconciles only matching branches and paths.
+- **Recoverable implementation rounds**: `running` records are created before IM,
+  summaries and `agent_complete` are persisted atomically, and `committed` records hold
+  the resulting commit and tree SHA.
+- **Attributable Git history**: the CO stages with `git add -A` and creates marked
+  commits using a fixed Quorum identity. Empty rounds record the unchanged tree without
+  creating an empty commit.
 - **Confined agent writes**: Local Sandbox restricts file writes to the linked worktree
   (see [isolation](isolation.md)).
 
@@ -67,6 +74,16 @@ iterations, sessions, or reviews from colliding across WIs.
 4. Verify the outputs required by that state.
 5. Advance when complete; otherwise re-run the idempotent step.
 6. For blocked states, re-derive and surface the persisted Session name.
+
+For an implementation round, restart behavior depends on its status:
+
+- `running`: require the original HEAD and rerun IM over any partial file edits.
+- `agent_complete`: stage/finalize the edits, or adopt an already-created commit whose
+  parent and Quorum markers match the round.
+- `committed`: skip IM and continue from the persisted result.
+
+An unrelated commit or unexpected HEAD is never reset or overwritten; the WI fails with
+the checkout left intact for inspection.
 
 ## Failure
 

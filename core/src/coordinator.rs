@@ -9,9 +9,10 @@ use std::path::PathBuf;
 use crate::agent::{AgentError, AgentRequest, AgentRunner, Filesystem};
 use crate::config::Config;
 use crate::convergence;
-use crate::persistence::{Store, StoreError, Transition};
+use crate::persistence::{ImplementationRoundStatus, Store, StoreError, Transition};
 use crate::prompt::{Prompt, PromptError};
 use crate::state::State;
+use crate::worktree::{ImplementationWorkspace, WorktreeError};
 
 /// Errors surfaced by the Coordinator.
 #[derive(Debug, thiserror::Error)]
@@ -22,6 +23,8 @@ pub enum CoordinatorError {
     Prompt(#[from] PromptError),
     #[error(transparent)]
     Agent(#[from] AgentError),
+    #[error(transparent)]
+    Worktree(#[from] WorktreeError),
     #[error("illegal transition {from} -> {to}")]
     IllegalTransition { from: State, to: State },
     #[error("no work item has been loaded")]
@@ -54,8 +57,8 @@ enum ReviewOutcome {
     Accepted,
     /// The Reviewer rejected; loop back to the Implementer.
     Rejected,
-    /// Too many rejected rounds; give up.
-    Exhausted,
+    /// Progress stopped or the iteration bound was reached.
+    Escalated(&'static str),
 }
 
 impl std::fmt::Display for Decision {
@@ -75,8 +78,10 @@ pub struct Coordinator {
     config: Config,
     store: Store,
     runner: Box<dyn AgentRunner>,
+    implementation_workspace: Box<dyn ImplementationWorkspace>,
     /// Working directory used as the sandbox cwd for agent invocations.
     workspace: PathBuf,
+    implementation_allowed_dirs: Vec<PathBuf>,
     /// The work item id, used to derive session names (see `docs/sessions.md`).
     wi_id: String,
     state: State,
@@ -91,6 +96,7 @@ impl Coordinator {
         config: Config,
         store: Store,
         runner: Box<dyn AgentRunner>,
+        implementation_workspace: Box<dyn ImplementationWorkspace>,
         workspace: PathBuf,
         wi_id: impl Into<String>,
     ) -> Result<Coordinator, CoordinatorError> {
@@ -99,10 +105,17 @@ impl Coordinator {
             config,
             store,
             runner,
+            implementation_workspace,
             workspace,
+            implementation_allowed_dirs: Vec::new(),
             wi_id: wi_id.into(),
             state,
         })
+    }
+
+    pub fn with_implementation_allowed_dirs(mut self, directories: Vec<PathBuf>) -> Coordinator {
+        self.implementation_allowed_dirs = directories;
+        self
     }
 
     /// The current state of the WI.
@@ -235,6 +248,7 @@ impl Coordinator {
                 cwd: self.workspace.clone(),
                 filesystem: Filesystem::ReadOnly,
                 model,
+                additional_dirs: vec![],
             };
             let output = self.invoke(&req)?;
             let trimmed = output.trim();
@@ -276,6 +290,7 @@ impl Coordinator {
                 cwd: self.workspace.clone(),
                 filesystem: Filesystem::ReadOnly,
                 model,
+                additional_dirs: vec![],
             };
             let output = self.invoke(&req)?;
             self.store.save_candidate(&slot, iteration, &output)?;
@@ -315,6 +330,7 @@ impl Coordinator {
             cwd: self.workspace.clone(),
             filesystem: Filesystem::ReadOnly,
             model: self.config.models.coordinator.clone(),
+            additional_dirs: vec![],
         };
         let output = self.invoke(&req)?;
         let merged = convergence::parse_merge(&output);
@@ -354,25 +370,80 @@ impl Coordinator {
             .map(|(text, _)| text)
             .unwrap_or_default();
 
-        let rendered = Prompt::implementer().render(&[
-            ("work_item", &work_item),
-            ("plan", &plan),
-            ("feedback", &feedback),
-        ])?;
-        let req = AgentRequest {
-            role: "IM".to_string(),
-            prompt: rendered,
-            cwd: self.workspace.clone(),
-            filesystem: Filesystem::ReadWrite,
-            model: self.config.models.implementer.clone(),
-        };
-        let output = self.invoke(&req)?;
-
-        // Derive the adversarial iteration from committed review progress, so a
-        // retry before the next review is recorded reuses the same iteration
-        // (idempotent) rather than creating a phantom unreviewed iteration.
         let iteration = self.store.review_count()?;
-        self.store.save_implementation(iteration, &output)?;
+        let mut round = match self.store.implementation_round(iteration)? {
+            Some(round) => round,
+            None => {
+                if !self.implementation_workspace.is_clean(&self.workspace)? {
+                    return Err(WorktreeError::DirtyUncommittedWork.into());
+                }
+                let head = self.implementation_workspace.head(&self.workspace)?;
+                if iteration > 0 {
+                    let expected = self
+                        .store
+                        .implementation_round(iteration - 1)?
+                        .and_then(|previous| previous.result_commit)
+                        .ok_or(CoordinatorError::NoImplementation)?;
+                    if head != expected {
+                        return Err(WorktreeError::UnexpectedHead {
+                            expected,
+                            actual: head,
+                        }
+                        .into());
+                    }
+                }
+                self.store.reserve_implementation_round(iteration, &head)?
+            }
+        };
+
+        if round.status == ImplementationRoundStatus::Committed {
+            return Ok(());
+        }
+
+        if round.status == ImplementationRoundStatus::Running {
+            let head = self.implementation_workspace.head(&self.workspace)?;
+            if head != round.start_commit {
+                return Err(WorktreeError::UnexpectedHead {
+                    expected: round.start_commit,
+                    actual: head,
+                }
+                .into());
+            }
+            let rendered = Prompt::implementer().render(&[
+                ("work_item", &work_item),
+                ("plan", &plan),
+                ("feedback", &feedback),
+            ])?;
+            let req = AgentRequest {
+                role: "IM".to_string(),
+                prompt: rendered,
+                cwd: self.workspace.clone(),
+                filesystem: Filesystem::ReadWrite,
+                model: self.config.models.implementer.clone(),
+                additional_dirs: self.implementation_allowed_dirs.clone(),
+            };
+            let output = self.invoke(&req)?;
+            let head_after_agent = self.implementation_workspace.head(&self.workspace)?;
+            if head_after_agent != round.start_commit {
+                return Err(WorktreeError::UnexpectedHead {
+                    expected: round.start_commit,
+                    actual: head_after_agent,
+                }
+                .into());
+            }
+            self.store
+                .mark_implementation_agent_complete(iteration, &output)?;
+            round.status = ImplementationRoundStatus::AgentComplete;
+        }
+
+        let result = self.implementation_workspace.finalize(
+            &self.workspace,
+            self.store.work_item_id(),
+            &self.wi_id,
+            &round,
+        )?;
+        self.store
+            .complete_implementation_round(iteration, &result.commit, &result.tree)?;
         Ok(())
     }
 
@@ -403,6 +474,7 @@ impl Coordinator {
             cwd: self.workspace.clone(),
             filesystem: Filesystem::ReadOnly,
             model: self.config.models.reviewer.clone(),
+            additional_dirs: vec![],
         };
         let output = self.invoke(&req)?;
         let review = convergence::parse_review(&output);
@@ -411,9 +483,16 @@ impl Coordinator {
 
         if review.accepted {
             Ok(ReviewOutcome::Accepted)
+        } else if iteration > 0
+            && self
+                .store
+                .implementation_tree(iteration)?
+                .zip(self.store.implementation_tree(iteration - 1)?)
+                .is_some_and(|(current, previous)| current == previous)
+        {
+            Ok(ReviewOutcome::Escalated("implementation unchanged"))
         } else if iteration + 1 >= self.config.limits.adversarial_max_iters {
-            // Too many rejected rounds: give up.
-            Ok(ReviewOutcome::Exhausted)
+            Ok(ReviewOutcome::Escalated("max adversarial iterations"))
         } else {
             Ok(ReviewOutcome::Rejected)
         }
@@ -451,8 +530,8 @@ impl Coordinator {
             return Ok(self.state);
         }
         match self.compute_next() {
-            Ok(next) => {
-                let reason = format!("auto: {} -> {next}", self.state);
+            Ok((next, detail)) => {
+                let reason = detail.unwrap_or_else(|| format!("auto: {} -> {next}", self.state));
                 self.transition_to(next, &reason)
             }
             // Database failures are fundamental — do not mask them as Failed.
@@ -463,14 +542,14 @@ impl Coordinator {
 
     /// Compute the next state for the current autonomous state, performing the
     /// agent work that state requires.
-    fn compute_next(&mut self) -> Result<State, CoordinatorError> {
+    fn compute_next(&mut self) -> Result<(State, Option<String>), CoordinatorError> {
         use State::*;
-        let next = match self.state {
+        let (next, detail) = match self.state {
             Intake => {
                 if self.store.work_item()?.is_none() {
                     return Err(CoordinatorError::NoWorkItem);
                 }
-                Planning
+                (Planning, None)
             }
             Planning => {
                 // Intake questions gate: only on the first planning pass (before
@@ -479,48 +558,53 @@ impl Coordinator {
                 if self.store.max_candidate_iteration()?.is_none() {
                     if let Some(questions) = self.run_intake_questions()? {
                         self.store.set_questions(&questions)?;
-                        IntakeReview
+                        (IntakeReview, None)
                     } else {
                         self.run_planners()?;
-                        Converging
+                        (Converging, None)
                     }
                 } else {
                     self.run_planners()?;
-                    Converging
+                    (Converging, None)
                 }
             }
             Converging => {
                 if self.run_merge()? {
                     // Converged: proceed to the plan gate (or straight to build).
                     if self.config.reviews.plan_review {
-                        PlanReview
+                        (PlanReview, None)
                     } else {
-                        Implementing
+                        (Implementing, None)
                     }
                 } else {
                     // Not converged: loop back for another planning round.
-                    Planning
+                    (Planning, None)
                 }
             }
             Implementing => {
                 self.run_implementer()?;
-                Reviewing
+                (Reviewing, None)
             }
             Reviewing => match self.run_reviewer()? {
                 ReviewOutcome::Accepted => {
                     if self.config.reviews.work_review {
-                        WorkReview
+                        (WorkReview, None)
                     } else {
-                        Done
+                        (Done, None)
                     }
                 }
-                ReviewOutcome::Rejected => Implementing,
-                ReviewOutcome::Exhausted => Failed,
+                ReviewOutcome::Rejected => (Implementing, None),
+                ReviewOutcome::Escalated(cause) => (
+                    WorkReview,
+                    Some(format!("escalated to WorkReview: {cause}")),
+                ),
             },
             // Not autonomous; the caller returns early for these.
-            IntakeReview | PlanReview | WorkReview | Done | Failed | Abandoned => self.state,
+            IntakeReview | PlanReview | WorkReview | Done | Failed | Abandoned => {
+                (self.state, None)
+            }
         };
-        Ok(next)
+        Ok((next, detail))
     }
 
     /// Move the WI to `Failed`, recording the cause. `Failed` is terminal but the
@@ -564,8 +648,56 @@ mod tests {
     use super::*;
     use crate::agent::{AgentError, AgentRequest, EchoRunner};
     use crate::persistence::Database;
+    use crate::worktree::{ImplementationWorkspace, RoundGitResult};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+
+    struct FakeImplementationWorkspace {
+        head: Mutex<String>,
+        stable_tree: bool,
+    }
+
+    impl FakeImplementationWorkspace {
+        fn new(stable_tree: bool) -> FakeImplementationWorkspace {
+            FakeImplementationWorkspace {
+                head: Mutex::new("base-commit".to_string()),
+                stable_tree,
+            }
+        }
+    }
+
+    impl ImplementationWorkspace for FakeImplementationWorkspace {
+        fn head(&self, _worktree: &std::path::Path) -> Result<String, WorktreeError> {
+            Ok(self.head.lock().unwrap().clone())
+        }
+
+        fn is_clean(&self, _worktree: &std::path::Path) -> Result<bool, WorktreeError> {
+            Ok(true)
+        }
+
+        fn finalize(
+            &self,
+            _worktree: &std::path::Path,
+            _work_item_id: &crate::persistence::WorkItemId,
+            _slug: &str,
+            round: &crate::persistence::ImplementationRound,
+        ) -> Result<RoundGitResult, WorktreeError> {
+            let commit = format!("round-{}", round.iteration);
+            *self.head.lock().unwrap() = commit.clone();
+            Ok(RoundGitResult {
+                commit,
+                tree: if self.stable_tree {
+                    "stable-tree".to_string()
+                } else {
+                    format!("tree-{}", round.iteration)
+                },
+            })
+        }
+    }
+
+    fn fake_workspace() -> Box<dyn ImplementationWorkspace> {
+        Box::new(FakeImplementationWorkspace::new(false))
+    }
 
     fn coordinator_with_wi(config: Config) -> (Coordinator, tempfile::TempDir) {
         let workspace = tempfile::tempdir().unwrap();
@@ -575,6 +707,7 @@ mod tests {
             config,
             store,
             Box::new(EchoRunner),
+            fake_workspace(),
             workspace.path().into(),
             "test-wi",
         )
@@ -637,6 +770,7 @@ mod tests {
             Config::default(),
             store,
             Box::new(EchoRunner),
+            fake_workspace(),
             PathBuf::from("."),
             "test-wi",
         )
@@ -710,6 +844,7 @@ mod tests {
             Config::default(),
             store,
             Box::new(runner),
+            fake_workspace(),
             PathBuf::from("."),
             "test-wi",
         )
@@ -744,6 +879,7 @@ mod tests {
             config,
             store,
             Box::new(runner),
+            fake_workspace(),
             PathBuf::from("."),
             "test-wi",
         )
@@ -793,12 +929,28 @@ mod tests {
     }
 
     fn coordinator_with_runner(config: Config, runner: Box<dyn AgentRunner>) -> Coordinator {
+        coordinator_with_runner_and_workspace(config, runner, fake_workspace())
+    }
+
+    fn coordinator_with_runner_and_workspace(
+        config: Config,
+        runner: Box<dyn AgentRunner>,
+        implementation_workspace: Box<dyn ImplementationWorkspace>,
+    ) -> Coordinator {
         let workspace = tempfile::tempdir().unwrap();
         // Leak the tempdir so the workspace path stays valid for the test.
         let path = workspace.keep();
         let mut store = Store::open_in_memory().unwrap();
         store.set_work_item("# WI").unwrap();
-        Coordinator::new(config, store, runner, path, "test-wi").unwrap()
+        Coordinator::new(
+            config,
+            store,
+            runner,
+            implementation_workspace,
+            path,
+            "test-wi",
+        )
+        .unwrap()
     }
 
     /// A runner that errors for the first `fail_times` calls, then delegates to
@@ -960,7 +1112,7 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_exhausts_to_failed() {
+    fn reviewer_exhausts_to_forced_work_review() {
         let mut config = Config::default();
         config.reviews.plan_review = false;
         config.reviews.work_review = false;
@@ -970,10 +1122,80 @@ mod tests {
         let reviews = runner.reviews.clone();
         let mut co = coordinator_with_runner(config, Box::new(runner));
 
-        assert_eq!(co.run_until_blocked().unwrap(), State::Failed);
+        assert_eq!(co.run_until_blocked().unwrap(), State::WorkReview);
         // Bounded to 2 review rounds (0, 1), both rejected.
         assert_eq!(reviews.load(Ordering::SeqCst), 2);
-        assert!(co.state().is_terminal());
+        assert!(!co.state().is_terminal());
+    }
+
+    #[test]
+    fn unchanged_consecutive_trees_force_work_review() {
+        let mut config = Config::default();
+        config.reviews.plan_review = false;
+        config.reviews.work_review = false;
+        config.limits.adversarial_max_iters = 5;
+        let runner = ReviewRunner::new(usize::MAX);
+        let reviews = runner.reviews.clone();
+        let mut co = coordinator_with_runner_and_workspace(
+            config,
+            Box::new(runner),
+            Box::new(FakeImplementationWorkspace::new(true)),
+        );
+
+        assert_eq!(co.run_until_blocked().unwrap(), State::WorkReview);
+        assert_eq!(reviews.load(Ordering::SeqCst), 2);
+        assert!(co
+            .history()
+            .unwrap()
+            .last()
+            .unwrap()
+            .reason
+            .contains("implementation unchanged"));
+    }
+
+    #[test]
+    fn agent_complete_round_resumes_without_rerunning_implementer() {
+        struct CountingRunner(Arc<AtomicUsize>);
+
+        impl AgentRunner for CountingRunner {
+            fn run(&self, _req: &AgentRequest) -> Result<String, AgentError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok("unexpected".to_string())
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut store = Store::open_in_memory().unwrap();
+        store.set_work_item("# WI").unwrap();
+        store.set_plan("the plan", "").unwrap();
+        store
+            .reserve_implementation_round(0, "base-commit")
+            .unwrap();
+        store
+            .mark_implementation_agent_complete(0, "persisted summary")
+            .unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut co = Coordinator::new(
+            Config::default(),
+            store,
+            Box::new(CountingRunner(calls.clone())),
+            fake_workspace(),
+            workspace.path().to_path_buf(),
+            "test-wi",
+        )
+        .unwrap();
+
+        co.run_implementer().unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            co.store.latest_implementation().unwrap(),
+            Some((0, "persisted summary".to_string()))
+        );
+        assert_eq!(
+            co.store.implementation_round(0).unwrap().unwrap().status,
+            ImplementationRoundStatus::Committed
+        );
     }
 
     #[test]
@@ -1034,6 +1256,7 @@ mod tests {
             Config::default(),
             store,
             Box::new(EchoRunner),
+            fake_workspace(),
             workspace.path().into(),
             "test-wi",
         )
@@ -1068,6 +1291,7 @@ mod tests {
             Config::default(),
             store,
             Box::new(EchoRunner),
+            fake_workspace(),
             workspace.path().into(),
             "test-wi",
         )
@@ -1166,6 +1390,7 @@ mod tests {
                 Config::default(),
                 store,
                 Box::new(EchoRunner),
+                fake_workspace(),
                 dir.path().into(),
                 "test-wi",
             )
@@ -1182,6 +1407,7 @@ mod tests {
             Config::default(),
             store,
             Box::new(EchoRunner),
+            fake_workspace(),
             dir.path().into(),
             "test-wi",
         )

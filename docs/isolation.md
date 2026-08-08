@@ -50,6 +50,7 @@ Each agent run is one non-interactive `copilot` call:
 ```
 # IM (read/write): cwd = linked worktree root, sandbox allows writes here + temp
 copilot --sandbox --experimental --no-ask-user --allow-all-tools \
+        --add-dir "<absolute common Git directory>" \
         --deny-tool "<destructive ops>" -p "<prompt>"
 
 # PL/RV (read-only): cwd = read-only inputs
@@ -62,14 +63,13 @@ network, and deny-tool policy come from the `sandbox:` config block (see [config
 
 ## Recovery interplay
 
-The sandbox confines every agent's writes to the linked worktree. Its `.git` file points
-to the context repository's external Git directory; granting sandbox access for Git
-commands and per-round commits is specified separately. Combined with recoverable
-worktree setup and atomic database transitions, this keeps each step resumable (see
+The sandbox confines normal agent writes to the linked worktree. Its `.git` file points
+to an external shared Git directory, resolved with
+`git rev-parse --path-format=absolute --git-common-dir`. Quorum grants that exact path to
+IM with `--add-dir` so Git commands work in the linked checkout. PL and RV remain
+read-only and receive no additional writable directory. Combined with recoverable
+worktree setup and the per-round protocol, this keeps each step resumable (see
 [persistence](persistence.md)).
-
-Until that Git-directory access is added, agent-invoked Git commands such as `git status`
-may be denied even though normal file reads, edits, and tests inside the worktree work.
 
 ## Cloud sandbox (future)
 

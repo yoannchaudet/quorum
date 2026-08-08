@@ -30,6 +30,8 @@ pub struct AgentRequest {
     pub filesystem: Filesystem,
     /// The model id to run, if configured. Empty means use the CLI default.
     pub model: String,
+    /// Additional sandbox paths required by this invocation.
+    pub additional_dirs: Vec<PathBuf>,
 }
 
 /// Errors from running an agent.
@@ -85,6 +87,10 @@ impl CopilotRunner {
             args.push("--sandbox".to_string());
             if self.sandbox.experimental {
                 args.push("--experimental".to_string());
+            }
+            for directory in &req.additional_dirs {
+                args.push("--add-dir".to_string());
+                args.push(directory.display().to_string());
             }
         }
         args.push("--no-ask-user".to_string());
@@ -175,6 +181,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             filesystem: Filesystem::ReadOnly,
             model: String::new(),
+            additional_dirs: vec![],
         }
     }
 
@@ -223,6 +230,29 @@ mod tests {
         assert!(!args.contains(&"--allow-tool".to_string()));
         // The deny-list still applies even with allow-all.
         assert!(args.contains(&"shell(rm)".to_string()));
+    }
+
+    #[test]
+    fn sandbox_includes_additional_directories() {
+        let runner = CopilotRunner::new(Sandbox::default());
+        let mut request = req();
+        request.additional_dirs = vec![PathBuf::from("/repo/.git")];
+        let args = runner.args(&request);
+        let position = args.iter().position(|arg| arg == "--add-dir").unwrap();
+        assert_eq!(args[position + 1], "/repo/.git");
+    }
+
+    #[test]
+    fn disabled_sandbox_omits_additional_directories() {
+        let runner = CopilotRunner::new(Sandbox {
+            enabled: false,
+            experimental: false,
+            deny_tools: vec![],
+        });
+        let mut request = req();
+        request.additional_dirs = vec![PathBuf::from("/repo/.git")];
+        let args = runner.args(&request);
+        assert!(!args.contains(&"--add-dir".to_string()));
     }
 
     #[test]

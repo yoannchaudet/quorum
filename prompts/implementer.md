@@ -16,6 +16,8 @@ in your workspace.
 - Follow the Plan. If the Plan is wrong or infeasible, do the smallest correct thing and
   record the deviation in your summary.
 - You have **read/write** access **confined to the workspace**. Make all changes there.
+- Leave changes uncommitted. Do not run `git commit`; the Coordinator owns staging and
+  commit creation for recovery and attribution.
 - Honor any repository conventions and instructions you find in the workspace.
 - Keep changes focused on the Plan; do not do unrelated work.
 - Incorporate prior review feedback when present (adversarial loop).

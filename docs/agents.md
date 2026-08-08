@@ -48,7 +48,10 @@ Exact model IDs are set in config; the docs fix the *number and roles*, not the 
 - IM produces the implementation from the accepted Plan.
 - RV is a **different** model that adversarially reviews IM's output.
 - **Adversarial loop**: `Implementing` → `Reviewing` → `Implementing` until RV accepts
-  (or max iterations, then `Failed`).
+  or the CO forces `WorkReview` because two rejected rounds have the same Git tree or
+  the maximum iteration count is reached.
+- The CO, not IM, stages and commits each changed round. Empty rounds retain the
+  existing commit while recording its tree SHA.
 
 ## Human Intervention (HI)
 

@@ -115,6 +115,13 @@ mod tests {
     }
 
     #[test]
+    fn implementer_leaves_commit_ownership_to_coordinator() {
+        assert!(Prompt::implementer()
+            .body
+            .contains("Do not run `git commit`"));
+    }
+
+    #[test]
     fn render_substitutes_placeholders() {
         let p = Prompt {
             id: "x".into(),

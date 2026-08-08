@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 /// The global database schema version.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Stable internal identity for a work item.
@@ -78,6 +78,33 @@ pub struct WorktreeRecord {
     pub ready: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImplementationRoundStatus {
+    Running,
+    AgentComplete,
+    Committed,
+}
+
+impl ImplementationRoundStatus {
+    fn from_str(value: &str) -> Option<ImplementationRoundStatus> {
+        match value {
+            "running" => Some(ImplementationRoundStatus::Running),
+            "agent_complete" => Some(ImplementationRoundStatus::AgentComplete),
+            "committed" => Some(ImplementationRoundStatus::Committed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImplementationRound {
+    pub iteration: u32,
+    pub start_commit: String,
+    pub status: ImplementationRoundStatus,
+    pub result_commit: Option<String>,
+    pub tree_sha: Option<String>,
+}
+
 /// Errors from the persistence layer.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -91,6 +118,8 @@ pub enum StoreError {
     UnsupportedSchema { found: i64, expected: i64 },
     #[error("path is not valid UTF-8: {0}")]
     NonUtf8Path(std::path::PathBuf),
+    #[error("stored implementation round status {0:?} is invalid")]
+    InvalidRoundStatus(String),
 }
 
 /// A recorded state transition, in insertion order.
@@ -270,6 +299,20 @@ impl Database {
                 status       TEXT NOT NULL CHECK (status IN ('creating', 'ready')),
                 created_at   TEXT NOT NULL,
                 updated_at   TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS implementation_rounds (
+                work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                iteration    INTEGER NOT NULL,
+                start_commit TEXT NOT NULL,
+                status       TEXT NOT NULL CHECK (
+                    status IN ('running', 'agent_complete', 'committed')
+                ),
+                result_commit TEXT,
+                tree_sha      TEXT,
+                created_at    TEXT NOT NULL,
+                updated_at    TEXT NOT NULL,
+                PRIMARY KEY (work_item_id, iteration)
             );
             "#,
         )?;
@@ -773,6 +816,120 @@ impl Store {
         Ok(())
     }
 
+    pub fn implementation_round(
+        &self,
+        iteration: u32,
+    ) -> Result<Option<ImplementationRound>, StoreError> {
+        match self.conn.query_row(
+            "SELECT start_commit, status, result_commit, tree_sha
+             FROM implementation_rounds
+             WHERE work_item_id = ?1 AND iteration = ?2",
+            params![self.work_item_id.as_str(), iteration],
+            |row| {
+                let status: String = row.get(1)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    status,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        ) {
+            Ok((start_commit, status, result_commit, tree_sha)) => {
+                let status = ImplementationRoundStatus::from_str(&status)
+                    .ok_or(StoreError::InvalidRoundStatus(status))?;
+                Ok(Some(ImplementationRound {
+                    iteration,
+                    start_commit,
+                    status,
+                    result_commit,
+                    tree_sha,
+                }))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn reserve_implementation_round(
+        &mut self,
+        iteration: u32,
+        start_commit: &str,
+    ) -> Result<ImplementationRound, StoreError> {
+        let ts = now_millis();
+        self.conn.execute(
+            "INSERT INTO implementation_rounds
+             (work_item_id, iteration, start_commit, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'running', ?4, ?4)",
+            params![self.work_item_id.as_str(), iteration, start_commit, ts],
+        )?;
+        Ok(ImplementationRound {
+            iteration,
+            start_commit: start_commit.to_string(),
+            status: ImplementationRoundStatus::Running,
+            result_commit: None,
+            tree_sha: None,
+        })
+    }
+
+    pub fn mark_implementation_agent_complete(
+        &mut self,
+        iteration: u32,
+        summary: &str,
+    ) -> Result<(), StoreError> {
+        let ts = now_millis();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO implementations (work_item_id, iteration, summary, ts)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(work_item_id, iteration)
+             DO UPDATE SET summary = excluded.summary, ts = excluded.ts",
+            params![self.work_item_id.as_str(), iteration, summary, ts],
+        )?;
+        tx.execute(
+            "UPDATE implementation_rounds
+             SET status = 'agent_complete', updated_at = ?1
+             WHERE work_item_id = ?2 AND iteration = ?3",
+            params![ts, self.work_item_id.as_str(), iteration],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn complete_implementation_round(
+        &mut self,
+        iteration: u32,
+        result_commit: &str,
+        tree_sha: &str,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE implementation_rounds
+             SET status = 'committed', result_commit = ?1, tree_sha = ?2, updated_at = ?3
+             WHERE work_item_id = ?4 AND iteration = ?5",
+            params![
+                result_commit,
+                tree_sha,
+                now_millis(),
+                self.work_item_id.as_str(),
+                iteration
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn implementation_tree(&self, iteration: u32) -> Result<Option<String>, StoreError> {
+        match self.conn.query_row(
+            "SELECT tree_sha FROM implementation_rounds
+             WHERE work_item_id = ?1 AND iteration = ?2 AND status = 'committed'",
+            params![self.work_item_id.as_str(), iteration],
+            |row| row.get::<_, Option<String>>(0),
+        ) {
+            Ok(tree) => Ok(tree),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub fn latest_implementation(&self) -> Result<Option<(u32, String)>, StoreError> {
         match self.conn.query_row(
             "SELECT iteration, summary FROM implementations
@@ -1030,6 +1187,33 @@ mod tests {
     }
 
     #[test]
+    fn migrates_v3_by_adding_implementation_rounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quorum.db");
+        let db = Database::open(&path).unwrap();
+        db.conn
+            .execute_batch(
+                "DROP TABLE implementation_rounds;
+                 UPDATE meta SET value = '3' WHERE key = 'schema_version';",
+            )
+            .unwrap();
+        drop(db);
+
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        let table: String = db
+            .conn
+            .query_row(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND name = 'implementation_rounds'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table, "implementation_rounds");
+    }
+
+    #[test]
     fn get_or_create_returns_stable_id() {
         let mut db = Database::open_in_memory().unwrap();
         let repository = register(&mut db, "/repo");
@@ -1181,5 +1365,38 @@ mod tests {
             ]
         );
         assert_eq!(store.candidates(1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn persists_implementation_round_lifecycle_and_tree() {
+        let mut store = Store::open_in_memory().unwrap();
+        let running = store.reserve_implementation_round(0, "start").unwrap();
+        assert_eq!(running.status, ImplementationRoundStatus::Running);
+        assert_eq!(store.implementation_round(0).unwrap(), Some(running));
+
+        store
+            .mark_implementation_agent_complete(0, "implemented")
+            .unwrap();
+        let agent_complete = store.implementation_round(0).unwrap().unwrap();
+        assert_eq!(
+            agent_complete.status,
+            ImplementationRoundStatus::AgentComplete
+        );
+        assert_eq!(
+            store.latest_implementation().unwrap(),
+            Some((0, "implemented".to_string()))
+        );
+
+        store
+            .complete_implementation_round(0, "result", "tree")
+            .unwrap();
+        let committed = store.implementation_round(0).unwrap().unwrap();
+        assert_eq!(committed.status, ImplementationRoundStatus::Committed);
+        assert_eq!(committed.result_commit.as_deref(), Some("result"));
+        assert_eq!(committed.tree_sha.as_deref(), Some("tree"));
+        assert_eq!(
+            store.implementation_tree(0).unwrap().as_deref(),
+            Some("tree")
+        );
     }
 }
