@@ -28,6 +28,18 @@ stable repository ID and its WI associations.
 Unregistering never deletes WIs, filesystem state, branches, or worktrees. WI commands
 remain blocked until that repository is registered again.
 
+## WI worktrees
+
+The first run pins the repository's committed `HEAD` and creates a linked worktree at
+`~/.quorum/state/<work-item-id>/implementation/`. Quorum uses a deterministic branch:
+
+```
+quorum/<sanitized-wi-slug>-<short-work-item-id>
+```
+
+The original checkout and any uncommitted changes in it remain untouched. Worktrees and
+branches are retained when a WI reaches `Done`, `Failed`, or `Abandoned`.
+
 ## Work-item identity
 
 The user-facing WI slug is unique within a repository, not globally. Two repositories

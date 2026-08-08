@@ -26,9 +26,9 @@ The **CO itself (the Rust Core) is not sandboxed** — it is the orchestrator. O
 
 | Role | Filesystem | cwd | Rationale |
 |------|-----------|-----|-----------|
-| PL | read-only | read-only view of WI + assets | Analysis only; plan captured from stdout. |
-| RV | read-only | read-only view of IM output | Reviews; feedback captured from stdout. |
-| IM | read/write | its WI workspace (`implementation/`) | Must write code; writes stay in the workspace. |
+| PL | read-only | WI worktree root | Analysis only; plan captured from stdout. |
+| RV | read-only | WI worktree root | Reviews the real checkout; feedback captured from stdout. |
+| IM | read/write | WI worktree root (`implementation/`) | Must modify the real checkout. |
 
 Because the run is non-interactive (`--no-ask-user`), copilot cannot prompt for tool
 approval and would otherwise deny every action. Tools are therefore granted up front,
@@ -48,7 +48,7 @@ There is no blanket `--allow-all-tools` outside the sandbox.
 Each agent run is one non-interactive `copilot` call:
 
 ```
-# IM (read/write): cwd = implementation/, sandbox allows writes here + temp
+# IM (read/write): cwd = linked worktree root, sandbox allows writes here + temp
 copilot --sandbox --experimental --no-ask-user --allow-all-tools \
         --deny-tool "<destructive ops>" -p "<prompt>"
 
@@ -62,10 +62,14 @@ network, and deny-tool policy come from the `sandbox:` config block (see [config
 
 ## Recovery interplay
 
-The sandbox confines every agent's writes to the WI workspace, so a crashed or killed
-agent can never leave partial files outside `~/.quorum/state/<work-item-id>/`. Combined
-with atomic global-database transactions, this keeps each step recoverable (see
+The sandbox confines every agent's writes to the linked worktree. Its `.git` file points
+to the context repository's external Git directory; granting sandbox access for Git
+commands and per-round commits is specified separately. Combined with recoverable
+worktree setup and atomic database transitions, this keeps each step resumable (see
 [persistence](persistence.md)).
+
+Until that Git-directory access is added, agent-invoked Git commands such as `git status`
+may be denied even though normal file reads, edits, and tests inside the worktree work.
 
 ## Cloud sandbox (future)
 

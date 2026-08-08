@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 /// The global database schema version.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Stable internal identity for a work item.
@@ -27,6 +27,11 @@ impl WorkItemId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(value: impl Into<String>) -> WorkItemId {
+        WorkItemId(value.into())
     }
 }
 
@@ -63,6 +68,16 @@ pub struct RegisteredRepository {
     pub root: std::path::PathBuf,
 }
 
+/// Persisted intent and lifecycle state for a WI's linked Git worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeRecord {
+    pub work_item_id: WorkItemId,
+    pub base_commit: String,
+    pub branch: String,
+    pub path: std::path::PathBuf,
+    pub ready: bool,
+}
+
 /// Errors from the persistence layer.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -74,8 +89,8 @@ pub enum StoreError {
     WorkItemNotFound(WorkItemId),
     #[error("database schema version {found} is not supported (expected {expected})")]
     UnsupportedSchema { found: i64, expected: i64 },
-    #[error("repository path is not valid UTF-8: {0}")]
-    NonUtf8RepositoryPath(std::path::PathBuf),
+    #[error("path is not valid UTF-8: {0}")]
+    NonUtf8Path(std::path::PathBuf),
 }
 
 /// A recorded state transition, in insertion order.
@@ -246,6 +261,16 @@ impl Database {
 
             CREATE INDEX IF NOT EXISTS events_work_item
                 ON events(work_item_id, id);
+
+            CREATE TABLE IF NOT EXISTS worktrees (
+                work_item_id TEXT PRIMARY KEY REFERENCES work_items(id) ON DELETE CASCADE,
+                base_commit  TEXT NOT NULL,
+                branch       TEXT NOT NULL,
+                path         TEXT NOT NULL UNIQUE,
+                status       TEXT NOT NULL CHECK (status IN ('creating', 'ready')),
+                created_at   TEXT NOT NULL,
+                updated_at   TEXT NOT NULL
+            );
             "#,
         )?;
         Ok(())
@@ -323,7 +348,7 @@ impl Database {
         let root_text = root
             .as_path()
             .to_str()
-            .ok_or_else(|| StoreError::NonUtf8RepositoryPath(root.as_path().to_path_buf()))?;
+            .ok_or_else(|| StoreError::NonUtf8Path(root.as_path().to_path_buf()))?;
         let id = RepositoryId::new();
         let ts = now_millis();
         let stored_id = self.conn.query_row(
@@ -372,7 +397,7 @@ impl Database {
         let root_text = root
             .as_path()
             .to_str()
-            .ok_or_else(|| StoreError::NonUtf8RepositoryPath(root.as_path().to_path_buf()))?;
+            .ok_or_else(|| StoreError::NonUtf8Path(root.as_path().to_path_buf()))?;
         let sql = if active_only {
             "SELECT id, root FROM repositories WHERE root = ?1 AND registered = 1"
         } else {
@@ -444,6 +469,67 @@ impl Database {
             )
             .map(WorkItemId)
             .map_err(Into::into)
+    }
+
+    /// The persisted worktree intent for a WI, if setup has begun.
+    pub fn worktree(
+        &self,
+        work_item_id: &WorkItemId,
+    ) -> Result<Option<WorktreeRecord>, StoreError> {
+        match self.conn.query_row(
+            "SELECT base_commit, branch, path, status
+             FROM worktrees WHERE work_item_id = ?1",
+            params![work_item_id.as_str()],
+            |row| {
+                Ok(WorktreeRecord {
+                    work_item_id: work_item_id.clone(),
+                    base_commit: row.get(0)?,
+                    branch: row.get(1)?,
+                    path: std::path::PathBuf::from(row.get::<_, String>(2)?),
+                    ready: row.get::<_, String>(3)? == "ready",
+                })
+            },
+        ) {
+            Ok(record) => Ok(Some(record)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Persist worktree creation intent before touching Git.
+    pub fn reserve_worktree(
+        &mut self,
+        work_item_id: &WorkItemId,
+        base_commit: &str,
+        branch: &str,
+        path: &Path,
+    ) -> Result<WorktreeRecord, StoreError> {
+        let path_text = path
+            .to_str()
+            .ok_or_else(|| StoreError::NonUtf8Path(path.to_path_buf()))?;
+        let ts = now_millis();
+        self.conn.execute(
+            "INSERT INTO worktrees
+             (work_item_id, base_commit, branch, path, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'creating', ?5, ?5)",
+            params![work_item_id.as_str(), base_commit, branch, path_text, ts],
+        )?;
+        Ok(WorktreeRecord {
+            work_item_id: work_item_id.clone(),
+            base_commit: base_commit.to_string(),
+            branch: branch.to_string(),
+            path: path.to_path_buf(),
+            ready: false,
+        })
+    }
+
+    /// Mark a reconciled worktree ready for agent use.
+    pub fn mark_worktree_ready(&mut self, work_item_id: &WorkItemId) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE worktrees SET status = 'ready', updated_at = ?1 WHERE work_item_id = ?2",
+            params![now_millis(), work_item_id.as_str()],
+        )?;
+        Ok(())
     }
 
     /// Scope this connection to one work item for Coordinator use.
@@ -930,7 +1016,7 @@ mod tests {
         drop(conn);
 
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 2);
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
         let store = db.into_store(WorkItemId("legacy-wi".to_string())).unwrap();
         assert_eq!(store.work_item().unwrap().as_deref(), Some("# Legacy"));
         assert_eq!(store.current_state().unwrap(), Some(State::Planning));
@@ -940,7 +1026,7 @@ mod tests {
     fn migration_recheck_tolerates_an_already_upgraded_database() {
         let db = Database::open_in_memory().unwrap();
         db.migrate_v1_to_v2().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 2);
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
     }
 
     #[test]
@@ -958,6 +1044,28 @@ mod tests {
             db.work_item_id(&repository.id, "example").unwrap(),
             Some(first)
         );
+    }
+
+    #[test]
+    fn persists_worktree_intent_and_ready_state() {
+        let mut db = Database::open_in_memory().unwrap();
+        let repository = register(&mut db, "/repo");
+        let work_item = db
+            .get_or_create_work_item(&repository.id, "example")
+            .unwrap();
+        let path = Path::new("/state/example/implementation");
+
+        let creating = db
+            .reserve_worktree(&work_item, "abc123", "quorum/example-12345678", path)
+            .unwrap();
+        assert!(!creating.ready);
+        assert_eq!(db.worktree(&work_item).unwrap(), Some(creating.clone()));
+
+        db.mark_worktree_ready(&work_item).unwrap();
+        let ready = db.worktree(&work_item).unwrap().unwrap();
+        assert!(ready.ready);
+        assert_eq!(ready.base_commit, "abc123");
+        assert_eq!(ready.path, path);
     }
 
     #[test]

@@ -11,11 +11,11 @@ Coordinator is scoped to a stable internal work-item ID.
   quorum.db                     # structured state for every WI
   state/<work-item-id>/
     assets/                     # binary image files referenced by the WI
-    implementation/             # IM working output
+    implementation/             # linked Git worktree
 ```
 
 The internal ID is a UUID, independent of the user-facing WI slug. Repository ownership
-will be associated in the database; it does not determine the filesystem path.
+is associated in the database; it does not determine the filesystem path.
 
 ## Schema
 
@@ -32,6 +32,7 @@ will be associated in the database; it does not determine the filesystem path.
 | `reviews` | RV feedback and verdict by WI and iteration. |
 | `sessions` | HI session records by WI and blocked state. |
 | `events` | Append-only audit events per WI. |
+| `worktrees` | Pinned base commit, branch, path, and setup status per WI. |
 
 Every WI-owned row has a foreign key to `work_items` with cascading deletion. WI slugs
 are unique per repository. Composite keys include the WI ID, preventing planners,
@@ -53,7 +54,9 @@ iterations, sessions, or reviews from colliding across WIs.
 - **Single source of truth**: the `states` row for a WI is authoritative.
 - **Idempotent outputs**: deterministic composite keys let a retry replace the same
   planner, implementation, or review iteration.
-- **Confined agent writes**: Local Sandbox restricts file writes to the WI workspace
+- **Recoverable worktree setup**: creation intent is persisted before Git is changed;
+  restart reconciles only matching branches and paths.
+- **Confined agent writes**: Local Sandbox restricts file writes to the linked worktree
   (see [isolation](isolation.md)).
 
 ## Resume after crash

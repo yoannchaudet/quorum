@@ -10,8 +10,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use quorum_core::{
     agent::{AgentRunner, EchoRunner},
-    Config, Coordinator, CopilotRunner, Database, Decision, RegisteredRepository, RepositoryRoot,
-    State, Store, WorkItemId,
+    ensure_worktree, worktree_record, Config, Coordinator, CopilotRunner, Database, Decision,
+    RegisteredRepository, RepositoryRoot, State, Store, WorkItemId,
 };
 
 #[derive(Parser)]
@@ -130,9 +130,12 @@ fn run() -> Result<()> {
             let internal_id = database
                 .get_or_create_work_item(&repository.id, &wi_id)
                 .context("creating work item state")?;
-            let workspace = config.work_item_dir(internal_id.as_str());
-            std::fs::create_dir_all(&workspace)
-                .with_context(|| format!("creating {}", workspace.display()))?;
+            let workspace = config
+                .work_item_dir(internal_id.as_str())
+                .join("implementation");
+            let worktree =
+                ensure_worktree(&mut database, &repository, &internal_id, &wi_id, &workspace)
+                    .context("preparing work item checkout")?;
 
             let mut store = database
                 .into_store(internal_id)
@@ -149,14 +152,13 @@ fn run() -> Result<()> {
             } else {
                 Box::new(CopilotRunner::new(config.sandbox.clone()))
             };
-            let mut co = Coordinator::new(config, store, runner, workspace, wi_id.clone())
+            let mut co = Coordinator::new(config, store, runner, worktree.path, wi_id.clone())
                 .context("initializing coordinator")?;
             co.run_until_blocked().context("advancing work item")?;
             report(&wi_id, &co)?;
         }
         Command::Status { wi } => {
-            let (store, internal_id) = open_work_item(&config, context.as_deref(), &wi)?;
-            let workspace = config.work_item_dir(internal_id.as_str());
+            let (store, _, workspace) = open_work_item(&config, context.as_deref(), &wi, false)?;
             let mut co =
                 Coordinator::new(config, store, Box::new(EchoRunner), workspace, wi.clone())
                     .context("initializing coordinator")?;
@@ -210,8 +212,8 @@ fn resolve_and_continue(
     dry_run: bool,
 ) -> Result<()> {
     validate_wi_id(wi_id)?;
-    let (store, internal_id) = open_work_item(&config, context, wi_id)?;
-    let workspace = config.work_item_dir(internal_id.as_str());
+    let require_worktree = !matches!(decision, Decision::Abandon);
+    let (store, _, workspace) = open_work_item(&config, context, wi_id, require_worktree)?;
     let runner: Box<dyn AgentRunner> = if dry_run {
         Box::new(EchoRunner)
     } else {
@@ -307,17 +309,36 @@ fn open_work_item(
     config: &Config,
     context: Option<&std::path::Path>,
     wi_id: &str,
-) -> Result<(Store, WorkItemId)> {
+    require_worktree: bool,
+) -> Result<(Store, WorkItemId, PathBuf)> {
     validate_wi_id(wi_id)?;
-    let (database, repository) = open_registered_context(config, context)?;
+    let (mut database, repository) = open_registered_context(config, context)?;
     let internal_id = database
         .work_item_id(&repository.id, wi_id)
         .context("looking up work item")?
         .with_context(|| format!("no work item {wi_id}"))?;
+    let workspace = if require_worktree {
+        ensure_worktree(
+            &mut database,
+            &repository,
+            &internal_id,
+            wi_id,
+            &config
+                .work_item_dir(internal_id.as_str())
+                .join("implementation"),
+        )
+        .context("preparing work item checkout")?
+        .path
+    } else {
+        worktree_record(&database, &internal_id)
+            .context("reading worktree state")?
+            .map(|record| record.path)
+            .unwrap_or_else(|| config.work_item_dir(internal_id.as_str()))
+    };
     let store = database
         .into_store(internal_id.clone())
         .context("opening work item state")?;
-    Ok((store, internal_id))
+    Ok((store, internal_id, workspace))
 }
 
 /// Render the current state and, when blocked, the HI resume command (and any

@@ -33,7 +33,7 @@ cli/                  # thin binary: parse args, call Core, render state
 
 | Layer | Owns | Does NOT own |
 |-------|------|--------------|
-| Core | State machine, agent orchestration (CO/PL/IM/RV), persistence, repository discovery/registry, config load, GitHub + `copilot` invocation | Argument parsing, terminal rendering |
+| Core | State machine, agent orchestration (CO/PL/IM/RV), persistence, repository/worktree lifecycle, config load, GitHub + `copilot` invocation | Argument parsing, terminal rendering |
 | CLI | One WI: start/resume, print current state + HI resume commands | Any business logic; multi-WI orchestration |
 | Tauri (future) | Windowing, launching a terminal for HI | Any logic not already in Core |
 
