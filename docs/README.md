@@ -8,15 +8,16 @@ Specifications for Quorum's **Core** and **CLI**. Design-on-paper; no code yet.
 2. [architecture.md](architecture.md) — Core vs CLI, Rust workspace, future Tauri.
 3. [work-items.md](work-items.md) — work-item inputs, GitHub pull, and images.
 4. [repositories.md](repositories.md) — repository context and registration.
-5. [state-machine.md](state-machine.md) — the backbone: states, loops, and human intervention.
-6. [agents.md](agents.md) — Coordinator, Planner quorum, Implementer, and Reviewer.
-7. [isolation.md](isolation.md) — execution isolation: local sandbox + per-role profiles.
-8. [prompts.md](prompts.md) — prompts as markdown files with frontmatter.
-9. [sessions.md](sessions.md) — human intervention through resumable `copilot` sessions.
-10. [config.md](config.md) — `~/.quorum/config.yaml` schema.
-11. [persistence.md](persistence.md) — crash resilience and recovery.
-12. [observability.md](observability.md) — live progress and rich work-item status.
-13. [dev-lifecycle.md](dev-lifecycle.md) — Makefile: `verify` / `verify-full`.
+5. [cli.md](cli.md) — canonical command hierarchy and focused views.
+6. [state-machine.md](state-machine.md) — the backbone: states, loops, and human intervention.
+7. [agents.md](agents.md) — Coordinator, Planner quorum, Implementer, and Reviewer.
+8. [isolation.md](isolation.md) — execution isolation: local sandbox + per-role profiles.
+9. [prompts.md](prompts.md) — prompts as markdown files with frontmatter.
+10. [sessions.md](sessions.md) — human intervention through resumable `copilot` sessions.
+11. [config.md](config.md) — `~/.quorum/config.yaml` schema.
+12. [persistence.md](persistence.md) — crash resilience and recovery.
+13. [observability.md](observability.md) — live progress and rich work-item status.
+14. [dev-lifecycle.md](dev-lifecycle.md) — Makefile: `verify` / `verify-full`.
 
 ## Doc style rules
 

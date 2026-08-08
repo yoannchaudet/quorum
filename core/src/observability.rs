@@ -184,6 +184,30 @@ pub struct StatusSnapshot {
     pub workspace: WorkspaceSnapshot,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanDocument {
+    pub version: u32,
+    pub work_item: WorkItemIdentitySnapshot,
+    pub state: StateSnapshot,
+    pub plan: String,
+    pub iterations: u32,
+    pub planners: Vec<String>,
+    pub metrics: Option<String>,
+    pub execution: Option<ExecutionCapabilities>,
+    pub feedback: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImplementationDocument {
+    pub version: u32,
+    pub work_item: WorkItemIdentitySnapshot,
+    pub state: StateSnapshot,
+    pub implementations: Vec<ImplementationSnapshot>,
+    pub reviews: Vec<ReviewSnapshot>,
+    pub artifacts: Vec<ArtifactSnapshot>,
+    pub workspace: WorkspaceSnapshot,
+}
+
 impl StatusSnapshot {
     pub fn load(store: &Store) -> Result<StatusSnapshot, StoreError> {
         let mut snapshot = store.status_snapshot()?;
@@ -193,6 +217,32 @@ impl StatusSnapshot {
             snapshot.workspace.clean = crate::worktree::worktree_is_clean(path).ok();
         }
         Ok(snapshot)
+    }
+
+    pub fn plan_document(&self) -> Option<PlanDocument> {
+        Some(PlanDocument {
+            version: 1,
+            work_item: self.identity.clone(),
+            state: self.state.clone(),
+            plan: self.planning.plan.clone()?,
+            iterations: self.planning.iterations,
+            planners: self.planning.planners.clone(),
+            metrics: self.planning.metrics.clone(),
+            execution: self.planning.execution.clone(),
+            feedback: self.planning.feedback.clone(),
+        })
+    }
+
+    pub fn implementation_document(&self) -> ImplementationDocument {
+        ImplementationDocument {
+            version: 1,
+            work_item: self.identity.clone(),
+            state: self.state.clone(),
+            implementations: self.implementations.clone(),
+            reviews: self.reviews.clone(),
+            artifacts: self.artifacts.clone(),
+            workspace: self.workspace.clone(),
+        }
     }
 }
 

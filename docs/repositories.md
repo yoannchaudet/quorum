@@ -17,9 +17,9 @@ for the top-level directory and stores its canonical path.
 
 | Command | Behavior |
 |---------|----------|
-| `quorum repo register [<path>]` | Add or reactivate the containing repository. |
-| `quorum repo unregister [<path>]` | Remove it from the active allow-list. |
-| `quorum repo list` | List active repository IDs and canonical roots. |
+| `quorum repository register [<path>]` | Add or reactivate the containing repository. |
+| `quorum repository unregister [<path>]` | Remove it from the active allow-list. |
+| `quorum repository list` | List active repository IDs and canonical roots. |
 
 For register/unregister, the explicit path overrides `--context`, which overrides cwd.
 Registration is idempotent. Re-registering a previously removed root restores the same

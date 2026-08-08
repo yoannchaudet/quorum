@@ -22,12 +22,12 @@ pub use capabilities::{
 pub use config::Config;
 pub use coordinator::{Coordinator, Decision};
 pub use observability::{
-    ActivityEvent, ActivityKind, ActivityObserver, ArtifactSnapshot, NoopActivityObserver,
-    StatusSnapshot,
+    ActivityEvent, ActivityKind, ActivityObserver, ArtifactSnapshot, ImplementationDocument,
+    NoopActivityObserver, PlanDocument, StatusSnapshot,
 };
 pub use persistence::{
     Artifact, Database, ImplementationRound, ImplementationRoundStatus, RegisteredRepository,
-    RepositoryId, Store, Transition, WorkItemId, WorktreeRecord,
+    RepositoryId, Store, Transition, WorkItemId, WorkItemSummary, WorktreeRecord,
 };
 pub use prompt::Prompt;
 pub use repository::{RepositoryError, RepositoryRoot};

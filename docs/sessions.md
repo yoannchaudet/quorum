@@ -28,10 +28,14 @@ When a work item enters a blocked state, the CLI:
    > `copilot` has no non-interactive flag to create a session with a chosen
    > name, so the human assigns the name once via `/rename`; Quorum supplies the
    > name to use so it stays consistent for the block.
-3. The human resolves the block with a Quorum command (`quorum approve` /
-   `reject` / `answer` / `abandon`), and the Coordinator resumes autonomous progress.
-   `quorum reject <work-item> ["feedback"]` (or `--file`) carries revision guidance
-   into the next planning or implementation pass.
+3. The human resolves the block with the state-specific command:
+   - `quorum intake answer <work-item> ...`;
+   - `quorum plan approve|reject <work-item>`;
+   - `quorum implementation approve|reject <work-item>`;
+   - `quorum work-item abandon <work-item>`.
+
+   Rejection accepts optional positional feedback or `--file` and carries that
+   guidance into the next planning or implementation pass.
 
 ## Tauri UX (future)
 

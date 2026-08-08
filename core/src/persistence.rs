@@ -73,6 +73,14 @@ pub struct RegisteredRepository {
     pub root: std::path::PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkItemSummary {
+    pub id: WorkItemId,
+    pub slug: String,
+    pub state: State,
+    pub updated_at: u64,
+}
+
 /// Persisted intent and lifecycle state for a work item's linked Git worktree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeRecord {
@@ -135,6 +143,8 @@ pub enum StoreError {
     UnknownState(String),
     #[error("work item {0} does not exist")]
     WorkItemNotFound(WorkItemId),
+    #[error("work item {slug:?} already exists in this repository")]
+    WorkItemAlreadyExists { slug: String },
     #[error("database schema version {found} is not supported (expected {expected})")]
     UnsupportedSchema { found: i64, expected: i64 },
     #[error("path is not valid UTF-8: {0}")]
@@ -605,6 +615,67 @@ impl Database {
             )
             .map(WorkItemId)
             .map_err(Into::into)
+    }
+
+    /// Create a new repository-scoped work item, rejecting an existing slug.
+    pub fn create_work_item(
+        &mut self,
+        repository_id: &RepositoryId,
+        slug: &str,
+        text: &str,
+    ) -> Result<WorkItemId, StoreError> {
+        if self.work_item_id(repository_id, slug)?.is_some() {
+            return Err(StoreError::WorkItemAlreadyExists {
+                slug: slug.to_string(),
+            });
+        }
+        let id = WorkItemId::new();
+        let ts = now_millis();
+        self.conn.execute(
+            "INSERT INTO work_items (id, repository_id, slug, text, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params![id.as_str(), repository_id.as_str(), slug, text, ts],
+        )?;
+        Ok(id)
+    }
+
+    /// List work items for one repository, most recently active first.
+    pub fn work_items(
+        &self,
+        repository_id: &RepositoryId,
+    ) -> Result<Vec<WorkItemSummary>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT w.id, w.slug, COALESCE(s.state, 'Intake'),
+                    COALESCE(
+                        (SELECT MAX(a.ts) FROM activities a WHERE a.work_item_id = w.id),
+                        CAST(s.updated_at AS INTEGER),
+                        CAST(w.updated_at AS INTEGER)
+                    ) AS latest
+             FROM work_items w
+             LEFT JOIN states s ON s.work_item_id = w.id
+             WHERE w.repository_id = ?1
+             ORDER BY latest DESC, w.slug ASC",
+        )?;
+        let rows = stmt.query_map(params![repository_id.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut summaries = Vec::new();
+        for row in rows {
+            let (id, slug, state, updated_at) = row?;
+            let state = State::from_db_str(&state).ok_or(StoreError::UnknownState(state))?;
+            summaries.push(WorkItemSummary {
+                id: WorkItemId(id),
+                slug,
+                state,
+                updated_at: updated_at as u64,
+            });
+        }
+        Ok(summaries)
     }
 
     /// The persisted worktree intent for a work item, if setup has begun.
@@ -1875,6 +1946,32 @@ mod tests {
 
         let reactivated = register(&mut db, "/repo");
         assert_eq!(reactivated, first);
+    }
+
+    #[test]
+    fn creates_and_lists_repository_work_items() {
+        let mut db = Database::open_in_memory().unwrap();
+        let repository = register(&mut db, "/repo");
+        let first = db
+            .create_work_item(&repository.id, "first", "# First")
+            .unwrap();
+        assert!(matches!(
+            db.create_work_item(&repository.id, "first", "# Duplicate"),
+            Err(StoreError::WorkItemAlreadyExists { .. })
+        ));
+        {
+            let mut store = db.into_store(first.clone()).unwrap();
+            store
+                .record_transition(None, State::PlanReview, "ready")
+                .unwrap();
+            db = Database { conn: store.conn };
+        }
+
+        let summaries = db.work_items(&repository.id).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, first);
+        assert_eq!(summaries[0].slug, "first");
+        assert_eq!(summaries[0].state, State::PlanReview);
     }
 
     #[test]
