@@ -2,7 +2,7 @@
 id: merge
 role: Coordinator
 model-target: coordinator
-version: 2
+version: 3
 purpose: Merge candidate plans into one converged Plan and report convergence.
 ---
 
@@ -25,6 +25,8 @@ a single, coherent **Plan** for the work item.
 - **Work item**: `{{work_item}}`
 - **Candidate plans** (from each Planner): `{{candidates}}`
 - **Previous merged plan** (may be empty, for convergence): `{{previous_plan}}`
+- **Human rejection feedback** (may be empty; the merged Plan must address it):
+  `{{human_feedback}}`
 
 ## Output
 

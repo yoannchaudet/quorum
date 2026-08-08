@@ -73,6 +73,12 @@ enum Command {
     Reject {
         /// The user-facing work-item slug.
         work_item: String,
+        /// Feedback for the next planning or implementation pass (mutually exclusive with --file).
+        #[arg(conflicts_with = "file")]
+        feedback: Option<String>,
+        /// Read feedback from a file instead of an argument.
+        #[arg(long, conflicts_with = "feedback")]
+        file: Option<PathBuf>,
         /// Continue with stub agents instead of invoking copilot.
         #[arg(long)]
         dry_run: bool,
@@ -218,12 +224,26 @@ fn run() -> Result<()> {
                 quiet,
             )?;
         }
-        Command::Reject { work_item, dry_run } => {
+        Command::Reject {
+            work_item,
+            feedback,
+            file,
+            dry_run,
+        } => {
+            let feedback = match (feedback, file) {
+                (_, Some(path)) => Some(
+                    std::fs::read_to_string(&path)
+                        .with_context(|| format!("reading feedback from {}", path.display()))?,
+                ),
+                (Some(text), None) => Some(text),
+                (None, None) => None,
+            }
+            .and_then(|text| (!text.trim().is_empty()).then_some(text));
             resolve_and_continue(
                 config,
                 context.as_deref(),
                 &work_item,
-                Decision::Reject,
+                Decision::Reject { feedback },
                 dry_run,
                 quiet,
             )?;
@@ -527,6 +547,9 @@ fn report_status(snapshot: &StatusSnapshot, verbose: bool) {
         println!("  approved execution:");
         for line in execution.to_string().lines() {
             println!("    {line}");
+        }
+        if let Some(feedback) = &snapshot.planning.feedback {
+            println!("  rejection feedback: {}", display_text(feedback, verbose));
         }
     }
     if let Some(metrics) = &snapshot.planning.metrics {

@@ -47,8 +47,8 @@ pub enum CoordinatorError {
 pub enum Decision {
     /// Accept the current gate (PlanReview or WorkReview).
     Approve,
-    /// Send the work back for another pass (PlanReview or WorkReview).
-    Reject,
+    /// Send the work back for another pass, optionally with human feedback.
+    Reject { feedback: Option<String> },
     /// Provide answers to planner questions (IntakeReview).
     Answer(String),
     /// Cancel the work item entirely (any blocked state).
@@ -70,7 +70,7 @@ impl std::fmt::Display for Decision {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             Decision::Approve => "approve",
-            Decision::Reject => "reject",
+            Decision::Reject { .. } => "reject",
             Decision::Answer(_) => "answer",
             Decision::Abandon => "abandon",
         };
@@ -207,18 +207,26 @@ impl Coordinator {
     pub fn resolve(&mut self, decision: Decision) -> Result<State, CoordinatorError> {
         use Decision::*;
         use State::*;
-        let (next, answer) = match (self.state, &decision) {
+        let (next, answer, feedback) = match (self.state, &decision) {
             (PlanReview, Approve) => {
                 let plan = self.store.plan()?.ok_or(CoordinatorError::NoPlan)?;
                 ExecutionCapabilities::parse_plan(&plan)?;
-                (Implementing, None)
+                (Implementing, None, None)
             }
-            (PlanReview, Reject) => (Planning, None),
-            (WorkReview, Approve) => (Done, None),
-            (WorkReview, Reject) => (Implementing, None),
-            (IntakeReview, Answer(text)) => (Planning, Some(text.as_str())),
+            (PlanReview, Reject { feedback }) => (
+                Planning,
+                None,
+                Some(("plan_feedback", feedback.as_deref().unwrap_or(""))),
+            ),
+            (WorkReview, Approve) => (Done, None, None),
+            (WorkReview, Reject { feedback }) => (
+                Implementing,
+                None,
+                Some(("work_feedback", feedback.as_deref().unwrap_or(""))),
+            ),
+            (IntakeReview, Answer(text)) => (Planning, Some(text.as_str()), None),
             // Abandoning is allowed from any blocked state.
-            (s, Abandon) if s.is_blocked() => (Abandoned, None),
+            (s, Abandon) if s.is_blocked() => (Abandoned, None, None),
             _ => {
                 return Err(CoordinatorError::InvalidResolution {
                     state: self.state,
@@ -238,6 +246,9 @@ impl Coordinator {
         let mut extra: Vec<(&str, &str)> = Vec::new();
         if let Some(text) = answer {
             extra.push(("human_answer", text));
+        }
+        if let Some((kind, text)) = feedback {
+            extra.push((kind, text));
         }
         extra.push(("human_decision", &decision_data));
 
@@ -305,6 +316,7 @@ impl Coordinator {
             .ok_or(CoordinatorError::NoWorkItem)?;
         let previous_plan = self.store.plan()?.unwrap_or_default();
         let answers = self.store.answers()?;
+        let feedback = self.store.plan_feedback()?.unwrap_or_default();
         let prompt = Prompt::planner();
         let iteration = match self.store.max_candidate_iteration()? {
             Some(prev) => prev + 1,
@@ -316,6 +328,7 @@ impl Coordinator {
                 ("work_item", &work_item),
                 ("answers", &answers),
                 ("previous_plan", &previous_plan),
+                ("human_feedback", &feedback),
             ])?;
             let model = self.config.planners.get(&slot).cloned().unwrap_or_default();
             let req = AgentRequest {
@@ -354,11 +367,13 @@ impl Coordinator {
             .collect::<Vec<_>>()
             .join("\n\n");
         let previous_plan = self.store.plan()?.unwrap_or_default();
+        let feedback = self.store.plan_feedback()?.unwrap_or_default();
 
         let rendered = Prompt::merge().render(&[
             ("work_item", &work_item),
             ("candidates", &joined),
             ("previous_plan", &previous_plan),
+            ("human_feedback", &feedback),
         ])?;
         let req = AgentRequest {
             role: AgentRole::CoordinatorMerge,
@@ -415,12 +430,7 @@ impl Coordinator {
             .ok_or(CoordinatorError::NoWorkItem)?;
         let plan = self.store.plan()?.ok_or(CoordinatorError::NoPlan)?;
         let execution = ExecutionCapabilities::parse_plan(&plan)?;
-        let feedback = self
-            .store
-            .latest_review()?
-            .filter(|(_, accepted)| !accepted)
-            .map(|(text, _)| text)
-            .unwrap_or_default();
+        let feedback = self.implementation_feedback()?;
 
         let iteration = self.store.review_count()?;
         let mut round = match self.store.implementation_round(iteration)? {
@@ -577,6 +587,21 @@ impl Coordinator {
             .iteration(iteration),
         );
         Ok(())
+    }
+
+    fn implementation_feedback(&self) -> Result<String, CoordinatorError> {
+        let review_feedback = self
+            .store
+            .latest_review()?
+            .filter(|(_, accepted)| !accepted)
+            .map(|(text, _)| text)
+            .unwrap_or_default();
+        let human_feedback = self.store.work_feedback()?.unwrap_or_default();
+        Ok([review_feedback, human_feedback]
+            .into_iter()
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n"))
     }
 
     /// Run the Reviewer adversarially over the latest implementation and
@@ -1679,7 +1704,44 @@ mod tests {
     fn reject_plan_review_returns_to_planning() {
         let (mut co, _tmp) = coordinator_with_work_item(Config::default());
         co.run_until_blocked().unwrap();
-        assert_eq!(co.resolve(Decision::Reject).unwrap(), State::Planning);
+        assert_eq!(
+            co.resolve(Decision::Reject {
+                feedback: Some("Add rollback steps.".to_string()),
+            })
+            .unwrap(),
+            State::Planning
+        );
+        assert_eq!(
+            co.store.plan_feedback().unwrap().as_deref(),
+            Some("Add rollback steps.")
+        );
+        co.run_until_blocked().unwrap();
+        assert_eq!(
+            co.resolve(Decision::Reject { feedback: None }).unwrap(),
+            State::Planning
+        );
+        assert_eq!(co.store.plan_feedback().unwrap(), None);
+    }
+
+    #[test]
+    fn work_review_feedback_is_combined_with_reviewer_findings() {
+        let (mut co, _tmp) = coordinator_with_work_item(Config::default());
+        co.state = State::WorkReview;
+        co.store
+            .save_review(0, "AI reviewer finding.", false)
+            .unwrap();
+
+        assert_eq!(
+            co.resolve(Decision::Reject {
+                feedback: Some("Also update the documentation.".to_string()),
+            })
+            .unwrap(),
+            State::Implementing
+        );
+        assert_eq!(
+            co.implementation_feedback().unwrap(),
+            "AI reviewer finding.\n\nAlso update the documentation."
+        );
     }
 
     #[test]

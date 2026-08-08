@@ -34,7 +34,8 @@ events are still persisted.
 Default output uses snippets and the latest ten activity records. `--verbose` prints full
 stored text and all activity. `--json` returns a versioned snapshot document for tools
 and future UI clients.
-The current document version is `4`; version 4 adds the human-approved execution
+The current document version is `5`; version 5 adds the latest human Plan rejection
+feedback under `planning.feedback`. Version 4 added the human-approved execution
 capability grant.
 
 An unmatched old `agent_started` record is reported only as the latest known activity;
