@@ -214,9 +214,60 @@ impl Store {
         }
         Ok(out)
     }
-}
 
-/// Milliseconds since the Unix epoch, as a string (sortable, dependency-free).
+    /// Store the normalized WI markdown (single row). Idempotent (upsert).
+    pub fn set_work_item(&mut self, text: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO work_item (id, text) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET text = excluded.text",
+            params![text],
+        )?;
+        Ok(())
+    }
+
+    /// The stored WI markdown, if any.
+    pub fn work_item(&self) -> Result<Option<String>, StoreError> {
+        match self
+            .conn
+            .query_row("SELECT text FROM work_item WHERE id = 1", [], |row| {
+                row.get::<_, String>(0)
+            }) {
+            Ok(t) => Ok(Some(t)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Save a planner's candidate plan for a given iteration. Idempotent (upsert).
+    pub fn save_candidate(
+        &mut self,
+        planner: &str,
+        iteration: u32,
+        text: &str,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO candidates (planner, iteration, text) VALUES (?1, ?2, ?3)
+             ON CONFLICT(planner, iteration) DO UPDATE SET text = excluded.text",
+            params![planner, iteration, text],
+        )?;
+        Ok(())
+    }
+
+    /// All candidate plans for a given iteration, ordered by planner slot.
+    pub fn candidates(&self, iteration: u32) -> Result<Vec<(String, String)>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT planner, text FROM candidates WHERE iteration = ?1 ORDER BY planner ASC",
+        )?;
+        let rows = stmt.query_map([iteration], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+}
 fn now_millis() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -256,5 +307,27 @@ mod tests {
         assert_eq!(history[0].from, Some(State::Intake));
         assert_eq!(history[0].to, State::Planning);
         assert_eq!(history[1].to, State::Converging);
+    }
+
+    #[test]
+    fn stores_work_item_and_candidates() {
+        let mut store = Store::open_in_memory().unwrap();
+        assert_eq!(store.work_item().unwrap(), None);
+        store.set_work_item("# WI\nbody").unwrap();
+        assert_eq!(store.work_item().unwrap().as_deref(), Some("# WI\nbody"));
+
+        store.save_candidate("planner-b", 0, "plan B").unwrap();
+        store.save_candidate("planner-a", 0, "plan A").unwrap();
+        store.save_candidate("planner-a", 1, "plan A v2").unwrap();
+
+        let iter0 = store.candidates(0).unwrap();
+        assert_eq!(
+            iter0,
+            vec![
+                ("planner-a".to_string(), "plan A".to_string()),
+                ("planner-b".to_string(), "plan B".to_string()),
+            ]
+        );
+        assert_eq!(store.candidates(1).unwrap().len(), 1);
     }
 }

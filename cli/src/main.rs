@@ -8,7 +8,10 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use quorum_core::{Config, Coordinator, State, Store};
+use quorum_core::{
+    agent::{AgentRunner, EchoRunner},
+    Config, Coordinator, CopilotRunner, State, Store,
+};
 
 #[derive(Parser)]
 #[command(name = "quorum", version, about = "Drive a single Quorum work item")]
@@ -27,6 +30,9 @@ enum Command {
     Run {
         /// Path to the work item markdown file.
         work_item: PathBuf,
+        /// Use stub agents instead of invoking copilot (offline; no model calls).
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Print the current state of a work item.
     Status {
@@ -52,15 +58,31 @@ fn run() -> Result<()> {
         .with_context(|| format!("loading config from {}", config_path.display()))?;
 
     match cli.command {
-        Command::Run { work_item } => {
+        Command::Run { work_item, dry_run } => {
             let wi_id = work_item_id(&work_item);
             let db_path = config.state_dir.join(&wi_id).join("quorum.db");
-            if let Some(parent) = db_path.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("creating {}", parent.display()))?;
+            let workspace = db_path
+                .parent()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            std::fs::create_dir_all(&workspace)
+                .with_context(|| format!("creating {}", workspace.display()))?;
+
+            let mut store = Store::open(&db_path).context("opening state database")?;
+            // Intake: load the WI markdown once, if not already stored.
+            if store.work_item().context("reading work item")?.is_none() {
+                let text = std::fs::read_to_string(&work_item)
+                    .with_context(|| format!("reading work item {}", work_item.display()))?;
+                store.set_work_item(&text).context("storing work item")?;
             }
-            let store = Store::open(&db_path).context("opening state database")?;
-            let mut co = Coordinator::new(config, store).context("initializing coordinator")?;
+
+            let runner: Box<dyn AgentRunner> = if dry_run {
+                Box::new(EchoRunner)
+            } else {
+                Box::new(CopilotRunner::new(config.sandbox.clone()))
+            };
+            let mut co = Coordinator::new(config, store, runner, workspace)
+                .context("initializing coordinator")?;
             co.run_until_blocked().context("advancing work item")?;
             report(&wi_id, co.state());
         }
@@ -71,8 +93,13 @@ fn run() -> Result<()> {
                 .and_then(|n| n.to_str())
                 .unwrap_or("work-item")
                 .to_string();
+            let workspace = db
+                .parent()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
             let store = Store::open(&db).context("opening state database")?;
-            let co = Coordinator::new(config, store).context("initializing coordinator")?;
+            let co = Coordinator::new(config, store, Box::new(EchoRunner), workspace)
+                .context("initializing coordinator")?;
             report(&wi_id, co.state());
         }
     }

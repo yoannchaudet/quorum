@@ -2,10 +2,14 @@
 //!
 //! The CO is the only stateful orchestrator for a single WI: it owns the state
 //! machine, runs the agents, and persists after every step so it can resume
-//! after a crash. At this skeleton stage `step` is a no-op placeholder.
+//! after a crash.
 
+use std::path::PathBuf;
+
+use crate::agent::{AgentError, AgentRequest, AgentRunner, Filesystem};
 use crate::config::Config;
 use crate::persistence::{Store, StoreError, Transition};
+use crate::prompt::{Prompt, PromptError};
 use crate::state::State;
 
 /// Errors surfaced by the Coordinator.
@@ -13,25 +17,42 @@ use crate::state::State;
 pub enum CoordinatorError {
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error(transparent)]
+    Prompt(#[from] PromptError),
+    #[error(transparent)]
+    Agent(#[from] AgentError),
     #[error("illegal transition {from} -> {to}")]
     IllegalTransition { from: State, to: State },
+    #[error("no work item has been loaded")]
+    NoWorkItem,
 }
 
 /// Orchestrates one work item through the state machine.
 pub struct Coordinator {
     config: Config,
     store: Store,
+    runner: Box<dyn AgentRunner>,
+    /// Working directory used as the sandbox cwd for agent invocations.
+    workspace: PathBuf,
     state: State,
 }
 
 impl Coordinator {
     /// Create a Coordinator over an opened `store`, resuming the persisted state
-    /// if present, otherwise starting at `Intake`.
-    pub fn new(config: Config, store: Store) -> Result<Coordinator, CoordinatorError> {
+    /// if present, otherwise starting at `Intake`. `workspace` is the sandbox
+    /// cwd for agent invocations.
+    pub fn new(
+        config: Config,
+        store: Store,
+        runner: Box<dyn AgentRunner>,
+        workspace: PathBuf,
+    ) -> Result<Coordinator, CoordinatorError> {
         let state = store.current_state()?.unwrap_or(State::Intake);
         Ok(Coordinator {
             config,
             store,
+            runner,
+            workspace,
             state,
         })
     }
@@ -52,9 +73,6 @@ impl Coordinator {
     }
 
     /// Perform a single validated, persisted transition to `next`.
-    ///
-    /// Rejects transitions not permitted by the state machine, and persists the
-    /// accepted transition atomically before updating in-memory state.
     pub fn transition_to(&mut self, next: State, reason: &str) -> Result<State, CoordinatorError> {
         if !self.state.can_transition_to(next) {
             return Err(CoordinatorError::IllegalTransition {
@@ -68,46 +86,75 @@ impl Coordinator {
         Ok(self.state)
     }
 
-    /// The next state for an autonomous step, or `None` when the WI is blocked
-    /// (awaiting HI) or terminal.
-    ///
-    /// This is the happy-path skeleton: agent-driven branches (e.g. PLs raising
-    /// questions, or RV rejecting) are not yet wired, so autonomous states move
-    /// forward. Review gates from config decide whether the optional human-review
-    /// states are entered.
-    fn next_autonomous(&self) -> Option<State> {
-        use State::*;
-        match self.state {
-            Intake => Some(Planning),
-            Planning => Some(Converging),
-            Converging => Some(if self.config.reviews.plan_review {
-                PlanReview
-            } else {
-                Implementing
-            }),
-            Implementing => Some(Reviewing),
-            Reviewing => Some(if self.config.reviews.work_review {
-                WorkReview
-            } else {
-                Done
-            }),
-            // Blocked (HI) or terminal: no autonomous progress.
-            IntakeReview | PlanReview | WorkReview | Done | Failed | Abandoned => None,
+    /// Run the planner roster for the current planning iteration, in isolation,
+    /// and persist each candidate plan.
+    fn run_planners(&mut self) -> Result<(), CoordinatorError> {
+        let work_item = self
+            .store
+            .work_item()?
+            .ok_or(CoordinatorError::NoWorkItem)?;
+        let prompt = Prompt::planner();
+        // Convergence loop is not yet implemented, so there is a single pass.
+        let iteration = 0;
+        let slots: Vec<String> = self.config.planners.keys().cloned().collect();
+        for slot in slots {
+            let rendered = prompt.render(&[("work_item", &work_item), ("answers", "")])?;
+            let req = AgentRequest {
+                role: format!("PL:{slot}"),
+                prompt: rendered,
+                cwd: self.workspace.clone(),
+                filesystem: Filesystem::ReadOnly,
+            };
+            let output = self.runner.run(&req)?;
+            self.store.save_candidate(&slot, iteration, &output)?;
         }
+        Ok(())
     }
 
-    /// Advance the WI by one autonomous step.
+    /// Advance the WI by one autonomous step, performing any agent work the
+    /// current state requires before transitioning.
     ///
     /// Returns the (possibly unchanged) state. The state is unchanged when the
     /// WI is blocked on HI or terminal — the caller must resolve HI to proceed.
+    ///
+    /// Agent-driven branches (PLs raising questions, RV rejecting) are not yet
+    /// wired, so autonomous states move forward on the happy path. Review gates
+    /// from config decide whether the optional human-review states are entered.
     pub fn step(&mut self) -> Result<State, CoordinatorError> {
-        match self.next_autonomous() {
-            Some(next) => {
-                let reason = format!("auto: {} -> {next}", self.state);
-                self.transition_to(next, &reason)
+        use State::*;
+        let next = match self.state {
+            Intake => {
+                if self.store.work_item()?.is_none() {
+                    return Err(CoordinatorError::NoWorkItem);
+                }
+                Planning
             }
-            None => Ok(self.state),
-        }
+            Planning => {
+                self.run_planners()?;
+                Converging
+            }
+            Converging => {
+                if self.config.reviews.plan_review {
+                    PlanReview
+                } else {
+                    Implementing
+                }
+            }
+            Implementing => Reviewing,
+            Reviewing => {
+                if self.config.reviews.work_review {
+                    WorkReview
+                } else {
+                    Done
+                }
+            }
+            // Blocked (HI) or terminal: no autonomous progress.
+            IntakeReview | PlanReview | WorkReview | Done | Failed | Abandoned => {
+                return Ok(self.state)
+            }
+        };
+        let reason = format!("auto: {} -> {next}", self.state);
+        self.transition_to(next, &reason)
     }
 
     /// Step repeatedly until the WI is blocked on HI or reaches a terminal state.
@@ -125,27 +172,40 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::EchoRunner;
 
-    fn coordinator(config: Config) -> Coordinator {
-        let store = Store::open_in_memory().unwrap();
-        Coordinator::new(config, store).unwrap()
+    fn coordinator_with_wi(config: Config) -> Coordinator {
+        let mut store = Store::open_in_memory().unwrap();
+        store.set_work_item("# WI\ndo the thing").unwrap();
+        Coordinator::new(config, store, Box::new(EchoRunner), PathBuf::from(".")).unwrap()
     }
 
     #[test]
     fn new_coordinator_starts_at_intake() {
-        let co = coordinator(Config::default());
+        let co = coordinator_with_wi(Config::default());
         assert_eq!(co.state(), State::Intake);
     }
 
     #[test]
+    fn intake_without_work_item_errors() {
+        let store = Store::open_in_memory().unwrap();
+        let mut co = Coordinator::new(
+            Config::default(),
+            store,
+            Box::new(EchoRunner),
+            PathBuf::from("."),
+        )
+        .unwrap();
+        assert!(matches!(co.step(), Err(CoordinatorError::NoWorkItem)));
+    }
+
+    #[test]
     fn runs_until_first_review_gate_by_default() {
-        // Default config enables both review gates.
-        let mut co = coordinator(Config::default());
+        let mut co = coordinator_with_wi(Config::default());
         let state = co.run_until_blocked().unwrap();
         assert_eq!(state, State::PlanReview);
 
-        let history = co.history().unwrap();
-        let path: Vec<State> = history.iter().map(|t| t.to).collect();
+        let path: Vec<State> = co.history().unwrap().iter().map(|t| t.to).collect();
         assert_eq!(
             path,
             vec![State::Planning, State::Converging, State::PlanReview]
@@ -153,11 +213,23 @@ mod tests {
     }
 
     #[test]
+    fn planning_persists_a_candidate_per_planner() {
+        let mut co = coordinator_with_wi(Config::default());
+        co.run_until_blocked().unwrap();
+        let candidates = co.store.candidates(0).unwrap();
+        // Default roster has three planner slots.
+        assert_eq!(candidates.len(), 3);
+        assert!(candidates
+            .iter()
+            .all(|(_, text)| text.contains("Dry-run stub")));
+    }
+
+    #[test]
     fn runs_to_done_when_review_gates_disabled() {
         let mut config = Config::default();
         config.reviews.plan_review = false;
         config.reviews.work_review = false;
-        let mut co = coordinator(config);
+        let mut co = coordinator_with_wi(config);
         let state = co.run_until_blocked().unwrap();
         assert_eq!(state, State::Done);
 
@@ -176,10 +248,9 @@ mod tests {
 
     #[test]
     fn illegal_transition_is_rejected() {
-        let mut co = coordinator(Config::default());
+        let mut co = coordinator_with_wi(Config::default());
         let err = co.transition_to(State::Done, "nope").unwrap_err();
         assert!(matches!(err, CoordinatorError::IllegalTransition { .. }));
-        // State is unchanged after a rejected transition.
         assert_eq!(co.state(), State::Intake);
     }
 
@@ -189,14 +260,27 @@ mod tests {
         let path = dir.path().join("quorum.db");
 
         {
-            let store = Store::open(&path).unwrap();
-            let mut co = Coordinator::new(Config::default(), store).unwrap();
+            let mut store = Store::open(&path).unwrap();
+            store.set_work_item("# WI").unwrap();
+            let mut co = Coordinator::new(
+                Config::default(),
+                store,
+                Box::new(EchoRunner),
+                dir.path().into(),
+            )
+            .unwrap();
             assert_eq!(co.run_until_blocked().unwrap(), State::PlanReview);
         }
 
         // Reopen: a fresh Coordinator must resume at the persisted state.
         let store = Store::open(&path).unwrap();
-        let co = Coordinator::new(Config::default(), store).unwrap();
+        let co = Coordinator::new(
+            Config::default(),
+            store,
+            Box::new(EchoRunner),
+            dir.path().into(),
+        )
+        .unwrap();
         assert_eq!(co.state(), State::PlanReview);
         assert_eq!(co.history().unwrap().len(), 3);
     }

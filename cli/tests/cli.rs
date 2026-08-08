@@ -19,10 +19,11 @@ fn run_advances_to_plan_review_and_status_reads_it_back() {
     let wi = home.join("mywi.md");
     std::fs::write(&wi, "# My WI\n").unwrap();
 
-    // `run` advances the WI until it blocks on the first review gate (PlanReview),
-    // and surfaces the HI resume command.
+    // `run --dry-run` advances the WI until it blocks on the first review gate
+    // (PlanReview), using stub agents so no copilot/network is needed.
     let out = Command::new(bin())
         .arg("run")
+        .arg("--dry-run")
         .arg(&wi)
         .env("HOME", home)
         .output()
