@@ -15,7 +15,8 @@ Specifications for Quorum's **Core** and **CLI**. Design-on-paper; no code yet.
 9. [sessions.md](sessions.md) — HI via resumable `copilot` sessions.
 10. [config.md](config.md) — `~/.quorum/config.yaml` schema.
 11. [persistence.md](persistence.md) — crash resilience and recovery.
-12. [dev-lifecycle.md](dev-lifecycle.md) — Makefile: `verify` / `verify-full`.
+12. [observability.md](observability.md) — live progress and rich WI status.
+13. [dev-lifecycle.md](dev-lifecycle.md) — Makefile: `verify` / `verify-full`.
 
 ## Doc style rules
 

@@ -3,6 +3,7 @@
 //! See `docs/architecture.md`. This binary parses arguments, calls the Core,
 //! and renders state. It holds no business logic.
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -10,9 +11,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use quorum_core::{
     agent::{AgentRunner, EchoRunner},
-    ensure_worktree, git_common_dir, worktree_record, Config, Coordinator, CopilotRunner, Database,
-    Decision, GitImplementationWorkspace, RegisteredRepository, RepositoryRoot, State, Store,
-    WorkItemId,
+    ensure_worktree, git_common_dir, worktree_record, ActivityEvent, ActivityObserver, Config,
+    Coordinator, CopilotRunner, Database, Decision, GitImplementationWorkspace, Kind,
+    RegisteredRepository, RepositoryRoot, State, StatusSnapshot, Store, WorkItemId,
 };
 
 #[derive(Parser)]
@@ -25,6 +26,10 @@ struct Cli {
     /// Resolve repository context from this folder instead of the current directory.
     #[arg(long, global = true)]
     context: Option<PathBuf>,
+
+    /// Suppress live autonomous progress on stderr.
+    #[arg(long, global = true)]
+    quiet: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -49,6 +54,12 @@ enum Command {
     Status {
         /// The work item id.
         wi: String,
+        /// Include full plans, summaries, findings, errors, and activity history.
+        #[arg(long)]
+        verbose: bool,
+        /// Print a versioned machine-readable status document.
+        #[arg(long)]
+        json: bool,
     },
     /// Approve the current review gate (PlanReview/WorkReview) and continue.
     Approve {
@@ -119,6 +130,7 @@ fn run() -> Result<()> {
     let config = Config::load(&config_path)
         .with_context(|| format!("loading config from {}", config_path.display()))?;
     let context = cli.context;
+    let quiet = cli.quiet;
 
     match cli.command {
         Command::Repo { command } => {
@@ -164,31 +176,42 @@ fn run() -> Result<()> {
                 wi_id.clone(),
             )
             .context("initializing coordinator")?
-            .with_implementation_allowed_dirs(vec![common_git_dir]);
+            .with_implementation_allowed_dirs(vec![common_git_dir])
+            .with_observer(progress_observer(quiet));
             co.run_until_blocked().context("advancing work item")?;
             report(&wi_id, &co)?;
         }
-        Command::Status { wi } => {
-            let (store, _, workspace) = open_work_item(&config, context.as_deref(), &wi, false)?;
-            let mut co = Coordinator::new(
-                config,
-                store,
-                Box::new(EchoRunner),
-                Box::new(GitImplementationWorkspace),
-                workspace,
-                wi.clone(),
-            )
-            .context("initializing coordinator")?;
-            // Ensure the HI session row exists (deterministic; repairs it if a
-            // crash occurred before it was recorded).
-            co.ensure_session().context("recording HI session")?;
-            report(&wi, &co)?;
+        Command::Status { wi, verbose, json } => {
+            let (store, _, _) = open_work_item(&config, context.as_deref(), &wi, false)?;
+            let snapshot = StatusSnapshot::load(&store).context("assembling work item status")?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&snapshot).context("serializing status")?
+                );
+            } else {
+                report_status(&snapshot, verbose);
+            }
         }
         Command::Approve { wi, dry_run } => {
-            resolve_and_continue(config, context.as_deref(), &wi, Decision::Approve, dry_run)?;
+            resolve_and_continue(
+                config,
+                context.as_deref(),
+                &wi,
+                Decision::Approve,
+                dry_run,
+                quiet,
+            )?;
         }
         Command::Reject { wi, dry_run } => {
-            resolve_and_continue(config, context.as_deref(), &wi, Decision::Reject, dry_run)?;
+            resolve_and_continue(
+                config,
+                context.as_deref(),
+                &wi,
+                Decision::Reject,
+                dry_run,
+                quiet,
+            )?;
         }
         Command::Answer {
             wi,
@@ -208,11 +231,19 @@ fn run() -> Result<()> {
                 &wi,
                 Decision::Answer(answer),
                 dry_run,
+                quiet,
             )?;
         }
         Command::Abandon { wi } => {
             // Abandon is terminal; no autonomous continuation, so agents are unused.
-            resolve_and_continue(config, context.as_deref(), &wi, Decision::Abandon, true)?;
+            resolve_and_continue(
+                config,
+                context.as_deref(),
+                &wi,
+                Decision::Abandon,
+                true,
+                quiet,
+            )?;
         }
     }
 
@@ -227,6 +258,7 @@ fn resolve_and_continue(
     wi_id: &str,
     decision: Decision,
     dry_run: bool,
+    quiet: bool,
 ) -> Result<()> {
     validate_wi_id(wi_id)?;
     let require_worktree = !matches!(decision, Decision::Abandon);
@@ -250,7 +282,8 @@ fn resolve_and_continue(
         wi_id,
     )
     .context("initializing coordinator")?
-    .with_implementation_allowed_dirs(additional_dirs);
+    .with_implementation_allowed_dirs(additional_dirs)
+    .with_observer(progress_observer(quiet));
     co.resolve(decision)
         .context("resolving human intervention")?;
     co.run_until_blocked().context("advancing work item")?;
@@ -369,6 +402,264 @@ fn open_work_item(
         .into_store(internal_id.clone())
         .context("opening work item state")?;
     Ok((store, internal_id, workspace))
+}
+
+struct StderrProgress {
+    enabled: bool,
+}
+
+impl ActivityObserver for StderrProgress {
+    fn on_activity(&self, event: &ActivityEvent) {
+        if !self.enabled {
+            return;
+        }
+        let mut details = Vec::new();
+        if let Some(model) = &event.model {
+            details.push(format!("model={model}"));
+        }
+        if let Some(attempt) = event.attempt {
+            details.push(format!("attempt={attempt}"));
+        }
+        if let Some(elapsed) = event.elapsed_ms {
+            details.push(format!("elapsed={}", format_duration(elapsed)));
+        }
+        let suffix = if details.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", details.join(", "))
+        };
+        eprintln!(
+            "{} {}{}",
+            format_time(event.timestamp_ms),
+            event.message,
+            suffix
+        );
+        let _ = std::io::stderr().flush();
+    }
+
+    fn on_persistence_error(
+        &self,
+        event: &ActivityEvent,
+        error: &quorum_core::persistence::StoreError,
+    ) {
+        if self.enabled {
+            eprintln!(
+                "{} warning: could not persist activity {:?}: {error}",
+                format_time(event.timestamp_ms),
+                event.kind
+            );
+            let _ = std::io::stderr().flush();
+        }
+    }
+}
+
+fn progress_observer(quiet: bool) -> Box<dyn ActivityObserver> {
+    Box::new(StderrProgress { enabled: !quiet })
+}
+
+fn report_status(snapshot: &StatusSnapshot, verbose: bool) {
+    println!(
+        "{}\n  internal id: {}\n  repository: {}",
+        snapshot.identity.slug, snapshot.identity.id, snapshot.identity.repository_root
+    );
+    println!(
+        "\nstate: {} ({})",
+        snapshot.state.current,
+        kind_label(snapshot.state.kind)
+    );
+    if let Some(activity) = snapshot.activities.last() {
+        println!(
+            "latest activity: {} ({} ago) — {}",
+            format_time(activity.timestamp_ms),
+            format_duration(now_millis().saturating_sub(activity.timestamp_ms)),
+            activity.message
+        );
+    }
+
+    if let Some(session) = &snapshot.session_name {
+        println!("\nhuman intervention:");
+        if snapshot.state.current == State::IntakeReview {
+            if let Some(questions) = &snapshot.questions {
+                println!("  questions: {}", display_text(questions, verbose));
+            }
+        }
+        println!("  session: {session}");
+        println!("  resume: copilot --resume {session}");
+        if let Some(hint) = resolve_hint(snapshot.state.current) {
+            println!("  resolve: quorum {hint} {}", snapshot.identity.slug);
+        }
+    }
+
+    println!(
+        "\nplanning: {} iteration(s), {} candidate(s), {} planner(s)",
+        snapshot.planning.iterations,
+        snapshot.planning.candidate_count,
+        snapshot.planning.planners.len()
+    );
+    if !snapshot.planning.planners.is_empty() {
+        println!("  planners: {}", snapshot.planning.planners.join(", "));
+    }
+    match &snapshot.planning.plan {
+        Some(plan) => println!("  plan: {}", display_text(plan, verbose)),
+        None => println!("  plan: not available"),
+    }
+    if let Some(metrics) = &snapshot.planning.metrics {
+        println!("  convergence: {metrics}");
+    }
+
+    println!("\nimplementation:");
+    if snapshot.implementations.is_empty() {
+        println!("  no rounds");
+    }
+    for round in &snapshot.implementations {
+        let result = match (&round.result_commit, round.changed) {
+            (Some(commit), Some(true)) => format!("commit {}", short_sha(commit)),
+            (Some(_), Some(false)) => "empty round".to_string(),
+            _ => "not finalized".to_string(),
+        };
+        println!(
+            "  round {}: {} — {} (start {})",
+            round.iteration + 1,
+            round.status,
+            result,
+            short_sha(&round.start_commit)
+        );
+        if let Some(summary) = &round.summary {
+            println!("    summary: {}", display_text(summary, verbose));
+        }
+    }
+
+    println!("\nreviews:");
+    if snapshot.reviews.is_empty() {
+        println!("  no reviews");
+    }
+    for review in &snapshot.reviews {
+        println!(
+            "  round {}: {} — {}",
+            review.iteration + 1,
+            if review.accepted { "ACCEPT" } else { "REJECT" },
+            display_text(&review.findings, verbose)
+        );
+    }
+
+    println!("\nworkspace: {}", snapshot.workspace.path);
+    if let Some(branch) = &snapshot.workspace.branch {
+        println!("  branch: {branch}");
+    }
+    if let Some(base) = &snapshot.workspace.base_commit {
+        println!("  base: {}", short_sha(base));
+    }
+    if let Some(head) = &snapshot.workspace.head {
+        println!("  HEAD: {}", short_sha(head));
+    }
+    println!(
+        "  checkout: {}",
+        if snapshot.workspace.ready {
+            "ready"
+        } else {
+            "not ready"
+        }
+    );
+    if let Some(clean) = snapshot.workspace.clean {
+        println!("  working tree: {}", if clean { "clean" } else { "dirty" });
+    }
+
+    if !snapshot.errors.is_empty() {
+        println!("\nfailures:");
+        for error in &snapshot.errors {
+            println!(
+                "  {} — {}",
+                format_time(error.timestamp_ms),
+                display_text(&error.message, verbose)
+            );
+        }
+    }
+
+    println!("\ntransitions:");
+    if snapshot.transitions.is_empty() {
+        println!("  none");
+    }
+    for transition in &snapshot.transitions {
+        println!(
+            "  {} {} -> {} ({})",
+            format_time(transition.ts.parse().unwrap_or(0)),
+            transition
+                .from
+                .map(|state| state.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            transition.to,
+            transition.reason
+        );
+    }
+
+    let activities = if verbose {
+        snapshot.activities.as_slice()
+    } else {
+        let start = snapshot.activities.len().saturating_sub(10);
+        &snapshot.activities[start..]
+    };
+    println!("\nactivity{}:", if verbose { "" } else { " (latest 10)" });
+    if activities.is_empty() {
+        println!("  none");
+    }
+    for activity in activities {
+        println!(
+            "  {} — {}",
+            format_time(activity.timestamp_ms),
+            activity.message
+        );
+    }
+}
+
+fn kind_label(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Autonomous => "progressing",
+        Kind::Blocked => "blocked",
+        Kind::Terminal => "terminal",
+    }
+}
+
+fn display_text(value: &str, verbose: bool) -> String {
+    if verbose {
+        return value.to_string();
+    }
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = compact.chars();
+    let snippet = chars.by_ref().take(160).collect::<String>();
+    if chars.next().is_some() {
+        format!("{snippet}…")
+    } else {
+        snippet
+    }
+}
+
+fn short_sha(value: &str) -> &str {
+    value.get(..7).unwrap_or(value)
+}
+
+fn format_time(timestamp_ms: u64) -> String {
+    let seconds = (timestamp_ms / 1_000) % 86_400;
+    format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3_600,
+        (seconds % 3_600) / 60,
+        seconds % 60
+    )
+}
+
+fn format_duration(elapsed_ms: u64) -> String {
+    if elapsed_ms < 1_000 {
+        format!("{elapsed_ms}ms")
+    } else {
+        format!("{:.1}s", elapsed_ms as f64 / 1_000.0)
+    }
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Render the current state and, when blocked, the HI resume command (and any

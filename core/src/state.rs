@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Whether a state makes autonomous progress, is blocked on a human, or is terminal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Kind {
     /// The Coordinator (CO) makes progress unattended.
     Autonomous,
@@ -19,6 +20,7 @@ pub enum Kind {
 
 /// The states a WI moves through. See `docs/state-machine.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum State {
     Intake,
     IntakeReview,

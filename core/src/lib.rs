@@ -7,6 +7,7 @@ pub mod agent;
 pub mod config;
 pub mod convergence;
 pub mod coordinator;
+pub mod observability;
 pub mod persistence;
 pub mod prompt;
 pub mod repository;
@@ -16,6 +17,9 @@ pub mod worktree;
 pub use agent::{AgentRunner, CopilotRunner, EchoRunner};
 pub use config::Config;
 pub use coordinator::{Coordinator, Decision};
+pub use observability::{
+    ActivityEvent, ActivityKind, ActivityObserver, NoopActivityObserver, StatusSnapshot,
+};
 pub use persistence::{
     Database, ImplementationRound, ImplementationRoundStatus, RegisteredRepository, RepositoryId,
     Store, Transition, WorkItemId, WorktreeRecord,

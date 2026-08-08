@@ -4,16 +4,21 @@
 //! catalog-level operations, while [`Store`] scopes every coordinator query to
 //! one work item so WI data cannot leak across runs.
 
+use crate::observability::{
+    ActivityEvent, ActivityKind, ImplementationSnapshot, PlanningSnapshot, ReviewSnapshot,
+    StateSnapshot, StatusSnapshot, WorkItemIdentitySnapshot, WorkspaceSnapshot,
+};
 use crate::repository::RepositoryRoot;
 use crate::state::State;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 /// The global database schema version.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Stable internal identity for a work item.
@@ -86,6 +91,14 @@ pub enum ImplementationRoundStatus {
 }
 
 impl ImplementationRoundStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ImplementationRoundStatus::Running => "running",
+            ImplementationRoundStatus::AgentComplete => "agent_complete",
+            ImplementationRoundStatus::Committed => "committed",
+        }
+    }
+
     fn from_str(value: &str) -> Option<ImplementationRoundStatus> {
         match value {
             "running" => Some(ImplementationRoundStatus::Running),
@@ -120,10 +133,12 @@ pub enum StoreError {
     NonUtf8Path(std::path::PathBuf),
     #[error("stored implementation round status {0:?} is invalid")]
     InvalidRoundStatus(String),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
 }
 
 /// A recorded state transition, in insertion order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transition {
     pub from: Option<State>,
     pub to: State,
@@ -290,6 +305,17 @@ impl Database {
 
             CREATE INDEX IF NOT EXISTS events_work_item
                 ON events(work_item_id, id);
+
+            CREATE TABLE IF NOT EXISTS activities (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                ts           INTEGER NOT NULL,
+                kind         TEXT NOT NULL,
+                data         TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS activities_work_item
+                ON activities(work_item_id, id);
 
             CREATE TABLE IF NOT EXISTS worktrees (
                 work_item_id TEXT PRIMARY KEY REFERENCES work_items(id) ON DELETE CASCADE,
@@ -713,6 +739,41 @@ impl Store {
         Ok(out)
     }
 
+    pub fn record_activity(&mut self, event: &ActivityEvent) -> Result<ActivityEvent, StoreError> {
+        let data = serde_json::to_string(event)?;
+        self.conn.execute(
+            "INSERT INTO activities (work_item_id, ts, kind, data)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                self.work_item_id.as_str(),
+                event.timestamp_ms as i64,
+                activity_kind_name(event.kind),
+                data
+            ],
+        )?;
+        let mut recorded = event.clone();
+        recorded.id = Some(self.conn.last_insert_rowid());
+        Ok(recorded)
+    }
+
+    pub fn activities(&self) -> Result<Vec<ActivityEvent>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, data FROM activities
+             WHERE work_item_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![self.work_item_id.as_str()], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut activities = Vec::new();
+        for row in rows {
+            let (id, data) = row?;
+            let mut event: ActivityEvent = serde_json::from_str(&data)?;
+            event.id = Some(id);
+            activities.push(event);
+        }
+        Ok(activities)
+    }
+
     pub fn count_events(&self) -> Result<i64, StoreError> {
         Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM events WHERE work_item_id = ?1",
@@ -727,6 +788,174 @@ impl Store {
             params![self.work_item_id.as_str(), kind],
             |row| row.get(0),
         )?)
+    }
+
+    pub fn status_snapshot(&self) -> Result<StatusSnapshot, StoreError> {
+        let (id, slug, repository_root) = self.conn.query_row(
+            "SELECT w.id, w.slug, r.root
+             FROM work_items w
+             JOIN repositories r ON r.id = w.repository_id
+             WHERE w.id = ?1",
+            params![self.work_item_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?;
+        let state = self.current_state()?.unwrap_or(State::Intake);
+
+        let (candidate_count, iterations): (i64, i64) = self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(MAX(iteration) + 1, 0)
+             FROM candidates WHERE work_item_id = ?1",
+            params![self.work_item_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let mut planner_stmt = self.conn.prepare(
+            "SELECT DISTINCT planner FROM candidates
+             WHERE work_item_id = ?1 ORDER BY planner",
+        )?;
+        let planners = planner_stmt
+            .query_map(params![self.work_item_id.as_str()], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let plan = self
+            .conn
+            .query_row(
+                "SELECT text, metrics FROM plans WHERE work_item_id = ?1",
+                params![self.work_item_id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+
+        let mut implementation_stmt = self.conn.prepare(
+            "SELECT r.iteration, r.status, r.start_commit, r.result_commit, r.tree_sha,
+                    i.summary
+             FROM implementation_rounds r
+             LEFT JOIN implementations i
+               ON i.work_item_id = r.work_item_id AND i.iteration = r.iteration
+             WHERE r.work_item_id = ?1 ORDER BY r.iteration",
+        )?;
+        let implementations = implementation_stmt
+            .query_map(params![self.work_item_id.as_str()], |row| {
+                let start_commit = row.get::<_, String>(2)?;
+                let result_commit = row.get::<_, Option<String>>(3)?;
+                Ok(ImplementationSnapshot {
+                    iteration: row.get::<_, i64>(0)? as u32,
+                    status: row.get(1)?,
+                    changed: result_commit.as_ref().map(|result| result != &start_commit),
+                    start_commit,
+                    result_commit,
+                    tree_sha: row.get(4)?,
+                    summary: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut review_stmt = self.conn.prepare(
+            "SELECT iteration, accepted, text FROM reviews
+             WHERE work_item_id = ?1 ORDER BY iteration",
+        )?;
+        let reviews = review_stmt
+            .query_map(params![self.work_item_id.as_str()], |row| {
+                Ok(ReviewSnapshot {
+                    iteration: row.get::<_, i64>(0)? as u32,
+                    accepted: row.get::<_, i64>(1)? != 0,
+                    findings: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let worktree = self
+            .conn
+            .query_row(
+                "SELECT path, branch, base_commit, status
+                 FROM worktrees WHERE work_item_id = ?1",
+                params![self.work_item_id.as_str()],
+                |row| {
+                    Ok(WorkspaceSnapshot {
+                        path: row.get(0)?,
+                        branch: Some(row.get(1)?),
+                        base_commit: Some(row.get(2)?),
+                        ready: row.get::<_, String>(3)? == "ready",
+                        head: None,
+                        clean: None,
+                    })
+                },
+            )
+            .optional()?
+            .unwrap_or(WorkspaceSnapshot {
+                path: String::new(),
+                branch: None,
+                base_commit: None,
+                ready: false,
+                head: None,
+                clean: None,
+            });
+
+        let activities = self.activities()?;
+        let mut errors = activities
+            .iter()
+            .filter(|event| matches!(event.kind, ActivityKind::AgentFailed | ActivityKind::Failed))
+            .cloned()
+            .collect::<Vec<_>>();
+        if errors.is_empty() {
+            let mut legacy_stmt = self.conn.prepare(
+                "SELECT ts, data FROM events
+                 WHERE work_item_id = ?1 AND kind = 'error' ORDER BY id",
+            )?;
+            for row in legacy_stmt.query_map(params![self.work_item_id.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                ))
+            })? {
+                let (timestamp, message) = row?;
+                errors.push(ActivityEvent {
+                    id: None,
+                    timestamp_ms: timestamp.parse().unwrap_or(0),
+                    kind: ActivityKind::Failed,
+                    message,
+                    phase: Some(state),
+                    role: None,
+                    model: None,
+                    iteration: None,
+                    attempt: None,
+                    elapsed_ms: None,
+                });
+            }
+        }
+
+        Ok(StatusSnapshot {
+            version: 1,
+            identity: WorkItemIdentitySnapshot {
+                id,
+                slug: slug.clone(),
+                repository_root,
+            },
+            state: StateSnapshot {
+                current: state,
+                kind: state.kind(),
+            },
+            questions: self.questions()?,
+            session_name: state.is_blocked().then(|| format!("quorum/{slug}/{state}")),
+            transitions: self.history()?,
+            planning: PlanningSnapshot {
+                iterations: iterations as u32,
+                candidate_count: candidate_count as u32,
+                planners,
+                plan: plan.as_ref().map(|value| value.0.clone()),
+                metrics: plan.and_then(|value| value.1),
+            },
+            implementations,
+            reviews,
+            errors,
+            activities,
+            workspace: worktree,
+        })
     }
 
     pub fn set_work_item(&mut self, text: &str) -> Result<(), StoreError> {
@@ -1082,6 +1311,23 @@ fn now_millis() -> String {
         .to_string()
 }
 
+fn activity_kind_name(kind: ActivityKind) -> &'static str {
+    match kind {
+        ActivityKind::PhaseStarted => "phase_started",
+        ActivityKind::AgentStarted => "agent_started",
+        ActivityKind::AgentRetrying => "agent_retrying",
+        ActivityKind::AgentCompleted => "agent_completed",
+        ActivityKind::AgentFailed => "agent_failed",
+        ActivityKind::Convergence => "convergence",
+        ActivityKind::ImplementationRound => "implementation_round",
+        ActivityKind::Review => "review",
+        ActivityKind::Transition => "transition",
+        ActivityKind::HumanIntervention => "human_intervention",
+        ActivityKind::Completed => "completed",
+        ActivityKind::Failed => "failed",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1211,6 +1457,33 @@ mod tests {
             )
             .unwrap();
         assert_eq!(table, "implementation_rounds");
+    }
+
+    #[test]
+    fn migrates_v4_by_adding_activities() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quorum.db");
+        let db = Database::open(&path).unwrap();
+        db.conn
+            .execute_batch(
+                "DROP TABLE activities;
+                 UPDATE meta SET value = '4' WHERE key = 'schema_version';",
+            )
+            .unwrap();
+        drop(db);
+
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        let table: String = db
+            .conn
+            .query_row(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND name = 'activities'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table, "activities");
     }
 
     #[test]
@@ -1397,6 +1670,53 @@ mod tests {
         assert_eq!(
             store.implementation_tree(0).unwrap().as_deref(),
             Some("tree")
+        );
+    }
+
+    #[test]
+    fn status_snapshot_assembles_scoped_observability_data() {
+        let mut db = Database::open_in_memory().unwrap();
+        let repository = register(&mut db, "/repo");
+        let work_item = db
+            .get_or_create_work_item(&repository.id, "observable")
+            .unwrap();
+        db.reserve_worktree(
+            &work_item,
+            "base",
+            "quorum/observable",
+            Path::new("/state/observable/implementation"),
+        )
+        .unwrap();
+        db.mark_worktree_ready(&work_item).unwrap();
+        let mut store = db.into_store(work_item.clone()).unwrap();
+        store.set_work_item("# Observable").unwrap();
+        store.save_candidate("planner-a", 0, "candidate").unwrap();
+        store.set_plan("the plan", "iteration=0").unwrap();
+        store
+            .record_transition(Some(State::Intake), State::Planning, "start")
+            .unwrap();
+        store
+            .record_activity(
+                &ActivityEvent::new(ActivityKind::AgentStarted, "planner-a started")
+                    .phase(State::Planning)
+                    .role("PL:planner-a")
+                    .iteration(0),
+            )
+            .unwrap();
+
+        let snapshot = store.status_snapshot().unwrap();
+        assert_eq!(snapshot.version, 1);
+        assert_eq!(snapshot.identity.id, work_item.as_str());
+        assert_eq!(snapshot.identity.slug, "observable");
+        assert_eq!(snapshot.identity.repository_root, "/repo");
+        assert_eq!(snapshot.state.current, State::Planning);
+        assert_eq!(snapshot.planning.iterations, 1);
+        assert_eq!(snapshot.planning.candidate_count, 1);
+        assert_eq!(snapshot.planning.plan.as_deref(), Some("the plan"));
+        assert_eq!(snapshot.activities.len(), 1);
+        assert_eq!(
+            snapshot.workspace.branch.as_deref(),
+            Some("quorum/observable")
         );
     }
 }

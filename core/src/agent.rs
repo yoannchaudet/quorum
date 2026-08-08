@@ -30,6 +30,8 @@ pub struct AgentRequest {
     pub filesystem: Filesystem,
     /// The model id to run, if configured. Empty means use the CLI default.
     pub model: String,
+    /// Planning, implementation, or review iteration when applicable.
+    pub iteration: Option<u32>,
     /// Additional sandbox paths required by this invocation.
     pub additional_dirs: Vec<PathBuf>,
 }
@@ -181,6 +183,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             filesystem: Filesystem::ReadOnly,
             model: String::new(),
+            iteration: None,
             additional_dirs: vec![],
         }
     }
