@@ -25,6 +25,33 @@ pub enum CoordinatorError {
     IllegalTransition { from: State, to: State },
     #[error("no work item has been loaded")]
     NoWorkItem,
+    #[error("cannot {decision} in state {state} (not an applicable human-intervention state)")]
+    InvalidResolution { state: State, decision: Decision },
+}
+
+/// A human's decision to resolve a blocked (HI) state (see `docs/agents.md`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision {
+    /// Accept the current gate (PlanReview or WorkReview).
+    Approve,
+    /// Send the work back for another pass (PlanReview or WorkReview).
+    Reject,
+    /// Provide answers to planner questions (IntakeReview).
+    Answer(String),
+    /// Cancel the work item entirely (any blocked state).
+    Abandon,
+}
+
+impl std::fmt::Display for Decision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Decision::Approve => "approve",
+            Decision::Reject => "reject",
+            Decision::Answer(_) => "answer",
+            Decision::Abandon => "abandon",
+        };
+        f.write_str(s)
+    }
 }
 
 /// Orchestrates one work item through the state machine.
@@ -82,6 +109,55 @@ impl Coordinator {
         }
         self.store
             .record_transition(Some(self.state), next, reason)?;
+        self.state = next;
+        Ok(self.state)
+    }
+
+    /// Resolve the current blocked (HI) state with a human `decision`, performing
+    /// the corresponding validated, persisted transition (see `docs/agents.md`).
+    ///
+    /// The decision (and any answer) is logged in the **same** transaction as the
+    /// transition, so the audit log can never record a decision that did not
+    /// actually advance the state.
+    ///
+    /// Errors if the decision does not apply to the current state (e.g. approving
+    /// when the WI is not at a review gate).
+    pub fn resolve(&mut self, decision: Decision) -> Result<State, CoordinatorError> {
+        use Decision::*;
+        use State::*;
+        let (next, answer) = match (self.state, &decision) {
+            (PlanReview, Approve) => (Implementing, None),
+            (PlanReview, Reject) => (Planning, None),
+            (WorkReview, Approve) => (Done, None),
+            (WorkReview, Reject) => (Implementing, None),
+            (IntakeReview, Answer(text)) => (Planning, Some(text.as_str())),
+            // Abandoning is allowed from any blocked (HI) state.
+            (s, Abandon) if s.is_blocked() => (Abandoned, None),
+            _ => {
+                return Err(CoordinatorError::InvalidResolution {
+                    state: self.state,
+                    decision,
+                })
+            }
+        };
+
+        if !self.state.can_transition_to(next) {
+            return Err(CoordinatorError::IllegalTransition {
+                from: self.state,
+                to: next,
+            });
+        }
+
+        let decision_data = format!("{}@{}", decision, self.state);
+        let mut extra: Vec<(&str, &str)> = Vec::new();
+        if let Some(text) = answer {
+            extra.push(("hi_answer", text));
+        }
+        extra.push(("hi_decision", &decision_data));
+
+        let reason = format!("hi: {decision} {} -> {next}", self.state);
+        self.store
+            .record_transition_with_events(Some(self.state), next, &reason, &extra)?;
         self.state = next;
         Ok(self.state)
     }
@@ -252,6 +328,68 @@ mod tests {
         let err = co.transition_to(State::Done, "nope").unwrap_err();
         assert!(matches!(err, CoordinatorError::IllegalTransition { .. }));
         assert_eq!(co.state(), State::Intake);
+    }
+
+    #[test]
+    fn approve_plan_review_proceeds_to_implementing() {
+        let mut co = coordinator_with_wi(Config::default());
+        assert_eq!(co.run_until_blocked().unwrap(), State::PlanReview);
+        assert_eq!(co.resolve(Decision::Approve).unwrap(), State::Implementing);
+    }
+
+    #[test]
+    fn reject_plan_review_returns_to_planning() {
+        let mut co = coordinator_with_wi(Config::default());
+        co.run_until_blocked().unwrap();
+        assert_eq!(co.resolve(Decision::Reject).unwrap(), State::Planning);
+    }
+
+    #[test]
+    fn drives_intake_to_done_via_approvals() {
+        let mut co = coordinator_with_wi(Config::default());
+        // Plan gate.
+        assert_eq!(co.run_until_blocked().unwrap(), State::PlanReview);
+        assert_eq!(co.resolve(Decision::Approve).unwrap(), State::Implementing);
+        // Work gate.
+        assert_eq!(co.run_until_blocked().unwrap(), State::WorkReview);
+        assert_eq!(co.resolve(Decision::Approve).unwrap(), State::Done);
+        assert!(co.state().is_terminal());
+    }
+
+    #[test]
+    fn abandon_from_blocked_state_terminates() {
+        let mut co = coordinator_with_wi(Config::default());
+        co.run_until_blocked().unwrap();
+        assert_eq!(co.resolve(Decision::Abandon).unwrap(), State::Abandoned);
+    }
+
+    #[test]
+    fn resolve_rejected_when_not_blocked() {
+        let mut co = coordinator_with_wi(Config::default());
+        // At Intake (autonomous), no HI decision applies.
+        let err = co.resolve(Decision::Approve).unwrap_err();
+        assert!(matches!(err, CoordinatorError::InvalidResolution { .. }));
+        assert_eq!(co.state(), State::Intake);
+    }
+
+    #[test]
+    fn answer_only_applies_at_intake_review() {
+        let mut co = coordinator_with_wi(Config::default());
+        co.run_until_blocked().unwrap(); // PlanReview
+        let err = co.resolve(Decision::Answer("nope".into())).unwrap_err();
+        assert!(matches!(err, CoordinatorError::InvalidResolution { .. }));
+    }
+
+    #[test]
+    fn rejected_resolution_records_no_events() {
+        let mut co = coordinator_with_wi(Config::default());
+        // At Intake, approve is invalid and must not write any event.
+        let _ = co.resolve(Decision::Approve);
+        let events = co.store.count_events().unwrap();
+        // Only the autonomous transitions so far (none yet) — no HI events.
+        let hi = co.store.count_events_of_kind("hi_decision").unwrap();
+        assert_eq!(hi, 0);
+        assert_eq!(events, 0);
     }
 
     #[test]

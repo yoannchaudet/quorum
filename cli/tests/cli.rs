@@ -50,3 +50,37 @@ fn run_advances_to_plan_review_and_status_reads_it_back() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("PlanReview"), "unexpected output: {stdout}");
 }
+
+#[test]
+fn approve_gates_drive_work_item_to_done() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+
+    let wi = home.join("done-wi.md");
+    std::fs::write(&wi, "# WI\ndo it\n").unwrap();
+
+    let run = |args: &[&str]| {
+        Command::new(bin())
+            .args(args)
+            .arg("--dry-run")
+            .env("HOME", home)
+            .output()
+            .unwrap()
+    };
+
+    // Start: blocks at PlanReview.
+    let out = run(&["run", wi.to_str().unwrap()]);
+    assert!(out.status.success(), "run failed: {out:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("PlanReview"));
+
+    // Approve the plan: proceeds and blocks at WorkReview.
+    let out = run(&["approve", "done-wi"]);
+    assert!(out.status.success(), "approve failed: {out:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("WorkReview"));
+
+    // Approve the work: reaches Done.
+    let out = run(&["approve", "done-wi"]);
+    assert!(out.status.success(), "approve failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Done"), "unexpected output: {stdout}");
+}
