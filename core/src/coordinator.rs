@@ -1168,7 +1168,11 @@ mod tests {
 
         {
             let mut database = Database::open(&path).unwrap();
-            work_item_id = database.get_or_create_work_item("test-wi").unwrap();
+            let root = crate::repository::RepositoryRoot::from_canonical("/test/repository");
+            let repository = database.register_repository(&root).unwrap();
+            work_item_id = database
+                .get_or_create_work_item(&repository.id, "test-wi")
+                .unwrap();
             let mut store = database.into_store(work_item_id.clone()).unwrap();
             store.set_work_item("# WI").unwrap();
             let mut co = Coordinator::new(

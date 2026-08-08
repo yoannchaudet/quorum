@@ -10,7 +10,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use quorum_core::{
     agent::{AgentRunner, EchoRunner},
-    Config, Coordinator, CopilotRunner, Database, Decision, State, Store, WorkItemId,
+    Config, Coordinator, CopilotRunner, Database, Decision, RegisteredRepository, RepositoryRoot,
+    State, Store, WorkItemId,
 };
 
 #[derive(Parser)]
@@ -20,12 +21,21 @@ struct Cli {
     #[arg(long, global = true)]
     config: Option<PathBuf>,
 
+    /// Resolve repository context from this folder instead of the current directory.
+    #[arg(long, global = true)]
+    context: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Manage the repositories Quorum is allowed to use.
+    Repo {
+        #[command(subcommand)]
+        command: RepoCommand,
+    },
     /// Start (or resume) processing a work item from a markdown file.
     Run {
         /// Path to the work item markdown file.
@@ -76,6 +86,22 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum RepoCommand {
+    /// Register a Git repository with Quorum.
+    Register {
+        /// A path inside the repository (default: --context, then cwd).
+        path: Option<PathBuf>,
+    },
+    /// Unregister a Git repository without deleting its work items.
+    Unregister {
+        /// A path inside the repository (default: --context, then cwd).
+        path: Option<PathBuf>,
+    },
+    /// List registered repositories.
+    List,
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -91,14 +117,18 @@ fn run() -> Result<()> {
     let config_path = cli.config.unwrap_or_else(Config::default_path);
     let config = Config::load(&config_path)
         .with_context(|| format!("loading config from {}", config_path.display()))?;
+    let context = cli.context;
 
     match cli.command {
+        Command::Repo { command } => {
+            run_repo_command(&config, context.as_deref(), command)?;
+        }
         Command::Run { work_item, dry_run } => {
             let wi_id = work_item_id(&work_item);
             validate_wi_id(&wi_id)?;
-            let mut database = open_database(&config)?;
+            let (mut database, repository) = open_registered_context(&config, context.as_deref())?;
             let internal_id = database
-                .get_or_create_work_item(&wi_id)
+                .get_or_create_work_item(&repository.id, &wi_id)
                 .context("creating work item state")?;
             let workspace = config.work_item_dir(internal_id.as_str());
             std::fs::create_dir_all(&workspace)
@@ -125,7 +155,7 @@ fn run() -> Result<()> {
             report(&wi_id, &co)?;
         }
         Command::Status { wi } => {
-            let (store, internal_id) = open_work_item(&config, &wi)?;
+            let (store, internal_id) = open_work_item(&config, context.as_deref(), &wi)?;
             let workspace = config.work_item_dir(internal_id.as_str());
             let mut co =
                 Coordinator::new(config, store, Box::new(EchoRunner), workspace, wi.clone())
@@ -136,10 +166,10 @@ fn run() -> Result<()> {
             report(&wi, &co)?;
         }
         Command::Approve { wi, dry_run } => {
-            resolve_and_continue(config, &wi, Decision::Approve, dry_run)?;
+            resolve_and_continue(config, context.as_deref(), &wi, Decision::Approve, dry_run)?;
         }
         Command::Reject { wi, dry_run } => {
-            resolve_and_continue(config, &wi, Decision::Reject, dry_run)?;
+            resolve_and_continue(config, context.as_deref(), &wi, Decision::Reject, dry_run)?;
         }
         Command::Answer {
             wi,
@@ -153,11 +183,17 @@ fn run() -> Result<()> {
                 (Some(t), None) => t,
                 (None, None) => anyhow::bail!("provide an answer as an argument or via --file"),
             };
-            resolve_and_continue(config, &wi, Decision::Answer(answer), dry_run)?;
+            resolve_and_continue(
+                config,
+                context.as_deref(),
+                &wi,
+                Decision::Answer(answer),
+                dry_run,
+            )?;
         }
         Command::Abandon { wi } => {
             // Abandon is terminal; no autonomous continuation, so agents are unused.
-            resolve_and_continue(config, &wi, Decision::Abandon, true)?;
+            resolve_and_continue(config, context.as_deref(), &wi, Decision::Abandon, true)?;
         }
     }
 
@@ -168,12 +204,13 @@ fn run() -> Result<()> {
 /// next blocked or terminal state.
 fn resolve_and_continue(
     config: Config,
+    context: Option<&std::path::Path>,
     wi_id: &str,
     decision: Decision,
     dry_run: bool,
 ) -> Result<()> {
     validate_wi_id(wi_id)?;
-    let (store, internal_id) = open_work_item(&config, wi_id)?;
+    let (store, internal_id) = open_work_item(&config, context, wi_id)?;
     let workspace = config.work_item_dir(internal_id.as_str());
     let runner: Box<dyn AgentRunner> = if dry_run {
         Box::new(EchoRunner)
@@ -195,11 +232,86 @@ fn open_database(config: &Config) -> Result<Database> {
     Database::open(&config.database_path()).context("opening Quorum state")
 }
 
-fn open_work_item(config: &Config, wi_id: &str) -> Result<(Store, WorkItemId)> {
-    validate_wi_id(wi_id)?;
+fn run_repo_command(
+    config: &Config,
+    context: Option<&std::path::Path>,
+    command: RepoCommand,
+) -> Result<()> {
+    match command {
+        RepoCommand::Register { path } => {
+            let root = resolve_repository(path.as_deref().or(context))?;
+            let mut database = open_database(config)?;
+            let repository = database
+                .register_repository(&root)
+                .context("registering repository")?;
+            println!(
+                "registered: {} {}",
+                repository.id,
+                repository.root.display()
+            );
+        }
+        RepoCommand::Unregister { path } => {
+            let root = resolve_repository(path.as_deref().or(context))?;
+            let mut database = open_database(config)?;
+            let repository = database
+                .unregister_repository(&root)
+                .context("unregistering repository")?
+                .with_context(|| {
+                    format!("repository {} is not registered", root.as_path().display())
+                })?;
+            println!(
+                "unregistered: {} {}",
+                repository.id,
+                repository.root.display()
+            );
+        }
+        RepoCommand::List => {
+            let database = open_database(config)?;
+            for repository in database.repositories().context("listing repositories")? {
+                println!("{}\t{}", repository.id, repository.root.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_repository(context: Option<&std::path::Path>) -> Result<RepositoryRoot> {
+    let path = match context {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_dir().context("reading current directory")?,
+    };
+    RepositoryRoot::discover(&path)
+        .with_context(|| format!("resolving repository from {}", path.display()))
+}
+
+fn open_registered_context(
+    config: &Config,
+    context: Option<&std::path::Path>,
+) -> Result<(Database, RegisteredRepository)> {
+    let root = resolve_repository(context)?;
     let database = open_database(config)?;
+    let repository = database
+        .registered_repository(&root)
+        .context("looking up repository registration")?
+        .with_context(|| {
+            format!(
+                "repository {} is not registered; run `quorum repo register {}`",
+                root.as_path().display(),
+                root.as_path().display()
+            )
+        })?;
+    Ok((database, repository))
+}
+
+fn open_work_item(
+    config: &Config,
+    context: Option<&std::path::Path>,
+    wi_id: &str,
+) -> Result<(Store, WorkItemId)> {
+    validate_wi_id(wi_id)?;
+    let (database, repository) = open_registered_context(config, context)?;
     let internal_id = database
-        .work_item_id(wi_id)
+        .work_item_id(&repository.id, wi_id)
         .context("looking up work item")?
         .with_context(|| format!("no work item {wi_id}"))?;
     let store = database

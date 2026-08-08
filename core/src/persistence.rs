@@ -4,6 +4,7 @@
 //! catalog-level operations, while [`Store`] scopes every coordinator query to
 //! one work item so WI data cannot leak across runs.
 
+use crate::repository::RepositoryRoot;
 use crate::state::State;
 use rusqlite::{params, Connection};
 use std::fmt;
@@ -12,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 /// The global database schema version.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Stable internal identity for a work item.
@@ -35,6 +36,33 @@ impl fmt::Display for WorkItemId {
     }
 }
 
+/// Stable internal identity for a registered repository.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RepositoryId(String);
+
+impl RepositoryId {
+    fn new() -> RepositoryId {
+        RepositoryId(Uuid::new_v4().to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RepositoryId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// One repository in Quorum's allow-list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredRepository {
+    pub id: RepositoryId,
+    pub root: std::path::PathBuf,
+}
+
 /// Errors from the persistence layer.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -46,6 +74,8 @@ pub enum StoreError {
     WorkItemNotFound(WorkItemId),
     #[error("database schema version {found} is not supported (expected {expected})")]
     UnsupportedSchema { found: i64, expected: i64 },
+    #[error("repository path is not valid UTF-8: {0}")]
+    NonUtf8RepositoryPath(std::path::PathBuf),
 }
 
 /// A recorded state transition, in insertion order.
@@ -100,24 +130,48 @@ impl Database {
             Err(rusqlite::Error::QueryReturnedNoRows) => 0,
             Err(error) => return Err(error.into()),
         };
-        if stored_version != 0 && stored_version != SCHEMA_VERSION {
+        if stored_version > SCHEMA_VERSION {
             return Err(StoreError::UnsupportedSchema {
                 found: stored_version,
                 expected: SCHEMA_VERSION,
             });
         }
 
+        if stored_version == 1 {
+            self.migrate_v1_to_v2()?;
+        }
+
+        self.create_schema_v2()?;
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [SCHEMA_VERSION.to_string()],
+        )?;
+        Ok(())
+    }
+
+    fn create_schema_v2(&self) -> Result<(), StoreError> {
         self.conn.execute_batch(
             r#"
+            CREATE TABLE IF NOT EXISTS repositories (
+                id            TEXT PRIMARY KEY,
+                root          TEXT NOT NULL UNIQUE,
+                registered    INTEGER NOT NULL,
+                created_at    TEXT NOT NULL,
+                updated_at    TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS work_items (
                 id           TEXT PRIMARY KEY,
-                slug         TEXT NOT NULL UNIQUE,
+                repository_id TEXT REFERENCES repositories(id),
+                slug         TEXT NOT NULL,
                 text         TEXT,
                 source       TEXT,
                 origin_repo  TEXT,
                 origin_issue INTEGER,
                 created_at   TEXT NOT NULL,
-                updated_at   TEXT NOT NULL
+                updated_at   TEXT NOT NULL,
+                UNIQUE (repository_id, slug)
             );
 
             CREATE TABLE IF NOT EXISTS states (
@@ -194,11 +248,65 @@ impl Database {
                 ON events(work_item_id, id);
             "#,
         )?;
-        self.conn.execute(
-            "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [SCHEMA_VERSION.to_string()],
-        )?;
+        Ok(())
+    }
+
+    fn migrate_v1_to_v2(&self) -> Result<(), StoreError> {
+        self.conn.pragma_update(None, "foreign_keys", false)?;
+        let result = (|| -> Result<(), rusqlite::Error> {
+            self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+            let version: String = self.conn.query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )?;
+            if version != "1" {
+                self.conn.execute_batch("COMMIT;")?;
+                return Ok(());
+            }
+
+            self.conn.execute_batch(
+                r#"
+                CREATE TABLE repositories (
+                id            TEXT PRIMARY KEY,
+                root          TEXT NOT NULL UNIQUE,
+                registered    INTEGER NOT NULL,
+                created_at    TEXT NOT NULL,
+                updated_at    TEXT NOT NULL
+            );
+
+            CREATE TABLE work_items_v2 (
+                id            TEXT PRIMARY KEY,
+                repository_id TEXT REFERENCES repositories(id),
+                slug          TEXT NOT NULL,
+                text          TEXT,
+                source        TEXT,
+                origin_repo   TEXT,
+                origin_issue  INTEGER,
+                created_at    TEXT NOT NULL,
+                updated_at    TEXT NOT NULL,
+                UNIQUE (repository_id, slug)
+            );
+
+            INSERT INTO work_items_v2
+                (id, repository_id, slug, text, source, origin_repo, origin_issue, created_at, updated_at)
+            SELECT id, NULL, slug, text, source, origin_repo, origin_issue, created_at, updated_at
+            FROM work_items;
+
+            DROP TABLE work_items;
+            ALTER TABLE work_items_v2 RENAME TO work_items;
+            UPDATE meta SET value = '2' WHERE key = 'schema_version';
+
+            COMMIT;
+            "#,
+            )
+        })();
+        if result.is_err() {
+            let _ = self.conn.execute_batch("ROLLBACK;");
+        }
+        let foreign_keys = self.conn.pragma_update(None, "foreign_keys", true);
+        result?;
+        foreign_keys?;
         Ok(())
     }
 
@@ -207,11 +315,108 @@ impl Database {
         schema_version(&self.conn)
     }
 
-    /// Find a work item by its user-facing slug.
-    pub fn work_item_id(&self, slug: &str) -> Result<Option<WorkItemId>, StoreError> {
+    /// Add or reactivate a repository in Quorum's allow-list.
+    pub fn register_repository(
+        &mut self,
+        root: &RepositoryRoot,
+    ) -> Result<RegisteredRepository, StoreError> {
+        let root_text = root
+            .as_path()
+            .to_str()
+            .ok_or_else(|| StoreError::NonUtf8RepositoryPath(root.as_path().to_path_buf()))?;
+        let id = RepositoryId::new();
+        let ts = now_millis();
+        let stored_id = self.conn.query_row(
+            "INSERT INTO repositories (id, root, registered, created_at, updated_at)
+             VALUES (?1, ?2, 1, ?3, ?3)
+             ON CONFLICT(root) DO UPDATE
+             SET registered = 1, updated_at = excluded.updated_at
+             RETURNING id",
+            params![id.as_str(), root_text, ts],
+            |row| row.get::<_, String>(0),
+        )?;
+        Ok(RegisteredRepository {
+            id: RepositoryId(stored_id),
+            root: root.as_path().to_path_buf(),
+        })
+    }
+
+    /// Deactivate a repository without deleting its identity or WI history.
+    pub fn unregister_repository(
+        &mut self,
+        root: &RepositoryRoot,
+    ) -> Result<Option<RegisteredRepository>, StoreError> {
+        let repository = self.repository_by_root(root, false)?;
+        if let Some(repository) = &repository {
+            self.conn.execute(
+                "UPDATE repositories SET registered = 0, updated_at = ?1 WHERE id = ?2",
+                params![now_millis(), repository.id.as_str()],
+            )?;
+        }
+        Ok(repository)
+    }
+
+    /// Find an active registered repository by canonical root.
+    pub fn registered_repository(
+        &self,
+        root: &RepositoryRoot,
+    ) -> Result<Option<RegisteredRepository>, StoreError> {
+        self.repository_by_root(root, true)
+    }
+
+    fn repository_by_root(
+        &self,
+        root: &RepositoryRoot,
+        active_only: bool,
+    ) -> Result<Option<RegisteredRepository>, StoreError> {
+        let root_text = root
+            .as_path()
+            .to_str()
+            .ok_or_else(|| StoreError::NonUtf8RepositoryPath(root.as_path().to_path_buf()))?;
+        let sql = if active_only {
+            "SELECT id, root FROM repositories WHERE root = ?1 AND registered = 1"
+        } else {
+            "SELECT id, root FROM repositories WHERE root = ?1"
+        };
+        match self.conn.query_row(sql, params![root_text], |row| {
+            Ok(RegisteredRepository {
+                id: RepositoryId(row.get(0)?),
+                root: std::path::PathBuf::from(row.get::<_, String>(1)?),
+            })
+        }) {
+            Ok(repository) => Ok(Some(repository)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// List active registered repositories in root-path order.
+    pub fn repositories(&self) -> Result<Vec<RegisteredRepository>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, root FROM repositories WHERE registered = 1 ORDER BY root ASC")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RegisteredRepository {
+                id: RepositoryId(row.get(0)?),
+                root: std::path::PathBuf::from(row.get::<_, String>(1)?),
+            })
+        })?;
+        let mut repositories = Vec::new();
+        for row in rows {
+            repositories.push(row?);
+        }
+        Ok(repositories)
+    }
+
+    /// Find a work item by repository and user-facing slug.
+    pub fn work_item_id(
+        &self,
+        repository_id: &RepositoryId,
+        slug: &str,
+    ) -> Result<Option<WorkItemId>, StoreError> {
         match self.conn.query_row(
-            "SELECT id FROM work_items WHERE slug = ?1",
-            params![slug],
+            "SELECT id FROM work_items WHERE repository_id = ?1 AND slug = ?2",
+            params![repository_id.as_str(), slug],
             |row| row.get::<_, String>(0),
         ) {
             Ok(id) => Ok(Some(WorkItemId(id))),
@@ -220,17 +425,21 @@ impl Database {
         }
     }
 
-    /// Return the existing WI for `slug`, or create an empty one.
-    pub fn get_or_create_work_item(&mut self, slug: &str) -> Result<WorkItemId, StoreError> {
+    /// Return the existing WI for `(repository, slug)`, or create an empty one.
+    pub fn get_or_create_work_item(
+        &mut self,
+        repository_id: &RepositoryId,
+        slug: &str,
+    ) -> Result<WorkItemId, StoreError> {
         let id = WorkItemId::new();
         let ts = now_millis();
         self.conn
             .query_row(
-                "INSERT INTO work_items (id, slug, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?3)
-             ON CONFLICT(slug) DO UPDATE SET slug = excluded.slug
+                "INSERT INTO work_items (id, repository_id, slug, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(repository_id, slug) DO UPDATE SET slug = excluded.slug
              RETURNING id",
-                params![id.as_str(), slug, ts],
+                params![id.as_str(), repository_id.as_str(), slug, ts],
                 |row| row.get::<_, String>(0),
             )
             .map(WorkItemId)
@@ -264,7 +473,9 @@ impl Store {
     /// Open a fresh in-memory database with one empty WI. Intended for tests.
     pub fn open_in_memory() -> Result<Store, StoreError> {
         let mut db = Database::open_in_memory()?;
-        let id = db.get_or_create_work_item("test-wi")?;
+        let root = RepositoryRoot::from_canonical("/test/repository");
+        let repository = db.register_repository(&root)?;
+        let id = db.get_or_create_work_item(&repository.id, "test-wi")?;
         db.into_store(id)
     }
 
@@ -632,6 +843,11 @@ fn now_millis() -> String {
 mod tests {
     use super::*;
 
+    fn register(db: &mut Database, root: &str) -> RegisteredRepository {
+        db.register_repository(&RepositoryRoot::from_canonical(root))
+            .unwrap()
+    }
+
     #[test]
     fn opens_and_migrates() {
         let db = Database::open_in_memory().unwrap();
@@ -682,12 +898,85 @@ mod tests {
     }
 
     #[test]
+    fn migrates_global_v1_without_losing_work_item_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quorum.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta (key, value) VALUES ('schema_version', '1');
+             CREATE TABLE work_items (
+                 id TEXT PRIMARY KEY,
+                 slug TEXT NOT NULL UNIQUE,
+                 text TEXT,
+                 source TEXT,
+                 origin_repo TEXT,
+                 origin_issue INTEGER,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+             );
+             CREATE TABLE states (
+                 work_item_id TEXT PRIMARY KEY REFERENCES work_items(id) ON DELETE CASCADE,
+                 state TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+             );
+             INSERT INTO work_items
+                 (id, slug, text, created_at, updated_at)
+             VALUES ('legacy-wi', 'legacy', '# Legacy', '1', '1');
+             INSERT INTO states (work_item_id, state, updated_at)
+             VALUES ('legacy-wi', 'Planning', '1');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 2);
+        let store = db.into_store(WorkItemId("legacy-wi".to_string())).unwrap();
+        assert_eq!(store.work_item().unwrap().as_deref(), Some("# Legacy"));
+        assert_eq!(store.current_state().unwrap(), Some(State::Planning));
+    }
+
+    #[test]
+    fn migration_recheck_tolerates_an_already_upgraded_database() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate_v1_to_v2().unwrap();
+        assert_eq!(db.schema_version().unwrap(), 2);
+    }
+
+    #[test]
     fn get_or_create_returns_stable_id() {
         let mut db = Database::open_in_memory().unwrap();
-        let first = db.get_or_create_work_item("example").unwrap();
-        let second = db.get_or_create_work_item("example").unwrap();
+        let repository = register(&mut db, "/repo");
+        let first = db
+            .get_or_create_work_item(&repository.id, "example")
+            .unwrap();
+        let second = db
+            .get_or_create_work_item(&repository.id, "example")
+            .unwrap();
         assert_eq!(first, second);
-        assert_eq!(db.work_item_id("example").unwrap(), Some(first));
+        assert_eq!(
+            db.work_item_id(&repository.id, "example").unwrap(),
+            Some(first)
+        );
+    }
+
+    #[test]
+    fn registration_is_idempotent_and_reactivation_keeps_identity() {
+        let mut db = Database::open_in_memory().unwrap();
+        let first = register(&mut db, "/repo");
+        let second = register(&mut db, "/repo");
+        assert_eq!(first, second);
+        assert_eq!(db.repositories().unwrap(), vec![first.clone()]);
+
+        assert_eq!(
+            db.unregister_repository(&RepositoryRoot::from_canonical("/repo"))
+                .unwrap(),
+            Some(first.clone())
+        );
+        assert!(db.repositories().unwrap().is_empty());
+
+        let reactivated = register(&mut db, "/repo");
+        assert_eq!(reactivated, first);
     }
 
     #[test]
@@ -696,7 +985,10 @@ mod tests {
         let path = dir.path().join("quorum.db");
         let id = {
             let mut db = Database::open(&path).unwrap();
-            let id = db.get_or_create_work_item("example").unwrap();
+            let repository = register(&mut db, "/repo");
+            let id = db
+                .get_or_create_work_item(&repository.id, "example")
+                .unwrap();
             let mut store = db.into_store(id.clone()).unwrap();
             store
                 .record_transition(Some(State::Intake), State::Planning, "auto")
@@ -723,8 +1015,14 @@ mod tests {
 
         let (one, two) = {
             let mut db = Database::open(&path).unwrap();
-            let one = db.get_or_create_work_item("one").unwrap();
-            let two = db.get_or_create_work_item("two").unwrap();
+            let repository_one = register(&mut db, "/repo/one");
+            let repository_two = register(&mut db, "/repo/two");
+            let one = db
+                .get_or_create_work_item(&repository_one.id, "same-slug")
+                .unwrap();
+            let two = db
+                .get_or_create_work_item(&repository_two.id, "same-slug")
+                .unwrap();
             (one, two)
         };
 
