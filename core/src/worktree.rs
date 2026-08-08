@@ -1,4 +1,4 @@
-//! Git worktree lifecycle for WI implementation checkouts.
+//! Git worktree lifecycle for work-item implementation checkouts.
 
 use crate::persistence::{
     Database, ImplementationRound, RegisteredRepository, StoreError, WorkItemId, WorktreeRecord,
@@ -6,7 +6,7 @@ use crate::persistence::{
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-/// Ensure a WI has a ready linked worktree rooted at `preferred_path`.
+/// Ensure a work item has a ready linked worktree rooted at `preferred_path`.
 ///
 /// The first call pins the repository's committed `HEAD`, persists the setup
 /// intent, and then creates the branch/worktree. Later calls reconcile Git with
@@ -58,7 +58,7 @@ pub fn worktree_record(
     Ok(database.worktree(work_item_id)?)
 }
 
-/// Deterministic, Git-safe branch name for a WI.
+/// Deterministic, Git-safe branch name for a work item.
 pub fn branch_name(slug: &str, work_item_id: &WorkItemId) -> String {
     let mut normalized = String::new();
     let mut previous_dash = false;
@@ -654,7 +654,7 @@ mod tests {
 
         let result = finalize_implementation_round(
             repository.path(),
-            &WorkItemId::for_test("wi"),
+            &WorkItemId::for_test("work-item"),
             "example",
             &start,
         )
@@ -682,7 +682,7 @@ mod tests {
 
         let result = finalize_implementation_round(
             repository.path(),
-            &WorkItemId::for_test("wi"),
+            &WorkItemId::for_test("work-item"),
             "example",
             &start,
         )
@@ -699,7 +699,7 @@ mod tests {
     fn adopts_matching_round_commit_after_database_crash() {
         let repository = repository();
         let start = round(repository.path(), 2);
-        let work_item_id = WorkItemId::for_test("wi");
+        let work_item_id = WorkItemId::for_test("work-item");
         std::fs::write(repository.path().join("tracked.txt"), "changed\n").unwrap();
         let committed =
             finalize_implementation_round(repository.path(), &work_item_id, "example", &start)
@@ -733,7 +733,7 @@ mod tests {
 
         let error = finalize_implementation_round(
             repository.path(),
-            &WorkItemId::for_test("wi"),
+            &WorkItemId::for_test("work-item"),
             "example",
             &start,
         )

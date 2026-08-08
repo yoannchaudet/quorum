@@ -1,4 +1,4 @@
-//! Quorum Core — headless logic for driving a single work item (WI).
+//! Quorum Core — headless logic for driving a single work item.
 //!
 //! See `docs/architecture.md`. The Core is frontend-agnostic; the CLI (and a
 //! future Tauri UX) are thin drivers over this crate.
@@ -14,7 +14,7 @@ pub mod repository;
 pub mod state;
 pub mod worktree;
 
-pub use agent::{AgentRunner, CopilotRunner, EchoRunner};
+pub use agent::{AgentRole, AgentRunner, CopilotRunner, EchoRunner};
 pub use config::Config;
 pub use coordinator::{Coordinator, Decision};
 pub use observability::{

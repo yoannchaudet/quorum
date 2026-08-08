@@ -1,15 +1,15 @@
 # Sessions (Human Intervention)
 
-When the CO is blocked awaiting a human (see [state-machine](state-machine.md)), it
+When the Coordinator is blocked awaiting a human, it
 gathers input through a **named `copilot` Session** — a terminal conversation that can
-be resumed later. This keeps HI in the same simple interface everywhere.
+be resumed later. This keeps human intervention in the same simple interface everywhere.
 
 ## Naming
 
-A Session name ties it to a WI and the blocking state:
+A Session name ties it to a work item and the blocking state:
 
 ```
-quorum/<wi-id>/<state>
+quorum/<work-item-slug>/<state>
 # e.g. quorum/1234/IntakeReview
 ```
 
@@ -17,7 +17,7 @@ This makes the right Session trivial to find and resume for a given block.
 
 ## CLI behavior
 
-When a WI enters a blocked state, the CLI:
+When a work item enters a blocked state, the CLI:
 
 1. Prints the current state and why it is blocked.
 2. Records the deterministic session name (see above) and surfaces it, with the
@@ -29,7 +29,7 @@ When a WI enters a blocked state, the CLI:
    > name, so the human assigns the name once via `/rename`; Quorum supplies the
    > name to use so it stays consistent for the block.
 3. The human resolves the block with a Quorum command (`quorum approve` /
-   `reject` / `answer` / `abandon`), and the CO resumes autonomous progress.
+   `reject` / `answer` / `abandon`), and the Coordinator resumes autonomous progress.
 
 ## Tauri UX (future)
 

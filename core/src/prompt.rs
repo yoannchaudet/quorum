@@ -29,27 +29,27 @@ const IMPLEMENTER: &str = include_str!("../../prompts/implementer.md");
 const REVIEWER: &str = include_str!("../../prompts/reviewer.md");
 
 impl Prompt {
-    /// The planner (PL) prompt.
+    /// The Planner prompt.
     pub fn planner() -> Prompt {
         Prompt::parse(PLANNER).expect("embedded planner prompt is valid")
     }
 
-    /// The intake-questions (PL) prompt.
+    /// The intake-questions Planner prompt.
     pub fn intake_questions() -> Prompt {
         Prompt::parse(INTAKE_QUESTIONS).expect("embedded intake-questions prompt is valid")
     }
 
-    /// The merge (CO) prompt.
+    /// The Coordinator merge prompt.
     pub fn merge() -> Prompt {
         Prompt::parse(MERGE).expect("embedded merge prompt is valid")
     }
 
-    /// The implementer (IM) prompt.
+    /// The Implementer prompt.
     pub fn implementer() -> Prompt {
         Prompt::parse(IMPLEMENTER).expect("embedded implementer prompt is valid")
     }
 
-    /// The reviewer (RV) prompt.
+    /// The Reviewer prompt.
     pub fn reviewer() -> Prompt {
         Prompt::parse(REVIEWER).expect("embedded reviewer prompt is valid")
     }
@@ -108,6 +108,22 @@ mod tests {
     }
 
     #[test]
+    fn embedded_prompt_metadata_uses_full_role_names() {
+        for (prompt, role) in [
+            (PLANNER, "Planner"),
+            (INTAKE_QUESTIONS, "Planner"),
+            (MERGE, "Coordinator"),
+            (IMPLEMENTER, "Implementer"),
+            (REVIEWER, "Reviewer"),
+        ] {
+            assert!(
+                prompt.contains(&format!("role: {role}")),
+                "prompt is missing role {role}"
+            );
+        }
+    }
+
+    #[test]
     fn body_excludes_frontmatter() {
         let p = Prompt::planner();
         assert!(!p.body.contains("model-target"));
@@ -125,12 +141,12 @@ mod tests {
     fn render_substitutes_placeholders() {
         let p = Prompt {
             id: "x".into(),
-            body: "hello {{name}}, WI: {{work_item}}".into(),
+            body: "hello {{name}}, work item: {{work_item}}".into(),
         };
         let out = p
             .render(&[("name", "world"), ("work_item", "do the thing")])
             .unwrap();
-        assert_eq!(out, "hello world, WI: do the thing");
+        assert_eq!(out, "hello world, work item: do the thing");
     }
 
     #[test]

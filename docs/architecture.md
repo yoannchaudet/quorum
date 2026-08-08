@@ -15,7 +15,7 @@ flowchart TB
   core --> gh[GitHub]
   core --> cop[copilot CLI]
   core --> db[(Global SQLite state)]
-  core --> fs[(Per-WI files)]
+  core --> fs[(Per-work-item files)]
   classDef future stroke-dasharray: 4 4;
 ```
 
@@ -23,7 +23,7 @@ flowchart TB
 
 ```
 Cargo.toml            # [workspace] members = ["core", "cli"]
-core/                 # all logic: state machine, CO/PL/IM/RV, persistence, config
+core/                 # state machine, agents, persistence, and config
   src/lib.rs
 cli/                  # thin binary: parse args, call Core, render state
   src/main.rs
@@ -33,16 +33,16 @@ cli/                  # thin binary: parse args, call Core, render state
 
 | Layer | Owns | Does NOT own |
 |-------|------|--------------|
-| Core | State machine, agent orchestration (CO/PL/IM/RV), persistence, repository/worktree lifecycle, config load, GitHub + `copilot` invocation | Argument parsing, terminal rendering |
-| CLI | One WI: start/resume, render live activity and status snapshots | Any business logic; multi-WI orchestration |
-| Tauri (future) | Windowing, launching a terminal for HI | Any logic not already in Core |
+| Core | State machine, agent orchestration, persistence, repository/worktree lifecycle, config load, GitHub + `copilot` invocation | Argument parsing, terminal rendering |
+| CLI | One work item: start/resume, render live activity and status snapshots | Any business logic; multi-work-item orchestration |
+| Tauri (future) | Windowing, launching a terminal for human intervention | Any logic not already in Core |
 
 ## Principles
 
 - **Core is headless and deterministic** given its on-disk state; both frontends are interchangeable drivers.
-- **CLI is light**: it drives exactly one WI. Orchestrating many WIs is a future UX concern.
+- **CLI is light**: it drives exactly one work item. Orchestrating many work items is a future UX concern.
 - **No logic in frontends**: anything a human would call "how Quorum works" lives in Core.
-- **Registered context**: every WI is scoped to an allow-listed Git repository.
+- **Registered context**: every work item is scoped to an allow-listed Git repository.
 - **Typed observability**: Core emits and persists structured activity; frontends only
   choose how to render it.
 

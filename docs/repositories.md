@@ -1,11 +1,11 @@
 # Repository Context
 
-Every WI belongs to one explicitly registered Git repository. Registration is an
-allow-list: Quorum refuses to process WIs for repositories the user has not approved.
+Every work item belongs to one explicitly registered Git repository. Registration is an
+allow-list: Quorum refuses to process work items for repositories the user has not approved.
 
 ## Context resolution
 
-WI commands resolve their repository in this order:
+Work-item commands resolve their repository in this order:
 
 1. Global `--context <folder>`.
 2. The current working directory.
@@ -23,27 +23,28 @@ for the top-level directory and stores its canonical path.
 
 For register/unregister, the explicit path overrides `--context`, which overrides cwd.
 Registration is idempotent. Re-registering a previously removed root restores the same
-stable repository ID and its WI associations.
+stable repository ID and its work-item associations.
 
-Unregistering never deletes WIs, filesystem state, branches, or worktrees. WI commands
+Unregistering never deletes work items, filesystem state, branches, or worktrees.
+Work-item commands
 remain blocked until that repository is registered again.
 
-## WI worktrees
+## Work-item worktrees
 
 The first run pins the repository's committed `HEAD` and creates a linked worktree at
 `~/.quorum/state/<work-item-id>/implementation/`. Quorum uses a deterministic branch:
 
 ```
-quorum/<sanitized-wi-slug>-<short-work-item-id>
+quorum/<sanitized-work-item-slug>-<short-work-item-id>
 ```
 
 The original checkout and any uncommitted changes in it remain untouched. Worktrees and
-branches are retained when a WI reaches `Done`, `Failed`, or `Abandoned`.
+branches are retained when a work item reaches `Done`, `Failed`, or `Abandoned`.
 
 ## Work-item identity
 
-The user-facing WI slug is unique within a repository, not globally. Two repositories
-may therefore each contain a WI named `example`.
+The user-facing work-item slug is unique within a repository, not globally. Two
+repositories may therefore each contain a work item named `example`.
 
-Repository IDs and WI IDs are opaque UUIDs stored in the global database. Canonical
+Repository IDs and work-item IDs are opaque UUIDs stored in the global database. Canonical
 paths identify registration records; they are not used as filesystem directory names.

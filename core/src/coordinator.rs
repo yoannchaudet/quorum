@@ -1,13 +1,13 @@
-//! The Coordinator (CO). Mirrors `docs/agents.md`.
+//! The Coordinator. Mirrors `docs/agents.md`.
 //!
-//! The CO is the only stateful orchestrator for a single WI: it owns the state
+//! The Coordinator is the only stateful orchestrator for a single work item: it owns the state
 //! machine, runs the agents, and persists after every step so it can resume
 //! after a crash.
 
 use std::path::PathBuf;
 use std::time::Instant;
 
-use crate::agent::{AgentError, AgentRequest, AgentRunner, Filesystem};
+use crate::agent::{AgentError, AgentRequest, AgentRole, AgentRunner, Filesystem};
 use crate::config::Config;
 use crate::convergence;
 use crate::observability::{ActivityEvent, ActivityKind, ActivityObserver, NoopActivityObserver};
@@ -39,7 +39,7 @@ pub enum CoordinatorError {
     InvalidResolution { state: State, decision: Decision },
 }
 
-/// A human's decision to resolve a blocked (HI) state (see `docs/agents.md`).
+/// A human's decision to resolve a blocked state (see `docs/agents.md`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     /// Accept the current gate (PlanReview or WorkReview).
@@ -85,15 +85,15 @@ pub struct Coordinator {
     /// Working directory used as the sandbox cwd for agent invocations.
     workspace: PathBuf,
     implementation_allowed_dirs: Vec<PathBuf>,
-    /// The work item id, used to derive session names (see `docs/sessions.md`).
-    wi_id: String,
+    /// The work-item slug used to derive session names (see `docs/sessions.md`).
+    work_item_slug: String,
     state: State,
 }
 
 impl Coordinator {
     /// Create a Coordinator over an opened `store`, resuming the persisted state
     /// if present, otherwise starting at `Intake`. `workspace` is the sandbox
-    /// cwd for agent invocations; `wi_id` identifies the work item (used for
+    /// cwd for agent invocations; `work_item_slug` identifies the work item (used for
     /// session names).
     pub fn new(
         config: Config,
@@ -101,7 +101,7 @@ impl Coordinator {
         runner: Box<dyn AgentRunner>,
         implementation_workspace: Box<dyn ImplementationWorkspace>,
         workspace: PathBuf,
-        wi_id: impl Into<String>,
+        work_item_slug: impl Into<String>,
     ) -> Result<Coordinator, CoordinatorError> {
         let state = store.current_state()?.unwrap_or(State::Intake);
         Ok(Coordinator {
@@ -112,7 +112,7 @@ impl Coordinator {
             implementation_workspace,
             workspace,
             implementation_allowed_dirs: Vec::new(),
-            wi_id: wi_id.into(),
+            work_item_slug: work_item_slug.into(),
             state,
         })
     }
@@ -127,7 +127,7 @@ impl Coordinator {
         self
     }
 
-    /// The current state of the WI.
+    /// The current state of the work item.
     pub fn state(&self) -> State {
         self.state
     }
@@ -137,28 +137,28 @@ impl Coordinator {
         &self.config
     }
 
-    /// The recorded transition history for this WI.
+    /// The recorded transition history for this work item.
     pub fn history(&self) -> Result<Vec<Transition>, CoordinatorError> {
         Ok(self.store.history()?)
     }
 
-    /// The intake questions surfaced to the human, if the WI is awaiting answers.
+    /// The intake questions surfaced to the human when the work item awaits answers.
     pub fn questions(&self) -> Result<Option<String>, CoordinatorError> {
         Ok(self.store.questions()?)
     }
 
-    /// The HI session name for the current state, if it is a blocked
-    /// (human-intervention) state. Deterministic from the WI id and state
-    /// (`quorum/<wi-id>/<state>`), so it survives crashes (see `docs/sessions.md`).
+    /// The human-intervention session name for the current blocked state.
+    /// Deterministic from the work-item slug and state
+    /// (`quorum/<work-item-slug>/<state>`), so it survives crashes.
     pub fn session_name(&self) -> Option<String> {
         if self.state.is_blocked() {
-            Some(format!("quorum/{}/{}", self.wi_id, self.state))
+            Some(format!("quorum/{}/{}", self.work_item_slug, self.state))
         } else {
             None
         }
     }
 
-    /// If the WI is at a blocked state, ensure its named session is recorded
+    /// If the work item is blocked, ensure its named session is recorded
     /// (idempotent) and return the session name. No-op for non-blocked states.
     pub fn ensure_session(&mut self) -> Result<Option<String>, CoordinatorError> {
         match self.session_name() {
@@ -192,7 +192,7 @@ impl Coordinator {
         Ok(self.state)
     }
 
-    /// Resolve the current blocked (HI) state with a human `decision`, performing
+    /// Resolve the current blocked state with a human `decision`, performing
     /// the corresponding validated, persisted transition (see `docs/agents.md`).
     ///
     /// The decision (and any answer) is logged in the **same** transaction as the
@@ -200,7 +200,7 @@ impl Coordinator {
     /// actually advance the state.
     ///
     /// Errors if the decision does not apply to the current state (e.g. approving
-    /// when the WI is not at a review gate).
+    /// when the work item is not at a review gate).
     pub fn resolve(&mut self, decision: Decision) -> Result<State, CoordinatorError> {
         use Decision::*;
         use State::*;
@@ -210,7 +210,7 @@ impl Coordinator {
             (WorkReview, Approve) => (Done, None),
             (WorkReview, Reject) => (Implementing, None),
             (IntakeReview, Answer(text)) => (Planning, Some(text.as_str())),
-            // Abandoning is allowed from any blocked (HI) state.
+            // Abandoning is allowed from any blocked state.
             (s, Abandon) if s.is_blocked() => (Abandoned, None),
             _ => {
                 return Err(CoordinatorError::InvalidResolution {
@@ -230,11 +230,11 @@ impl Coordinator {
         let decision_data = format!("{}@{}", decision, self.state);
         let mut extra: Vec<(&str, &str)> = Vec::new();
         if let Some(text) = answer {
-            extra.push(("hi_answer", text));
+            extra.push(("human_answer", text));
         }
-        extra.push(("hi_decision", &decision_data));
+        extra.push(("human_decision", &decision_data));
 
-        let reason = format!("hi: {decision} {} -> {next}", self.state);
+        let reason = format!("human: {decision} {} -> {next}", self.state);
         self.store
             .record_transition_with_events(Some(self.state), next, &reason, &extra)?;
         let previous = self.state;
@@ -252,7 +252,7 @@ impl Coordinator {
     /// Run the planner roster for the current planning iteration, in isolation,
     /// and persist each candidate plan. Each pass uses a fresh iteration so the
     /// convergence loop can compare successive rounds.
-    /// Ask each planner, in isolation, whether the WI needs clarification before
+    /// Ask each planner, in isolation, whether the work item needs clarification before
     /// planning (see `prompts/intake-questions.md`). Returns the aggregated
     /// questions when any planner raises some, or `None` when all are satisfied.
     fn run_intake_questions(&mut self) -> Result<Option<String>, CoordinatorError> {
@@ -268,7 +268,7 @@ impl Coordinator {
             let rendered = prompt.render(&[("work_item", &work_item), ("answers", &answers)])?;
             let model = self.config.planners.get(&slot).cloned().unwrap_or_default();
             let req = AgentRequest {
-                role: format!("PL-intake:{slot}"),
+                role: AgentRole::intake_planner(slot.clone()),
                 prompt: rendered,
                 cwd: self.workspace.clone(),
                 filesystem: Filesystem::ReadOnly,
@@ -311,7 +311,7 @@ impl Coordinator {
             ])?;
             let model = self.config.planners.get(&slot).cloned().unwrap_or_default();
             let req = AgentRequest {
-                role: format!("PL:{slot}"),
+                role: AgentRole::planner(slot.clone()),
                 prompt: rendered,
                 cwd: self.workspace.clone(),
                 filesystem: Filesystem::ReadOnly,
@@ -327,7 +327,7 @@ impl Coordinator {
 
     /// Merge the latest candidates into a Plan and decide convergence.
     ///
-    /// Runs the merge (CO) prompt over the current iteration's candidates and the
+    /// Runs the Coordinator merge prompt over the current iteration's candidates and the
     /// previous merged plan, persists the merged plan, and returns whether the
     /// loop has converged — either because the model reported `CONVERGED`, the
     /// merged plan is materially unchanged (diff within the configured
@@ -352,7 +352,7 @@ impl Coordinator {
             ("previous_plan", &previous_plan),
         ])?;
         let req = AgentRequest {
-            role: "CO:merge".to_string(),
+            role: AgentRole::CoordinatorMerge,
             prompt: rendered,
             cwd: self.workspace.clone(),
             filesystem: Filesystem::ReadOnly,
@@ -391,10 +391,10 @@ impl Coordinator {
         Ok(converged)
     }
 
-    /// Run the Implementer (IM) against the accepted Plan, in its writable
+    /// Run the Implementer against the accepted Plan, in its writable
     /// workspace, and persist the summary it returns.
     ///
-    /// The IM runs read/write at the worktree root (its sandbox cwd, see
+    /// The Implementer runs read/write at the worktree root (its sandbox cwd, see
     /// `docs/isolation.md`). On re-entry from the adversarial loop, the latest
     /// review feedback is fed back in.
     fn run_implementer(&mut self) -> Result<(), CoordinatorError> {
@@ -476,7 +476,7 @@ impl Coordinator {
                 ("feedback", &feedback),
             ])?;
             let req = AgentRequest {
-                role: "IM".to_string(),
+                role: AgentRole::Implementer,
                 prompt: rendered,
                 cwd: self.workspace.clone(),
                 filesystem: Filesystem::ReadWrite,
@@ -513,7 +513,7 @@ impl Coordinator {
         let result = self.implementation_workspace.finalize(
             &self.workspace,
             self.store.work_item_id(),
-            &self.wi_id,
+            &self.work_item_slug,
             &round,
         )?;
         self.store
@@ -538,10 +538,10 @@ impl Coordinator {
         Ok(())
     }
 
-    /// Run the Reviewer (RV) adversarially over the latest implementation and
+    /// Run the Reviewer adversarially over the latest implementation and
     /// record the verdict. Returns the outcome so the caller can drive the loop.
     ///
-    /// The RV runs read-only and is a different model from the IM (see
+    /// The Reviewer runs read-only and is a different model from the Implementer (see
     /// `docs/agents.md`). Its review is keyed to the implementation's iteration.
     fn run_reviewer(&mut self) -> Result<ReviewOutcome, CoordinatorError> {
         let work_item = self
@@ -560,7 +560,7 @@ impl Coordinator {
             ("implementation", &implementation),
         ])?;
         let req = AgentRequest {
-            role: "RV".to_string(),
+            role: AgentRole::Reviewer,
             prompt: rendered,
             cwd: self.workspace.clone(),
             filesystem: Filesystem::ReadOnly,
@@ -615,7 +615,7 @@ impl Coordinator {
             let mut started =
                 ActivityEvent::new(ActivityKind::AgentStarted, format!("{} started", req.role))
                     .phase(self.state)
-                    .role(req.role.clone())
+                    .role(req.role.to_string())
                     .model(req.model.clone())
                     .attempt(attempt);
             if let Some(iteration) = req.iteration {
@@ -630,7 +630,7 @@ impl Coordinator {
                         format!("{} completed", req.role),
                     )
                     .phase(self.state)
-                    .role(req.role.clone())
+                    .role(req.role.to_string())
                     .model(req.model.clone())
                     .attempt(attempt)
                     .elapsed(start.elapsed().as_millis() as u64);
@@ -655,7 +655,7 @@ impl Coordinator {
                         },
                     )
                     .phase(self.state)
-                    .role(req.role.clone())
+                    .role(req.role.to_string())
                     .model(req.model.clone())
                     .attempt(attempt)
                     .elapsed(start.elapsed().as_millis() as u64);
@@ -670,15 +670,15 @@ impl Coordinator {
         Err(last.expect("attempts >= 1").into())
     }
 
-    /// Advance the WI by one autonomous step, performing any agent work the
+    /// Advance the work item by one autonomous step, performing any agent work the
     /// current state requires before transitioning.
     ///
     /// Returns the (possibly unchanged) state. The state is unchanged when the
-    /// WI is blocked on HI or terminal — the caller must resolve HI to proceed.
+    /// work item is blocked on human input or terminal.
     ///
     /// A step whose agent work fails (after retries) or which cannot proceed is
     /// moved to `Failed` (terminal), with the cause recorded, rather than
-    /// aborting the process — the CO runs unattended (see `docs/persistence.md`).
+    /// aborting the process — the Coordinator runs unattended.
     /// Store (database) errors are not recoverable and propagate.
     pub fn step(&mut self) -> Result<State, CoordinatorError> {
         if self.state.is_blocked() || self.state.is_terminal() {
@@ -769,7 +769,7 @@ impl Coordinator {
         Ok((next, detail))
     }
 
-    /// Move the WI to `Failed`, recording the cause. `Failed` is terminal but the
+    /// Move the work item to `Failed`, recording the cause.
     /// database is preserved for inspection (see `docs/persistence.md`).
     fn fail(&mut self, cause: &str) -> Result<State, CoordinatorError> {
         // fail() is only reached from autonomous states, all of which permit a
@@ -790,9 +790,9 @@ impl Coordinator {
         Ok(State::Failed)
     }
 
-    /// Step repeatedly until the WI is blocked on HI or reaches a terminal state.
+    /// Step repeatedly until the work item is blocked or reaches a terminal state.
     ///
-    /// When it stops at a blocked (HI) state, the named session is recorded so
+    /// When it stops at a blocked state, the named session is recorded so
     /// the human can resume it (see `docs/sessions.md`).
     pub fn run_until_blocked(&mut self) -> Result<State, CoordinatorError> {
         loop {
@@ -894,17 +894,17 @@ mod tests {
         Box::new(FakeImplementationWorkspace::new(false))
     }
 
-    fn coordinator_with_wi(config: Config) -> (Coordinator, tempfile::TempDir) {
+    fn coordinator_with_work_item(config: Config) -> (Coordinator, tempfile::TempDir) {
         let workspace = tempfile::tempdir().unwrap();
         let mut store = Store::open_in_memory().unwrap();
-        store.set_work_item("# WI\ndo the thing").unwrap();
+        store.set_work_item("# Work Item\ndo the thing").unwrap();
         let co = Coordinator::new(
             config,
             store,
             Box::new(EchoRunner),
             fake_workspace(),
             workspace.path().into(),
-            "test-wi",
+            "test-work-item",
         )
         .unwrap();
         (co, workspace)
@@ -931,11 +931,11 @@ mod tests {
 
     impl AgentRunner for IteratingRunner {
         fn run(&self, req: &AgentRequest) -> Result<String, AgentError> {
-            if req.role.contains("intake") {
+            if matches!(req.role, AgentRole::IntakePlanner { .. }) {
                 return Ok("NONE".to_string());
             }
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
-            if req.role.starts_with("CO:merge") {
+            if req.role == AgentRole::CoordinatorMerge {
                 let m = self.merges.fetch_add(1, Ordering::SeqCst);
                 let verdict = if m < self.iterate_times {
                     "ITERATE — differs"
@@ -954,7 +954,7 @@ mod tests {
 
     #[test]
     fn new_coordinator_starts_at_intake() {
-        let (co, _tmp) = coordinator_with_wi(Config::default());
+        let (co, _tmp) = coordinator_with_work_item(Config::default());
         assert_eq!(co.state(), State::Intake);
     }
 
@@ -967,10 +967,10 @@ mod tests {
             Box::new(EchoRunner),
             fake_workspace(),
             PathBuf::from("."),
-            "test-wi",
+            "test-work-item",
         )
         .unwrap();
-        // A missing work item is unrecoverable: the WI moves to Failed with the
+        // A missing work item is unrecoverable: it moves to Failed with the
         // cause recorded, rather than aborting the process.
         assert_eq!(co.step().unwrap(), State::Failed);
         assert!(co.store.count_events_of_kind("error").unwrap() >= 1);
@@ -978,7 +978,7 @@ mod tests {
 
     #[test]
     fn runs_until_first_review_gate_by_default() {
-        let (mut co, _tmp) = coordinator_with_wi(Config::default());
+        let (mut co, _tmp) = coordinator_with_work_item(Config::default());
         let state = co.run_until_blocked().unwrap();
         assert_eq!(state, State::PlanReview);
 
@@ -991,11 +991,11 @@ mod tests {
 
     #[test]
     fn blocking_records_a_named_session() {
-        let (mut co, _tmp) = coordinator_with_wi(Config::default());
+        let (mut co, _tmp) = coordinator_with_work_item(Config::default());
         assert_eq!(co.run_until_blocked().unwrap(), State::PlanReview);
 
-        // The session name is deterministic and derived from the WI id + state.
-        let expected = "quorum/test-wi/PlanReview".to_string();
+        // The session name is deterministic and derived from the work-item slug and state.
+        let expected = "quorum/test-work-item/PlanReview".to_string();
         assert_eq!(co.session_name(), Some(expected.clone()));
         // And it was persisted (recoverable across a crash).
         assert_eq!(co.store.session(State::PlanReview).unwrap(), Some(expected));
@@ -1003,14 +1003,14 @@ mod tests {
 
     #[test]
     fn non_blocked_state_has_no_session() {
-        let (co, _tmp) = coordinator_with_wi(Config::default());
-        // At Intake (autonomous), there is no HI session.
+        let (co, _tmp) = coordinator_with_work_item(Config::default());
+        // At Intake (autonomous), there is no human-intervention session.
         assert_eq!(co.session_name(), None);
     }
 
     #[test]
     fn planning_persists_a_candidate_per_planner() {
-        let (mut co, _tmp) = coordinator_with_wi(Config::default());
+        let (mut co, _tmp) = coordinator_with_work_item(Config::default());
         co.run_until_blocked().unwrap();
         let candidates = co.store.candidates(0).unwrap();
         // Default roster has three planner slots.
@@ -1021,7 +1021,7 @@ mod tests {
     #[test]
     fn single_pass_convergence_persists_a_plan() {
         // EchoRunner reports CONVERGED, so one pass suffices.
-        let (mut co, _tmp) = coordinator_with_wi(Config::default());
+        let (mut co, _tmp) = coordinator_with_work_item(Config::default());
         assert_eq!(co.run_until_blocked().unwrap(), State::PlanReview);
         let plan = co.store.plan().unwrap();
         assert!(plan.is_some(), "a converged plan must be persisted");
@@ -1034,14 +1034,14 @@ mod tests {
         let runner = IteratingRunner::new(2); // ITERATE twice, then CONVERGE
         let merges = runner.merges.clone();
         let mut store = Store::open_in_memory().unwrap();
-        store.set_work_item("# WI").unwrap();
+        store.set_work_item("# Work Item").unwrap();
         let mut co = Coordinator::new(
             Config::default(),
             store,
             Box::new(runner),
             fake_workspace(),
             PathBuf::from("."),
-            "test-wi",
+            "test-work-item",
         )
         .unwrap();
 
@@ -1069,14 +1069,14 @@ mod tests {
         let runner = IteratingRunner::new(usize::MAX);
         let merges = runner.merges.clone();
         let mut store = Store::open_in_memory().unwrap();
-        store.set_work_item("# WI").unwrap();
+        store.set_work_item("# Work Item").unwrap();
         let mut co = Coordinator::new(
             config,
             store,
             Box::new(runner),
             fake_workspace(),
             PathBuf::from("."),
-            "test-wi",
+            "test-work-item",
         )
         .unwrap();
 
@@ -1087,7 +1087,7 @@ mod tests {
     }
 
     /// A runner that converges immediately at merge, and for the reviewer rejects
-    /// the first `reject_times` rounds then accepts. Planner/IM outputs are
+    /// the first `reject_times` rounds then accepts. Planner and Implementer outputs are
     /// generic. Used to drive the adversarial loop.
     struct ReviewRunner {
         reject_times: usize,
@@ -1105,11 +1105,11 @@ mod tests {
 
     impl AgentRunner for ReviewRunner {
         fn run(&self, req: &AgentRequest) -> Result<String, AgentError> {
-            if req.role.contains("intake") {
+            if matches!(req.role, AgentRole::IntakePlanner { .. }) {
                 Ok("NONE".to_string())
-            } else if req.role.starts_with("CO:merge") {
+            } else if req.role == AgentRole::CoordinatorMerge {
                 Ok("## Plan\nthe plan\n\n## Convergence\nCONVERGED".to_string())
-            } else if req.role == "RV" {
+            } else if req.role == AgentRole::Reviewer {
                 let n = self.reviews.fetch_add(1, Ordering::SeqCst);
                 let verdict = if n < self.reject_times {
                     "REJECT"
@@ -1136,14 +1136,14 @@ mod tests {
         // Leak the tempdir so the workspace path stays valid for the test.
         let path = workspace.keep();
         let mut store = Store::open_in_memory().unwrap();
-        store.set_work_item("# WI").unwrap();
+        store.set_work_item("# Work Item").unwrap();
         Coordinator::new(
             config,
             store,
             runner,
             implementation_workspace,
             path,
-            "test-wi",
+            "test-work-item",
         )
         .unwrap()
     }
@@ -1169,7 +1169,7 @@ mod tests {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if n < self.fail_times {
                 Err(AgentError::NonZeroExit {
-                    role: req.role.clone(),
+                    role: req.role.to_string(),
                     code: "1".to_string(),
                     stderr: "boom".to_string(),
                 })
@@ -1208,7 +1208,7 @@ mod tests {
             },
         ));
 
-        // Despite the initial transient failures, the WI completes normally.
+        // Despite the initial transient failures, the work item completes normally.
         assert_eq!(co.run_until_blocked().unwrap(), State::Done);
         assert_eq!(
             events
@@ -1225,7 +1225,7 @@ mod tests {
     fn emits_and_persists_agent_lifecycle_activity() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let mut store = Store::open_in_memory().unwrap();
-        store.set_work_item("# WI").unwrap();
+        store.set_work_item("# Work Item").unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let mut co = Coordinator::new(
             Config::default(),
@@ -1233,7 +1233,7 @@ mod tests {
             Box::new(EchoRunner),
             fake_workspace(),
             workspace.path().to_path_buf(),
-            "test-wi",
+            "test-work-item",
         )
         .unwrap()
         .with_observer(Box::new(CollectingObserver {
@@ -1266,7 +1266,7 @@ mod tests {
 
     impl AgentRunner for IntakeRunner {
         fn run(&self, req: &AgentRequest) -> Result<String, AgentError> {
-            if req.role.contains("intake") {
+            if matches!(req.role, AgentRole::IntakePlanner { .. }) {
                 if self.needs_answers.load(Ordering::SeqCst) {
                     Ok("1. Please clarify the scope?".to_string())
                 } else {
@@ -1280,8 +1280,8 @@ mod tests {
 
     #[test]
     fn no_questions_proceeds_past_intake() {
-        // EchoRunner returns NONE for intake, so the WI never blocks there.
-        let (mut co, _tmp) = coordinator_with_wi(Config::default());
+        // EchoRunner returns NONE for intake, so the work item never blocks there.
+        let (mut co, _tmp) = coordinator_with_work_item(Config::default());
         assert_eq!(co.run_until_blocked().unwrap(), State::PlanReview);
         assert!(co.store.questions().unwrap().is_none());
     }
@@ -1311,7 +1311,7 @@ mod tests {
             State::Planning
         );
 
-        // No more questions: the WI runs to completion, and the answer is stored
+        // No more questions: the work item runs to completion, and the answer is stored
         // (and fed to planners).
         assert_eq!(co.run_until_blocked().unwrap(), State::Done);
         assert!(co.store.answers().unwrap().contains("scope is X"));
@@ -1412,7 +1412,7 @@ mod tests {
 
         let calls = Arc::new(AtomicUsize::new(0));
         let mut store = Store::open_in_memory().unwrap();
-        store.set_work_item("# WI").unwrap();
+        store.set_work_item("# Work Item").unwrap();
         store.set_plan("the plan", "").unwrap();
         store
             .reserve_implementation_round(0, "base-commit")
@@ -1427,7 +1427,7 @@ mod tests {
             Box::new(CountingRunner(calls.clone())),
             fake_workspace(),
             workspace.path().to_path_buf(),
-            "test-wi",
+            "test-work-item",
         )
         .unwrap();
 
@@ -1449,7 +1449,7 @@ mod tests {
         let mut config = Config::default();
         config.reviews.plan_review = false;
         config.reviews.work_review = false;
-        let (mut co, _tmp) = coordinator_with_wi(config);
+        let (mut co, _tmp) = coordinator_with_work_item(config);
         let state = co.run_until_blocked().unwrap();
         assert_eq!(state, State::Done);
 
@@ -1471,15 +1471,15 @@ mod tests {
         let mut config = Config::default();
         config.reviews.plan_review = false;
         config.reviews.work_review = false;
-        let (mut co, tmp) = coordinator_with_wi(config);
+        let (mut co, tmp) = coordinator_with_work_item(config);
         assert_eq!(co.run_until_blocked().unwrap(), State::Done);
 
-        // The IM summary is persisted at iteration 0.
+        // The Implementer summary is persisted at iteration 0.
         let latest = co.store.latest_implementation().unwrap();
         assert!(latest.is_some());
         let (iteration, summary) = latest.unwrap();
         assert_eq!(iteration, 0);
-        assert!(summary.contains("IM"));
+        assert!(summary.contains("Implementer"));
 
         assert!(tmp.path().is_dir());
     }
@@ -1488,7 +1488,7 @@ mod tests {
     fn implementer_retry_reuses_iteration_until_reviewed() {
         // Set up a coordinator sitting at Implementing with a plan present.
         let mut store = Store::open_in_memory().unwrap();
-        store.set_work_item("# WI").unwrap();
+        store.set_work_item("# Work Item").unwrap();
         store.set_plan("the plan", "").unwrap();
         for (f, t) in [
             (State::Intake, State::Planning),
@@ -1504,11 +1504,11 @@ mod tests {
             Box::new(EchoRunner),
             fake_workspace(),
             workspace.path().into(),
-            "test-wi",
+            "test-work-item",
         )
         .unwrap();
 
-        // Run the IM twice with no review recorded (simulating a crash-retry
+        // Run the Implementer twice with no review recorded (simulating a crash-retry
         // before the transition): the iteration must stay 0, not grow.
         co.run_implementer().unwrap();
         co.run_implementer().unwrap();
@@ -1522,7 +1522,7 @@ mod tests {
     fn implementing_without_plan_moves_to_failed() {
         // Jump straight to Implementing with no plan persisted.
         let mut store = Store::open_in_memory().unwrap();
-        store.set_work_item("# WI").unwrap();
+        store.set_work_item("# Work Item").unwrap();
         store
             .record_transition(Some(State::Intake), State::Planning, "x")
             .unwrap();
@@ -1539,17 +1539,17 @@ mod tests {
             Box::new(EchoRunner),
             fake_workspace(),
             workspace.path().into(),
-            "test-wi",
+            "test-work-item",
         )
         .unwrap();
         assert_eq!(co.state(), State::Implementing);
-        // No plan is unrecoverable here: the WI moves to Failed.
+        // No plan is unrecoverable here: the work item moves to Failed.
         assert_eq!(co.step().unwrap(), State::Failed);
     }
 
     #[test]
     fn illegal_transition_is_rejected() {
-        let (mut co, _tmp) = coordinator_with_wi(Config::default());
+        let (mut co, _tmp) = coordinator_with_work_item(Config::default());
         let err = co.transition_to(State::Done, "nope").unwrap_err();
         assert!(matches!(err, CoordinatorError::IllegalTransition { .. }));
         assert_eq!(co.state(), State::Intake);
@@ -1557,21 +1557,21 @@ mod tests {
 
     #[test]
     fn approve_plan_review_proceeds_to_implementing() {
-        let (mut co, _tmp) = coordinator_with_wi(Config::default());
+        let (mut co, _tmp) = coordinator_with_work_item(Config::default());
         assert_eq!(co.run_until_blocked().unwrap(), State::PlanReview);
         assert_eq!(co.resolve(Decision::Approve).unwrap(), State::Implementing);
     }
 
     #[test]
     fn reject_plan_review_returns_to_planning() {
-        let (mut co, _tmp) = coordinator_with_wi(Config::default());
+        let (mut co, _tmp) = coordinator_with_work_item(Config::default());
         co.run_until_blocked().unwrap();
         assert_eq!(co.resolve(Decision::Reject).unwrap(), State::Planning);
     }
 
     #[test]
     fn drives_intake_to_done_via_approvals() {
-        let (mut co, _tmp) = coordinator_with_wi(Config::default());
+        let (mut co, _tmp) = coordinator_with_work_item(Config::default());
         // Plan gate.
         assert_eq!(co.run_until_blocked().unwrap(), State::PlanReview);
         assert_eq!(co.resolve(Decision::Approve).unwrap(), State::Implementing);
@@ -1583,15 +1583,15 @@ mod tests {
 
     #[test]
     fn abandon_from_blocked_state_terminates() {
-        let (mut co, _tmp) = coordinator_with_wi(Config::default());
+        let (mut co, _tmp) = coordinator_with_work_item(Config::default());
         co.run_until_blocked().unwrap();
         assert_eq!(co.resolve(Decision::Abandon).unwrap(), State::Abandoned);
     }
 
     #[test]
     fn resolve_rejected_when_not_blocked() {
-        let (mut co, _tmp) = coordinator_with_wi(Config::default());
-        // At Intake (autonomous), no HI decision applies.
+        let (mut co, _tmp) = coordinator_with_work_item(Config::default());
+        // At Intake (autonomous), no human-intervention decision applies.
         let err = co.resolve(Decision::Approve).unwrap_err();
         assert!(matches!(err, CoordinatorError::InvalidResolution { .. }));
         assert_eq!(co.state(), State::Intake);
@@ -1599,7 +1599,7 @@ mod tests {
 
     #[test]
     fn answer_only_applies_at_intake_review() {
-        let (mut co, _tmp) = coordinator_with_wi(Config::default());
+        let (mut co, _tmp) = coordinator_with_work_item(Config::default());
         co.run_until_blocked().unwrap(); // PlanReview
         let err = co.resolve(Decision::Answer("nope".into())).unwrap_err();
         assert!(matches!(err, CoordinatorError::InvalidResolution { .. }));
@@ -1607,13 +1607,13 @@ mod tests {
 
     #[test]
     fn rejected_resolution_records_no_events() {
-        let (mut co, _tmp) = coordinator_with_wi(Config::default());
+        let (mut co, _tmp) = coordinator_with_work_item(Config::default());
         // At Intake, approve is invalid and must not write any event.
         let _ = co.resolve(Decision::Approve);
         let events = co.store.count_events().unwrap();
-        // Only the autonomous transitions so far (none yet) — no HI events.
-        let hi = co.store.count_events_of_kind("hi_decision").unwrap();
-        assert_eq!(hi, 0);
+        // Only the autonomous transitions so far (none yet) — no human-intervention events.
+        let human_decisions = co.store.count_events_of_kind("human_decision").unwrap();
+        assert_eq!(human_decisions, 0);
         assert_eq!(events, 0);
     }
 
@@ -1628,17 +1628,17 @@ mod tests {
             let root = crate::repository::RepositoryRoot::from_canonical("/test/repository");
             let repository = database.register_repository(&root).unwrap();
             work_item_id = database
-                .get_or_create_work_item(&repository.id, "test-wi")
+                .get_or_create_work_item(&repository.id, "test-work-item")
                 .unwrap();
             let mut store = database.into_store(work_item_id.clone()).unwrap();
-            store.set_work_item("# WI").unwrap();
+            store.set_work_item("# Work Item").unwrap();
             let mut co = Coordinator::new(
                 Config::default(),
                 store,
                 Box::new(EchoRunner),
                 fake_workspace(),
                 dir.path().into(),
-                "test-wi",
+                "test-work-item",
             )
             .unwrap();
             assert_eq!(co.run_until_blocked().unwrap(), State::PlanReview);
@@ -1655,7 +1655,7 @@ mod tests {
             Box::new(EchoRunner),
             fake_workspace(),
             dir.path().into(),
-            "test-wi",
+            "test-work-item",
         )
         .unwrap();
         assert_eq!(co.state(), State::PlanReview);

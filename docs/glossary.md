@@ -1,34 +1,34 @@
 # Glossary
 
-Every term is defined here once. Elsewhere we use the acronym.
+Every Quorum-specific term is written in full throughout the project.
 
-| Term | Acronym | Definition |
-|------|---------|------------|
-| Work Item | WI | The unit of work Quorum processes. A local markdown file (optionally pulled from a GitHub issue), which may embed images. |
-| Coordinator | CO | The orchestrator. Runs the PLs, drives convergence, runs the IM↔RV loop, and pulls humans in when needed. Owns the state machine for one WI. |
-| Planner | PL | A single AI model that, in isolation, produces a candidate plan for a WI. Multiple PLs form the quorum. |
-| Quorum | — | The set of PLs whose candidate plans the CO merges into one converged Plan. |
-| Plan | — | The converged specification for a WI, merged from PL outputs and accepted by the CO (and optionally a human). |
-| Implementer | IM | A single AI model that produces the implementation from the Plan. |
-| Reviewer | RV | A different model that adversarially reviews the IM's output. IM and RV loop until RV accepts. |
-| Session | — | A named `copilot` CLI session, resumable in a terminal, used to gather Human Intervention. |
-| Human Intervention | HI | A point where the CO pauses autonomous progress and requires a human (intake answers, plan review, or work review). |
-| Core | — | The Rust library crate implementing all Quorum logic (state machine, agents, persistence). |
-| CLI | — | The Rust binary crate that drives the Core for a single WI. Light; no multi-item orchestration. |
-| Local Sandbox | LS | Copilot's OS-level sandbox (`--sandbox`) that confines an agent's filesystem, network, and tool access. Quorum's execution-isolation boundary (see [isolation](isolation.md)). |
-| Idea Isolation | — | Keeping each PL from seeing other PLs' output, so candidate plans stay independent (see [agents](agents.md)). |
-| Execution Isolation | — | Confining an agent's actions (filesystem/network/tools) via the LS, so unattended runs are safe (see [isolation](isolation.md)). |
+| Term | Definition |
+|------|------------|
+| Work item | The unit of work Quorum processes. A local markdown file, optionally pulled from a GitHub issue, which may embed images. |
+| Coordinator | The orchestrator. Runs the Planners, drives convergence, runs the Implementer and Reviewer loop, and pulls humans in when needed. Owns the state machine for one work item. |
+| Planner | A single AI model that independently produces a candidate plan for a work item. Multiple Planners form the quorum. |
+| Quorum | The set of Planners whose candidate plans the Coordinator merges into one converged Plan. |
+| Plan | The converged specification for a work item, merged from Planner output and accepted by the Coordinator and optionally a human. |
+| Implementer | A single AI model that produces the implementation from the Plan. |
+| Reviewer | A different model that adversarially reviews the Implementer's output. The Implementer and Reviewer loop until the Reviewer accepts. |
+| Session | A named `copilot` CLI session, resumable in a terminal, used to gather human input. |
+| Human intervention | A point where the Coordinator pauses autonomous progress and requires a human, such as intake answers, plan review, or work review. |
+| Core | The Rust library crate implementing all Quorum logic: state machine, agents, and persistence. |
+| CLI | The Rust binary crate that drives the Core for a single work item. It does not orchestrate multiple work items. |
+| Local Sandbox | Copilot's OS-level sandbox (`--sandbox`) that confines an agent's filesystem, network, and tool access. It is Quorum's execution-isolation boundary. |
+| Idea isolation | Keeping each Planner from seeing other Planners' output so candidate plans stay independent. |
+| Execution isolation | Confining an agent's filesystem, network, and tool access through the Local Sandbox so unattended runs remain safe. |
 
 ## Roles at a glance
 
 ```mermaid
 flowchart LR
-  H[Human] -- WI --> CO
-  CO -- runs in isolation --> PL1[PL a]
-  CO --> PL2[PL b]
-  CO --> PL3[PL c]
-  PL1 & PL2 & PL3 -- candidate plans --> CO
-  CO -- Plan --> IM
-  IM <-- adversarial loop --> RV
-  CO -- HI via Session --> H
+  Human -- work item --> Coordinator
+  Coordinator -- runs in isolation --> PlannerA[Planner a]
+  Coordinator --> PlannerB[Planner b]
+  Coordinator --> PlannerC[Planner c]
+  PlannerA & PlannerB & PlannerC -- candidate plans --> Coordinator
+  Coordinator -- Plan --> Implementer
+  Implementer <-- adversarial loop --> Reviewer
+  Coordinator -- human intervention via Session --> Human
 ```
