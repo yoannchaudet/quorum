@@ -28,6 +28,8 @@ pub struct AgentRequest {
     pub cwd: PathBuf,
     /// Filesystem posture for this role.
     pub filesystem: Filesystem,
+    /// The model id to run, if configured. Empty means use the CLI default.
+    pub model: String,
 }
 
 /// Errors from running an agent.
@@ -84,6 +86,10 @@ impl CopilotRunner {
         for tool in &self.sandbox.deny_tools {
             args.push("--deny-tool".to_string());
             args.push(tool.clone());
+        }
+        if !req.model.is_empty() {
+            args.push("--model".to_string());
+            args.push(req.model.clone());
         }
         args.push("-p".to_string());
         args.push(req.prompt.clone());
@@ -142,6 +148,7 @@ mod tests {
             prompt: "do the thing".to_string(),
             cwd: PathBuf::from("/tmp"),
             filesystem: Filesystem::ReadOnly,
+            model: String::new(),
         }
     }
 
@@ -154,9 +161,21 @@ mod tests {
         assert!(args.contains(&"--no-ask-user".to_string()));
         assert!(args.contains(&"--deny-tool".to_string()));
         assert!(args.contains(&"shell(rm)".to_string()));
+        // No model configured: --model is omitted.
+        assert!(!args.contains(&"--model".to_string()));
         // The prompt is passed via -p.
         let p = args.iter().position(|a| a == "-p").unwrap();
         assert_eq!(args[p + 1], "do the thing");
+    }
+
+    #[test]
+    fn command_includes_model_when_set() {
+        let runner = CopilotRunner::new(Sandbox::default());
+        let mut r = req();
+        r.model = "some-model".to_string();
+        let args = runner.args(&r);
+        let m = args.iter().position(|a| a == "--model").unwrap();
+        assert_eq!(args[m + 1], "some-model");
     }
 
     #[test]

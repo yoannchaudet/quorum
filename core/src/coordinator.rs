@@ -204,11 +204,13 @@ impl Coordinator {
                 ("answers", ""),
                 ("previous_plan", &previous_plan),
             ])?;
+            let model = self.config.planners.get(&slot).cloned().unwrap_or_default();
             let req = AgentRequest {
                 role: format!("PL:{slot}"),
                 prompt: rendered,
                 cwd: self.workspace.clone(),
                 filesystem: Filesystem::ReadOnly,
+                model,
             };
             let output = self.runner.run(&req)?;
             self.store.save_candidate(&slot, iteration, &output)?;
@@ -247,6 +249,7 @@ impl Coordinator {
             prompt: rendered,
             cwd: self.workspace.clone(),
             filesystem: Filesystem::ReadOnly,
+            model: self.config.models.coordinator.clone(),
         };
         let output = self.runner.run(&req)?;
         let merged = convergence::parse_merge(&output);
@@ -303,6 +306,7 @@ impl Coordinator {
             prompt: rendered,
             cwd: impl_dir,
             filesystem: Filesystem::ReadWrite,
+            model: self.config.models.implementer.clone(),
         };
         let output = self.runner.run(&req)?;
 
@@ -340,6 +344,7 @@ impl Coordinator {
             prompt: rendered,
             cwd: self.workspace.clone(),
             filesystem: Filesystem::ReadOnly,
+            model: self.config.models.reviewer.clone(),
         };
         let output = self.runner.run(&req)?;
         let review = convergence::parse_review(&output);

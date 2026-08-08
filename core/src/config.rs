@@ -180,6 +180,16 @@ impl Config {
                 "models.reviewer must differ from models.implementer".to_string(),
             ));
         }
+        if self.limits.adversarial_max_iters < 1 {
+            return Err(ConfigError::Invalid(
+                "limits.adversarial_max_iters must be at least 1".to_string(),
+            ));
+        }
+        if self.limits.convergence_max_iters < 1 {
+            return Err(ConfigError::Invalid(
+                "limits.convergence_max_iters must be at least 1".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -228,6 +238,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yaml");
         std::fs::write(&path, "models:\n  implementer: x\n  reviewer: x\n").unwrap();
+        assert!(Config::load(&path).is_err());
+    }
+
+    #[test]
+    fn zero_adversarial_max_iters_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "limits:\n  adversarial_max_iters: 0\n").unwrap();
         assert!(Config::load(&path).is_err());
     }
 }
