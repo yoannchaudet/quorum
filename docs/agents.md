@@ -47,8 +47,10 @@ Exact model IDs are set in config; the docs fix the *number and roles*, not the 
 
 - IM produces the implementation from the accepted Plan.
 - RV is a **different** model that adversarially reviews IM's output.
-- **Adversarial loop**: `Implementing` → `Reviewing` → `Implementing` until RV accepts
-  (or max iterations, then `Failed`).
+- **Adversarial loop**: `Implementing` → `Reviewing` → `Implementing` until RV accepts.
+  The loop **escalates to `WorkReview`** (a human decides) rather than discarding work
+  when it stops making progress: either the implementation is **unchanged** across a round
+  (the IM can't address the feedback) or the `adversarial_max_iters` budget is reached.
 
 ## Human Intervention (HI)
 
@@ -58,7 +60,13 @@ The CO pulls humans in at exactly three points, each a blocked state:
 |-------|---------------------|
 | `IntakeReview` | Answers PL follow-up questions. |
 | `PlanReview` (optional) | Approves or rejects the converged Plan. |
-| `WorkReview` (optional) | Approves or rejects the accepted work. |
+| `WorkReview` (optional) | Approves or rejects the work. |
+
+The `PlanReview` / `WorkReview` gates are optional (toggled in [config](config.md)) for
+the **normal accepted-work path**. Independently, the adversarial loop **always** routes to
+`WorkReview` when it escalates (implementation unchanged, or max iterations) — a human must
+decide, even if the `WorkReview` gate is disabled — so non-converged work is surfaced rather
+than accepted or discarded.
 
 All HI happens through a resumable [Session](sessions.md). All prompts the CO gives any
 agent live as reviewable markdown files (see [prompts](prompts.md)).

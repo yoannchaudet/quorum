@@ -11,7 +11,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The current schema version. Bump when `migrate` changes.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Errors from the persistence layer.
 #[derive(Debug, thiserror::Error)]
@@ -102,6 +102,12 @@ impl Store {
             CREATE TABLE IF NOT EXISTS implementation (
                 iteration INTEGER PRIMARY KEY,
                 summary   TEXT NOT NULL,
+                ts        TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS workspace_snapshots (
+                iteration INTEGER PRIMARY KEY,
+                hash      TEXT NOT NULL,
                 ts        TEXT NOT NULL
             );
 
@@ -358,6 +364,31 @@ impl Store {
             params![iteration, summary, now_millis()],
         )?;
         Ok(())
+    }
+
+    /// Save a content hash of the IM's workspace for a given iteration, used to
+    /// detect when the implementation stops changing across adversarial rounds.
+    /// Idempotent.
+    pub fn save_workspace_hash(&mut self, iteration: u32, hash: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO workspace_snapshots (iteration, hash, ts) VALUES (?1, ?2, ?3)
+             ON CONFLICT(iteration) DO UPDATE SET hash = excluded.hash, ts = excluded.ts",
+            params![iteration, hash, now_millis()],
+        )?;
+        Ok(())
+    }
+
+    /// The stored workspace content hash for an iteration, if any.
+    pub fn workspace_hash(&self, iteration: u32) -> Result<Option<String>, StoreError> {
+        match self.conn.query_row(
+            "SELECT hash FROM workspace_snapshots WHERE iteration = ?1",
+            params![iteration],
+            |r| r.get::<_, String>(0),
+        ) {
+            Ok(h) => Ok(Some(h)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// The latest Implementer summary and its iteration, if any.

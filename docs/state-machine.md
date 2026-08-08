@@ -17,7 +17,7 @@ Every state is either **autonomous** (CO makes progress unattended) or **blocked
 | `PlanReview` | blocked (HI, optional) | Human reviews the converged Plan. Approve, or send back to `Planning`. |
 | `Implementing` | autonomous | IM produces the implementation from the Plan. |
 | `Reviewing` | autonomous | RV adversarially reviews the IM output. |
-| `WorkReview` | blocked (HI, optional) | Human reviews the accepted work. Approve, or send back to `Implementing`. |
+| `WorkReview` | blocked (HI, optional gate) | Human reviews the work. Approve → `Done`, or send back to `Implementing`. Also entered (regardless of the gate) when the adversarial loop escalates. |
 | `Done` | terminal | Work accepted. |
 | `Failed` | terminal | Unrecoverable error (see [persistence](persistence.md) for retry/recovery first). |
 | `Abandoned` | terminal | Human canceled the WI. |
@@ -38,7 +38,7 @@ stateDiagram-v2
   Converging --> Implementing: converged, review disabled
   Implementing --> Reviewing
   Reviewing --> Implementing: RV rejects (adversarial loop)
-  Reviewing --> WorkReview: RV accepts
+  Reviewing --> WorkReview: RV accepts, or loop escalates
   WorkReview --> Implementing: changes requested (HI)
   WorkReview --> Done: approved (HI)
   Reviewing --> Done: RV accepts, review disabled
@@ -60,6 +60,8 @@ stateDiagram-v2
 1. **Intake loop** — `Planning` → `IntakeReview` → `Planning`, until PLs have no open questions.
 2. **Convergence loop** — `Planning` → `Converging` → `Planning`, until the Plan stabilizes. See [agents](agents.md) for convergence criteria.
 3. **Adversarial loop** — `Implementing` → `Reviewing` → `Implementing`, until RV accepts.
+   If it stops progressing (implementation unchanged, or `adversarial_max_iters` reached),
+   it escalates to `WorkReview` for a human decision instead of discarding the work.
 
 `PlanReview` and `WorkReview` are optional gates (toggled in [config](config.md)); when
 disabled the CO transitions straight through.

@@ -59,8 +59,10 @@ enum ReviewOutcome {
     Accepted,
     /// The Reviewer rejected; loop back to the Implementer.
     Rejected,
-    /// Too many rejected rounds; give up.
-    Exhausted,
+    /// The loop cannot make progress (implementation unchanged, or the max
+    /// iteration bound reached). Escalate to a human at `WorkReview` rather than
+    /// discarding the work. Carries a short cause for the audit trail.
+    Escalated(&'static str),
 }
 
 impl std::fmt::Display for Decision {
@@ -374,7 +376,7 @@ impl Coordinator {
         let req = AgentRequest {
             role: "IM".to_string(),
             prompt: rendered,
-            cwd: impl_dir,
+            cwd: impl_dir.clone(),
             filesystem: Filesystem::ReadWrite,
             model: self.config.models.implementer.clone(),
         };
@@ -385,6 +387,12 @@ impl Coordinator {
         // (idempotent) rather than creating a phantom unreviewed iteration.
         let iteration = self.store.review_count()?;
         self.store.save_implementation(iteration, &output)?;
+        // Snapshot the workspace so the reviewer step can detect a stall (the IM
+        // producing byte-identical output across rounds). Only record a complete
+        // snapshot; an unreadable tree yields no snapshot and thus no stall claim.
+        if let Some(hash) = hash_dir(&impl_dir) {
+            self.store.save_workspace_hash(iteration, &hash)?;
+        }
         Ok(())
     }
 
@@ -423,9 +431,17 @@ impl Coordinator {
 
         if review.accepted {
             Ok(ReviewOutcome::Accepted)
+        } else if iteration >= 1
+            && self.store.workspace_hash(iteration)? == self.store.workspace_hash(iteration - 1)?
+            && self.store.workspace_hash(iteration)?.is_some()
+        {
+            // The IM produced byte-identical output to the previous round, so it
+            // cannot address the reviewer's feedback: stop early and let a human
+            // decide rather than burning the remaining iterations.
+            Ok(ReviewOutcome::Escalated("implementation unchanged"))
         } else if iteration + 1 >= self.config.limits.adversarial_max_iters {
-            // Too many rejected rounds: give up.
-            Ok(ReviewOutcome::Exhausted)
+            // The loop did not converge within the iteration budget.
+            Ok(ReviewOutcome::Escalated("max adversarial iterations"))
         } else {
             Ok(ReviewOutcome::Rejected)
         }
@@ -463,8 +479,9 @@ impl Coordinator {
             return Ok(self.state);
         }
         match self.compute_next() {
-            Ok(next) => {
-                let reason = format!("auto: {} -> {next}", self.state);
+            Ok((next, custom_reason)) => {
+                let reason =
+                    custom_reason.unwrap_or_else(|| format!("auto: {} -> {next}", self.state));
                 self.transition_to(next, &reason)
             }
             // Database failures are fundamental — do not mask them as Failed.
@@ -474,15 +491,16 @@ impl Coordinator {
     }
 
     /// Compute the next state for the current autonomous state, performing the
-    /// agent work that state requires.
-    fn compute_next(&mut self) -> Result<State, CoordinatorError> {
+    /// agent work that state requires. The optional string overrides the default
+    /// transition reason (used to record why an adversarial round escalated).
+    fn compute_next(&mut self) -> Result<(State, Option<String>), CoordinatorError> {
         use State::*;
-        let next = match self.state {
+        let result = match self.state {
             Intake => {
                 if self.store.work_item()?.is_none() {
                     return Err(CoordinatorError::NoWorkItem);
                 }
-                Planning
+                (Planning, None)
             }
             Planning => {
                 // Intake questions gate: only on the first planning pass (before
@@ -491,48 +509,58 @@ impl Coordinator {
                 if self.store.max_candidate_iteration()?.is_none() {
                     if let Some(questions) = self.run_intake_questions()? {
                         self.store.set_questions(&questions)?;
-                        IntakeReview
+                        (IntakeReview, None)
                     } else {
                         self.run_planners()?;
-                        Converging
+                        (Converging, None)
                     }
                 } else {
                     self.run_planners()?;
-                    Converging
+                    (Converging, None)
                 }
             }
             Converging => {
                 if self.run_merge()? {
                     // Converged: proceed to the plan gate (or straight to build).
                     if self.config.reviews.plan_review {
-                        PlanReview
+                        (PlanReview, None)
                     } else {
-                        Implementing
+                        (Implementing, None)
                     }
                 } else {
                     // Not converged: loop back for another planning round.
-                    Planning
+                    (Planning, None)
                 }
             }
             Implementing => {
                 self.run_implementer()?;
-                Reviewing
+                (Reviewing, None)
             }
             Reviewing => match self.run_reviewer()? {
                 ReviewOutcome::Accepted => {
                     if self.config.reviews.work_review {
-                        WorkReview
+                        (WorkReview, None)
                     } else {
-                        Done
+                        (Done, None)
                     }
                 }
-                ReviewOutcome::Rejected => Implementing,
-                ReviewOutcome::Exhausted => Failed,
+                ReviewOutcome::Rejected => (Implementing, None),
+                // Escalation always stops at WorkReview for a human decision,
+                // regardless of the work-review gate, so non-converged work is
+                // surfaced rather than accepted or discarded.
+                ReviewOutcome::Escalated(cause) => (
+                    WorkReview,
+                    Some(format!(
+                        "adversarial escalated ({cause}): Reviewing -> WorkReview"
+                    )),
+                ),
             },
             // Not autonomous; the caller returns early for these.
-            IntakeReview | PlanReview | WorkReview | Done | Failed | Abandoned => self.state,
+            IntakeReview | PlanReview | WorkReview | Done | Failed | Abandoned => {
+                (self.state, None)
+            }
         };
-        Ok(next)
+        Ok(result)
     }
 
     /// Move the WI to `Failed`, recording the cause. `Failed` is terminal but the
@@ -569,6 +597,84 @@ impl Coordinator {
             }
         }
     }
+}
+
+/// Compute a stable content hash of every file under `dir`, ignoring `.git` and
+/// `.DS_Store`. Used to detect whether the Implementer changed the workspace
+/// between adversarial rounds. Returns `None` if the tree could not be read
+/// **completely** — an uncertain snapshot must not be compared, so the caller
+/// skips stall detection for that round rather than risk a false positive.
+fn hash_dir(dir: &std::path::Path) -> Option<String> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    if !collect_files(dir, dir, &mut files) {
+        return None;
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut hasher = DefaultHasher::new();
+    for (rel, bytes) in &files {
+        rel.hash(&mut hasher);
+        bytes.hash(&mut hasher);
+    }
+    Some(format!("{:016x}", hasher.finish()))
+}
+
+/// Recursively collect `(relative-path, contents)` for files under `dir`.
+/// Returns `true` only if every entry was read successfully; a `false` return
+/// means the snapshot is incomplete and must not be trusted for comparison.
+fn collect_files(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    out: &mut Vec<(String, Vec<u8>)>,
+) -> bool {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+    let mut complete = true;
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => {
+                complete = false;
+                continue;
+            }
+        };
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Skip version-control internals and macOS cruft — they change without
+        // reflecting a change to the actual implementation.
+        if name == ".git" || name == ".DS_Store" {
+            continue;
+        }
+        let path = entry.path();
+        match entry.file_type() {
+            // Symlinks report neither is_dir nor is_file here (file_type does not
+            // follow them), so they are ignored — no recursion, no infinite loop.
+            Ok(ft) if ft.is_dir() => {
+                if !collect_files(root, &path, out) {
+                    complete = false;
+                }
+            }
+            Ok(ft) if ft.is_file() => match std::fs::read(&path) {
+                Ok(bytes) => {
+                    let rel = path
+                        .strip_prefix(root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .to_string();
+                    out.push((rel, bytes));
+                }
+                Err(_) => complete = false,
+            },
+            Ok(_) => {}
+            Err(_) => complete = false,
+        }
+    }
+    complete
 }
 
 #[cfg(test)]
@@ -970,21 +1076,100 @@ mod tests {
         assert_eq!(implementing, 2);
     }
 
+    /// A runner where the Implementer writes a *unique* file each round (so the
+    /// workspace changes), the Reviewer always rejects, and merge converges.
+    /// Used to exercise the max-iterations escalation (no stall).
+    struct WritingRejectRunner {
+        im_calls: Arc<AtomicUsize>,
+        reviews: Arc<AtomicUsize>,
+    }
+
+    impl AgentRunner for WritingRejectRunner {
+        fn run(&self, req: &AgentRequest) -> Result<String, AgentError> {
+            if req.role.contains("intake") {
+                Ok("NONE".to_string())
+            } else if req.role.starts_with("CO:merge") {
+                Ok("## Plan\nthe plan\n\n## Convergence\nCONVERGED".to_string())
+            } else if req.role == "RV" {
+                self.reviews.fetch_add(1, Ordering::SeqCst);
+                Ok("## Verdict\nREJECT\n\n## Findings\nstill wrong".to_string())
+            } else if req.role == "IM" {
+                // Write a distinct file each round so the workspace hash changes.
+                let n = self.im_calls.fetch_add(1, Ordering::SeqCst);
+                let _ = std::fs::write(req.cwd.join(format!("f{n}.txt")), format!("content {n}"));
+                Ok("## Changes\nwrote a file\n\n## Deviations\nNONE".to_string())
+            } else {
+                Ok("## Summary\ncandidate".to_string())
+            }
+        }
+    }
+
     #[test]
-    fn reviewer_exhausts_to_failed() {
+    fn hash_dir_detects_content_changes_and_ignores_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.txt"), "hello").unwrap();
+        let h1 = hash_dir(root).unwrap();
+
+        // Re-hashing identical content is stable.
+        assert_eq!(hash_dir(root).unwrap(), h1);
+
+        // A .git change does not affect the hash.
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref: x").unwrap();
+        assert_eq!(hash_dir(root).unwrap(), h1);
+
+        // A real content change does.
+        std::fs::write(root.join("a.txt"), "hello world").unwrap();
+        assert_ne!(hash_dir(root).unwrap(), h1);
+    }
+
+    #[test]
+    fn stalled_implementation_escalates_to_work_review() {
         let mut config = Config::default();
         config.reviews.plan_review = false;
         config.reviews.work_review = false;
-        config.limits.adversarial_max_iters = 2;
-        // Always rejects.
+        // Never accepts; the IM (EchoRunner-style) writes nothing, so the
+        // workspace is unchanged across rounds -> stall.
         let runner = ReviewRunner::new(usize::MAX);
         let reviews = runner.reviews.clone();
         let mut co = coordinator_with_runner(config, Box::new(runner));
 
-        assert_eq!(co.run_until_blocked().unwrap(), State::Failed);
-        // Bounded to 2 review rounds (0, 1), both rejected.
+        // Escalates to WorkReview (not Failed) so the work isn't discarded.
+        assert_eq!(co.run_until_blocked().unwrap(), State::WorkReview);
+        // Stall is detected at iteration 1 (after two reviews), well before the
+        // default max of 5.
         assert_eq!(reviews.load(Ordering::SeqCst), 2);
-        assert!(co.state().is_terminal());
+        // The escalation cause is recorded on the transition.
+        assert!(co
+            .history()
+            .unwrap()
+            .iter()
+            .any(|t| t.to == State::WorkReview && t.reason.contains("implementation unchanged")));
+    }
+
+    #[test]
+    fn max_iters_escalates_to_work_review() {
+        let mut config = Config::default();
+        config.reviews.plan_review = false;
+        config.reviews.work_review = false;
+        config.limits.adversarial_max_iters = 3;
+        let runner = WritingRejectRunner {
+            im_calls: Arc::new(AtomicUsize::new(0)),
+            reviews: Arc::new(AtomicUsize::new(0)),
+        };
+        let reviews = runner.reviews.clone();
+        let mut co = coordinator_with_runner(config, Box::new(runner));
+
+        // The workspace changes each round, so no stall; escalation happens only
+        // when the iteration budget is exhausted.
+        assert_eq!(co.run_until_blocked().unwrap(), State::WorkReview);
+        assert_eq!(reviews.load(Ordering::SeqCst), 3);
+        assert!(co
+            .history()
+            .unwrap()
+            .iter()
+            .any(|t| t.to == State::WorkReview && t.reason.contains("max adversarial iterations")));
     }
 
     #[test]
