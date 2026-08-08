@@ -185,6 +185,16 @@ impl Store {
         Ok(())
     }
 
+    /// Append an event to the log (e.g. an HI decision). Standalone, not part of
+    /// a transition transaction.
+    pub fn record_event(&mut self, kind: &str, data: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO events (ts, kind, data) VALUES (?1, ?2, ?3)",
+            params![now_millis(), kind, data],
+        )?;
+        Ok(())
+    }
+
     /// The full transition history, in the order it was recorded.
     pub fn history(&self) -> Result<Vec<Transition>, StoreError> {
         let mut stmt = self
