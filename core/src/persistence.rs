@@ -99,6 +99,12 @@ impl Store {
                 metrics TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS implementation (
+                iteration INTEGER PRIMARY KEY,
+                summary   TEXT NOT NULL,
+                ts        TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS reviews (
                 iteration INTEGER PRIMARY KEY,
                 text      TEXT NOT NULL,
@@ -335,6 +341,51 @@ impl Store {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Save the Implementer's summary for a given adversarial iteration. Idempotent.
+    pub fn save_implementation(&mut self, iteration: u32, summary: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO implementation (iteration, summary, ts) VALUES (?1, ?2, ?3)
+             ON CONFLICT(iteration) DO UPDATE SET summary = excluded.summary, ts = excluded.ts",
+            params![iteration, summary, now_millis()],
+        )?;
+        Ok(())
+    }
+
+    /// The latest Implementer summary and its iteration, if any.
+    pub fn latest_implementation(&self) -> Result<Option<(u32, String)>, StoreError> {
+        match self.conn.query_row(
+            "SELECT iteration, summary FROM implementation ORDER BY iteration DESC LIMIT 1",
+            [],
+            |r| Ok((r.get::<_, i64>(0)? as u32, r.get::<_, String>(1)?)),
+        ) {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The latest review feedback and its verdict, if any.
+    pub fn latest_review(&self) -> Result<Option<(String, bool)>, StoreError> {
+        match self.conn.query_row(
+            "SELECT text, accepted FROM reviews ORDER BY iteration DESC LIMIT 1",
+            [],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)),
+        ) {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The number of reviews recorded so far. Doubles as the next adversarial
+    /// iteration index (reviews are keyed by 0-based iteration).
+    pub fn review_count(&self) -> Result<u32, StoreError> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM reviews", [], |r| r.get(0))?;
+        Ok(n as u32)
     }
 }
 fn now_millis() -> String {
