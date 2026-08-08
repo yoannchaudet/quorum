@@ -61,7 +61,7 @@ impl State {
             Intake => &[Planning, Failed],
             Planning => &[IntakeReview, Converging, Failed],
             IntakeReview => &[Planning, Abandoned],
-            Converging => &[Planning, PlanReview, Implementing],
+            Converging => &[Planning, PlanReview, Implementing, Failed],
             PlanReview => &[Planning, Implementing, Abandoned],
             Implementing => &[Reviewing, Failed],
             Reviewing => &[Implementing, WorkReview, Done, Failed],

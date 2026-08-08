@@ -44,6 +44,7 @@ stateDiagram-v2
   Reviewing --> Done: RV accepts, review disabled
   Intake --> Failed
   Planning --> Failed
+  Converging --> Failed
   Implementing --> Failed
   Reviewing --> Failed
   PlanReview --> Abandoned
