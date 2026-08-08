@@ -1,6 +1,8 @@
 //! Git worktree lifecycle for WI implementation checkouts.
 
-use crate::persistence::{Database, RegisteredRepository, StoreError, WorkItemId, WorktreeRecord};
+use crate::persistence::{
+    Database, ImplementationRound, RegisteredRepository, StoreError, WorkItemId, WorktreeRecord,
+};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -81,6 +83,203 @@ pub fn branch_name(slug: &str, work_item_id: &WorkItemId) -> String {
     };
     let short_id = work_item_id.as_str().chars().take(8).collect::<String>();
     format!("quorum/{normalized}-{short_id}")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoundGitResult {
+    pub commit: String,
+    pub tree: String,
+}
+
+pub trait ImplementationWorkspace: Send + Sync {
+    fn head(&self, worktree: &Path) -> Result<String, WorktreeError>;
+    fn is_clean(&self, worktree: &Path) -> Result<bool, WorktreeError>;
+    fn finalize(
+        &self,
+        worktree: &Path,
+        work_item_id: &WorkItemId,
+        slug: &str,
+        round: &ImplementationRound,
+    ) -> Result<RoundGitResult, WorktreeError>;
+}
+
+pub struct GitImplementationWorkspace;
+
+impl ImplementationWorkspace for GitImplementationWorkspace {
+    fn head(&self, worktree: &Path) -> Result<String, WorktreeError> {
+        worktree_head(worktree)
+    }
+
+    fn is_clean(&self, worktree: &Path) -> Result<bool, WorktreeError> {
+        worktree_is_clean(worktree)
+    }
+
+    fn finalize(
+        &self,
+        worktree: &Path,
+        work_item_id: &WorkItemId,
+        slug: &str,
+        round: &ImplementationRound,
+    ) -> Result<RoundGitResult, WorktreeError> {
+        finalize_implementation_round(worktree, work_item_id, slug, round)
+    }
+}
+
+/// Resolve the shared Git directory used by a linked worktree.
+pub fn git_common_dir(worktree: &Path) -> Result<PathBuf, WorktreeError> {
+    let output = run_git(
+        worktree,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let path = PathBuf::from(
+        String::from_utf8(output.stdout)
+            .map_err(|_| WorktreeError::NonUtf8GitOutput)?
+            .trim(),
+    );
+    std::fs::canonicalize(&path)
+        .map_err(|source| WorktreeError::CanonicalizeGitDir { path, source })
+}
+
+pub fn worktree_head(worktree: &Path) -> Result<String, WorktreeError> {
+    rev_parse_commit(worktree, "HEAD")
+}
+
+pub fn worktree_is_clean(worktree: &Path) -> Result<bool, WorktreeError> {
+    let output = run_git(worktree, &["status", "--porcelain"])?;
+    Ok(output.stdout.is_empty())
+}
+
+/// Finalize one agent-complete implementation round without discarding work.
+///
+/// If a matching Quorum commit is already at HEAD, it is adopted. Any unrelated
+/// commit is rejected. Otherwise all tracked/untracked changes are staged and a
+/// commit is created only when the resulting tree differs from the start tree.
+pub fn finalize_implementation_round(
+    worktree: &Path,
+    work_item_id: &WorkItemId,
+    slug: &str,
+    round: &ImplementationRound,
+) -> Result<RoundGitResult, WorktreeError> {
+    let head = worktree_head(worktree)?;
+    if head != round.start_commit {
+        if matching_round_commit(
+            worktree,
+            &head,
+            work_item_id,
+            round.iteration,
+            &round.start_commit,
+        )? {
+            if !worktree_is_clean(worktree)? {
+                return Err(WorktreeError::DirtyAfterCommit(head));
+            }
+            return Ok(RoundGitResult {
+                tree: tree_for_commit(worktree, &head)?,
+                commit: head,
+            });
+        }
+        return Err(WorktreeError::UnexpectedHead {
+            expected: round.start_commit.clone(),
+            actual: head,
+        });
+    }
+
+    run_git(worktree, &["add", "-A"])?;
+    let staged_tree = git_stdout(worktree, &["write-tree"])?;
+    let start_tree = tree_for_commit(worktree, &round.start_commit)?;
+    if staged_tree == start_tree {
+        if !worktree_is_clean(worktree)? {
+            return Err(WorktreeError::DirtyUncommittedWork);
+        }
+        return Ok(RoundGitResult {
+            commit: round.start_commit.clone(),
+            tree: staged_tree,
+        });
+    }
+
+    let title = format!("quorum: implement {slug} (round {})", round.iteration);
+    let markers = format!(
+        "Quorum-Work-Item: {work_item_id}\nQuorum-Iteration: {}\nQuorum-Start-Commit: {}",
+        round.iteration, round.start_commit
+    );
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args([
+            "-c",
+            "user.name=Quorum",
+            "-c",
+            "user.email=quorum@localhost",
+            "commit",
+            "--no-verify",
+            "--no-gpg-sign",
+            "-m",
+            &title,
+            "-m",
+            &markers,
+        ])
+        .output()
+        .map_err(|source| WorktreeError::Spawn {
+            repository: worktree.to_path_buf(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(git_failure(worktree, output));
+    }
+
+    let commit = worktree_head(worktree)?;
+    if !matching_round_commit(
+        worktree,
+        &commit,
+        work_item_id,
+        round.iteration,
+        &round.start_commit,
+    )? {
+        return Err(WorktreeError::CommitMarkerMismatch(commit));
+    }
+    if !worktree_is_clean(worktree)? {
+        return Err(WorktreeError::DirtyAfterCommit(commit));
+    }
+    Ok(RoundGitResult {
+        tree: tree_for_commit(worktree, &commit)?,
+        commit,
+    })
+}
+
+fn matching_round_commit(
+    worktree: &Path,
+    commit: &str,
+    work_item_id: &WorkItemId,
+    iteration: u32,
+    start_commit: &str,
+) -> Result<bool, WorktreeError> {
+    let format = git_stdout(worktree, &["show", "-s", "--format=%P%n%B", commit])?;
+    let mut lines = format.lines();
+    let parents = lines.next().unwrap_or_default();
+    if parents != start_commit {
+        return Ok(false);
+    }
+    let body = lines.collect::<Vec<_>>().join("\n");
+    Ok(body
+        .lines()
+        .any(|line| line == format!("Quorum-Work-Item: {work_item_id}"))
+        && body
+            .lines()
+            .any(|line| line == format!("Quorum-Iteration: {iteration}"))
+        && body
+            .lines()
+            .any(|line| line == format!("Quorum-Start-Commit: {start_commit}")))
+}
+
+fn tree_for_commit(worktree: &Path, commit: &str) -> Result<String, WorktreeError> {
+    git_stdout(worktree, &["rev-parse", &format!("{commit}^{{tree}}")])
+}
+
+fn git_stdout(repository: &Path, args: &[&str]) -> Result<String, WorktreeError> {
+    let output = run_git(repository, args)?;
+    Ok(String::from_utf8(output.stdout)
+        .map_err(|_| WorktreeError::NonUtf8GitOutput)?
+        .trim()
+        .to_string())
 }
 
 fn reconcile(
@@ -339,6 +538,11 @@ pub enum WorktreeError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("failed to canonicalize common Git directory {path}: {source}")]
+    CanonicalizeGitDir {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error(
         "worktree path already exists and is not the recorded checkout: {0}; inspect it and remove it manually only if it is safe"
     )]
@@ -368,11 +572,67 @@ pub enum WorktreeError {
         expected: String,
         actual: Option<String>,
     },
+    #[error("worktree is dirty before a new implementation round")]
+    DirtyUncommittedWork,
+    #[error("worktree remained dirty after commit {0}")]
+    DirtyAfterCommit(String),
+    #[error("worktree HEAD changed unexpectedly from {expected} to {actual}")]
+    UnexpectedHead { expected: String, actual: String },
+    #[error("created commit {0} does not contain the expected Quorum markers")]
+    CommitMarkerMismatch(String),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git(repository: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repository)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn repository() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "--quiet"]);
+        std::fs::write(dir.path().join("tracked.txt"), "base\n").unwrap();
+        std::fs::write(dir.path().join("deleted.txt"), "delete me\n").unwrap();
+        git(dir.path(), &["add", "tracked.txt", "deleted.txt"]);
+        git(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "base",
+            ],
+        );
+        dir
+    }
+
+    fn round(repository: &Path, iteration: u32) -> ImplementationRound {
+        ImplementationRound {
+            iteration,
+            start_commit: worktree_head(repository).unwrap(),
+            status: crate::persistence::ImplementationRoundStatus::AgentComplete,
+            result_commit: None,
+            tree_sha: None,
+        }
+    }
 
     #[test]
     fn branch_names_are_safe_and_include_identity() {
@@ -382,5 +642,111 @@ mod tests {
             "quorum/feature-bad-name-lock-12345678"
         );
         assert_eq!(branch_name("🚀", &id), "quorum/work-item-12345678");
+    }
+
+    #[test]
+    fn finalizes_added_modified_and_deleted_files_in_one_commit() {
+        let repository = repository();
+        let start = round(repository.path(), 0);
+        std::fs::write(repository.path().join("tracked.txt"), "changed\n").unwrap();
+        std::fs::write(repository.path().join("added.txt"), "added\n").unwrap();
+        std::fs::remove_file(repository.path().join("deleted.txt")).unwrap();
+
+        let result = finalize_implementation_round(
+            repository.path(),
+            &WorkItemId::for_test("wi"),
+            "example",
+            &start,
+        )
+        .unwrap();
+
+        assert_ne!(result.commit, start.start_commit);
+        assert_ne!(
+            result.tree,
+            tree_for_commit(repository.path(), &start.start_commit).unwrap()
+        );
+        assert_eq!(
+            git(
+                repository.path(),
+                &["show", "--format=", "--name-status", "HEAD"]
+            ),
+            "A\tadded.txt\nD\tdeleted.txt\nM\ttracked.txt"
+        );
+        assert!(worktree_is_clean(repository.path()).unwrap());
+    }
+
+    #[test]
+    fn empty_round_reuses_start_commit_without_creating_a_commit() {
+        let repository = repository();
+        let start = round(repository.path(), 0);
+
+        let result = finalize_implementation_round(
+            repository.path(),
+            &WorkItemId::for_test("wi"),
+            "example",
+            &start,
+        )
+        .unwrap();
+
+        assert_eq!(result.commit, start.start_commit);
+        assert_eq!(
+            result.tree,
+            tree_for_commit(repository.path(), &start.start_commit).unwrap()
+        );
+    }
+
+    #[test]
+    fn adopts_matching_round_commit_after_database_crash() {
+        let repository = repository();
+        let start = round(repository.path(), 2);
+        let work_item_id = WorkItemId::for_test("wi");
+        std::fs::write(repository.path().join("tracked.txt"), "changed\n").unwrap();
+        let committed =
+            finalize_implementation_round(repository.path(), &work_item_id, "example", &start)
+                .unwrap();
+
+        let adopted =
+            finalize_implementation_round(repository.path(), &work_item_id, "example", &start)
+                .unwrap();
+        assert_eq!(adopted, committed);
+    }
+
+    #[test]
+    fn rejects_an_unrelated_commit_at_head() {
+        let repository = repository();
+        let start = round(repository.path(), 0);
+        std::fs::write(repository.path().join("tracked.txt"), "model commit\n").unwrap();
+        git(repository.path(), &["add", "tracked.txt"]);
+        git(
+            repository.path(),
+            &[
+                "-c",
+                "user.name=Model",
+                "-c",
+                "user.email=model@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "unexpected",
+            ],
+        );
+
+        let error = finalize_implementation_round(
+            repository.path(),
+            &WorkItemId::for_test("wi"),
+            "example",
+            &start,
+        )
+        .unwrap_err();
+        assert!(matches!(error, WorktreeError::UnexpectedHead { .. }));
+    }
+
+    #[test]
+    fn resolves_the_shared_git_directory() {
+        let repository = repository();
+        assert_eq!(
+            git_common_dir(repository.path()).unwrap(),
+            std::fs::canonicalize(repository.path().join(".git")).unwrap()
+        );
     }
 }

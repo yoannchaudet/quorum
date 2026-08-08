@@ -10,8 +10,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use quorum_core::{
     agent::{AgentRunner, EchoRunner},
-    ensure_worktree, worktree_record, Config, Coordinator, CopilotRunner, Database, Decision,
-    RegisteredRepository, RepositoryRoot, State, Store, WorkItemId,
+    ensure_worktree, git_common_dir, worktree_record, Config, Coordinator, CopilotRunner, Database,
+    Decision, GitImplementationWorkspace, RegisteredRepository, RepositoryRoot, State, Store,
+    WorkItemId,
 };
 
 #[derive(Parser)]
@@ -152,16 +153,32 @@ fn run() -> Result<()> {
             } else {
                 Box::new(CopilotRunner::new(config.sandbox.clone()))
             };
-            let mut co = Coordinator::new(config, store, runner, worktree.path, wi_id.clone())
-                .context("initializing coordinator")?;
+            let common_git_dir =
+                git_common_dir(&worktree.path).context("resolving worktree Git directory")?;
+            let mut co = Coordinator::new(
+                config,
+                store,
+                runner,
+                Box::new(GitImplementationWorkspace),
+                worktree.path,
+                wi_id.clone(),
+            )
+            .context("initializing coordinator")?
+            .with_implementation_allowed_dirs(vec![common_git_dir]);
             co.run_until_blocked().context("advancing work item")?;
             report(&wi_id, &co)?;
         }
         Command::Status { wi } => {
             let (store, _, workspace) = open_work_item(&config, context.as_deref(), &wi, false)?;
-            let mut co =
-                Coordinator::new(config, store, Box::new(EchoRunner), workspace, wi.clone())
-                    .context("initializing coordinator")?;
+            let mut co = Coordinator::new(
+                config,
+                store,
+                Box::new(EchoRunner),
+                Box::new(GitImplementationWorkspace),
+                workspace,
+                wi.clone(),
+            )
+            .context("initializing coordinator")?;
             // Ensure the HI session row exists (deterministic; repairs it if a
             // crash occurred before it was recorded).
             co.ensure_session().context("recording HI session")?;
@@ -219,8 +236,21 @@ fn resolve_and_continue(
     } else {
         Box::new(CopilotRunner::new(config.sandbox.clone()))
     };
-    let mut co = Coordinator::new(config, store, runner, workspace, wi_id)
-        .context("initializing coordinator")?;
+    let additional_dirs = if require_worktree {
+        vec![git_common_dir(&workspace).context("resolving worktree Git directory")?]
+    } else {
+        vec![]
+    };
+    let mut co = Coordinator::new(
+        config,
+        store,
+        runner,
+        Box::new(GitImplementationWorkspace),
+        workspace,
+        wi_id,
+    )
+    .context("initializing coordinator")?
+    .with_implementation_allowed_dirs(additional_dirs);
     co.resolve(decision)
         .context("resolving human intervention")?;
     co.run_until_blocked().context("advancing work item")?;

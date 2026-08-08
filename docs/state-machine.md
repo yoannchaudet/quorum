@@ -39,6 +39,7 @@ stateDiagram-v2
   Implementing --> Reviewing
   Reviewing --> Implementing: RV rejects (adversarial loop)
   Reviewing --> WorkReview: RV accepts
+  Reviewing --> WorkReview: unchanged tree or iteration bound
   WorkReview --> Implementing: changes requested (HI)
   WorkReview --> Done: approved (HI)
   Reviewing --> Done: RV accepts, review disabled
@@ -60,6 +61,8 @@ stateDiagram-v2
 1. **Intake loop** — `Planning` → `IntakeReview` → `Planning`, until PLs have no open questions.
 2. **Convergence loop** — `Planning` → `Converging` → `Planning`, until the Plan stabilizes. See [agents](agents.md) for convergence criteria.
 3. **Adversarial loop** — `Implementing` → `Reviewing` → `Implementing`, until RV accepts.
+   After a rejection, equal consecutive Git tree SHAs or the configured iteration bound
+   force `WorkReview`, even when the normal work-review gate is disabled.
 
 `PlanReview` and `WorkReview` are optional gates (toggled in [config](config.md)); when
 disabled the CO transitions straight through.

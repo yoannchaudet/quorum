@@ -17,9 +17,14 @@ pub use agent::{AgentRunner, CopilotRunner, EchoRunner};
 pub use config::Config;
 pub use coordinator::{Coordinator, Decision};
 pub use persistence::{
-    Database, RegisteredRepository, RepositoryId, Store, Transition, WorkItemId, WorktreeRecord,
+    Database, ImplementationRound, ImplementationRoundStatus, RegisteredRepository, RepositoryId,
+    Store, Transition, WorkItemId, WorktreeRecord,
 };
 pub use prompt::Prompt;
 pub use repository::{RepositoryError, RepositoryRoot};
 pub use state::{Kind, State};
-pub use worktree::{branch_name, ensure_worktree, worktree_record, WorktreeError};
+pub use worktree::{
+    branch_name, ensure_worktree, finalize_implementation_round, git_common_dir, worktree_head,
+    worktree_is_clean, worktree_record, GitImplementationWorkspace, ImplementationWorkspace,
+    RoundGitResult, WorktreeError,
+};
