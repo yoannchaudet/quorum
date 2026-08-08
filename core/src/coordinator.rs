@@ -470,10 +470,20 @@ impl Coordinator {
                 }
                 .into());
             }
+            let runtime_dir = self
+                .workspace
+                .parent()
+                .unwrap_or(&self.workspace)
+                .join("runtime");
+            let artifact_dir = runtime_dir.join("artifacts");
+            let runtime_text = runtime_dir.display().to_string();
+            let artifact_text = artifact_dir.display().to_string();
             let rendered = Prompt::implementer().render(&[
                 ("work_item", &work_item),
                 ("plan", &plan),
                 ("feedback", &feedback),
+                ("runtime_dir", &runtime_text),
+                ("artifact_dir", &artifact_text),
             ])?;
             let req = AgentRequest {
                 role: AgentRole::Implementer,
@@ -484,7 +494,19 @@ impl Coordinator {
                 iteration: Some(iteration),
                 additional_dirs: self.implementation_allowed_dirs.clone(),
             };
-            let output = self.invoke(&req)?;
+            let invocation = self.invoke(&req);
+            let artifacts = self.store.sync_artifacts(iteration, &artifact_dir)?;
+            if artifacts > 0 {
+                self.record_activity(
+                    ActivityEvent::new(
+                        ActivityKind::Artifact,
+                        format!("{artifacts} execution artifact(s) retained"),
+                    )
+                    .phase(State::Implementing)
+                    .iteration(iteration),
+                );
+            }
+            let output = invocation?;
             let head_after_agent = self.implementation_workspace.head(&self.workspace)?;
             if head_after_agent != round.start_commit {
                 return Err(WorktreeError::UnexpectedHead {
@@ -554,11 +576,25 @@ impl Coordinator {
             .latest_implementation()?
             .ok_or(CoordinatorError::NoImplementation)?;
 
+        let artifacts = self
+            .store
+            .artifacts()?
+            .into_iter()
+            .map(|artifact| format!("- {}", artifact.path))
+            .collect::<Vec<_>>()
+            .join("\n");
         let rendered = Prompt::reviewer().render(&[
             ("work_item", &work_item),
             ("plan", &plan),
             ("implementation", &implementation),
+            ("artifacts", &artifacts),
         ])?;
+        let artifact_dir = self
+            .workspace
+            .parent()
+            .unwrap_or(&self.workspace)
+            .join("runtime")
+            .join("artifacts");
         let req = AgentRequest {
             role: AgentRole::Reviewer,
             prompt: rendered,
@@ -566,7 +602,11 @@ impl Coordinator {
             filesystem: Filesystem::ReadOnly,
             model: self.config.models.reviewer.clone(),
             iteration: Some(iteration),
-            additional_dirs: vec![],
+            additional_dirs: if artifact_dir.exists() {
+                vec![artifact_dir]
+            } else {
+                vec![]
+            },
         };
         let output = self.invoke(&req)?;
         let review = convergence::parse_review(&output);
@@ -641,7 +681,7 @@ impl Coordinator {
                     return Ok(output);
                 }
                 Err(error) => {
-                    let final_attempt = attempt == attempts;
+                    let final_attempt = attempt == attempts || !agent_error_is_retryable(&error);
                     let mut failed = ActivityEvent::new(
                         if final_attempt {
                             ActivityKind::AgentFailed
@@ -663,6 +703,9 @@ impl Coordinator {
                         failed = failed.iteration(iteration);
                     }
                     self.record_activity(failed);
+                    if !agent_error_is_retryable(&error) {
+                        return Err(error.into());
+                    }
                     last = Some(error);
                 }
             }
@@ -821,6 +864,13 @@ impl Coordinator {
             Err(error) => self.observer.on_persistence_error(&event, &error),
         }
     }
+}
+
+fn agent_error_is_retryable(error: &AgentError) -> bool {
+    matches!(
+        error,
+        AgentError::Spawn { .. } | AgentError::NonZeroExit { .. }
+    )
 }
 
 fn short_sha(value: &str) -> &str {
@@ -1553,6 +1603,23 @@ mod tests {
         let err = co.transition_to(State::Done, "nope").unwrap_err();
         assert!(matches!(err, CoordinatorError::IllegalTransition { .. }));
         assert_eq!(co.state(), State::Intake);
+    }
+
+    #[test]
+    fn deterministic_agent_failures_are_not_retried() {
+        assert!(!agent_error_is_retryable(&AgentError::Timeout {
+            role: "Implementer".to_string(),
+            seconds: 1,
+            stderr: String::new(),
+        }));
+        assert!(!agent_error_is_retryable(&AgentError::SandboxDisabled {
+            role: "Implementer".to_string(),
+        }));
+        assert!(agent_error_is_retryable(&AgentError::NonZeroExit {
+            role: "Implementer".to_string(),
+            code: "1".to_string(),
+            stderr: String::new(),
+        }));
     }
 
     #[test]

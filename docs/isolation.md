@@ -22,6 +22,9 @@ OS-level boundary (macOS Seatbelt / Linux bubblewrap). It:
 The **Coordinator itself (the Rust Core) is not sandboxed** — it is the orchestrator. Only the
 `copilot` agent invocations it spawns are sandboxed.
 
+Quorum refuses to run a real agent when the Local Sandbox is disabled. Dry runs remain
+available because they spawn no agent process.
+
 ## Per-role profiles
 
 | Role | Filesystem | cwd | Rationale |
@@ -34,14 +37,16 @@ Because the run is non-interactive (`--no-ask-user`), copilot cannot prompt for 
 approval and would otherwise deny every action. Tools are therefore granted up front,
 **scoped by role**:
 
-- **Implementer (read/write)**: with the sandbox enabled, `--allow-all-tools` — the sandbox is the
+- **Implementer (read/write)**: `--allow-all-tools` — the sandbox is the
   boundary, so broad tools are allowed inside it. A **deny-list** still blocks destructive
-  operations (e.g. `shell(rm)`) as defense in depth. If the sandbox is **disabled**, the Implementer
-  is instead scoped to file tools (`--allow-tool read,write`) — never blanket tools without
-  an OS boundary.
+  operations (e.g. `shell(rm)`) as defense in depth.
 - **Planner / Reviewer (read-only)**: `--allow-tool read` only — they can inspect but not modify.
 
 There is no blanket `--allow-all-tools` outside the sandbox.
+
+Unattended runs also disable remote control/export, automatic updates, and the built-in
+GitHub MCP server. Detected credential-like environment variables are passed through
+Copilot's secret stripping so shell and local MCP subprocesses do not inherit them.
 
 ## Invocation shape
 
@@ -51,6 +56,8 @@ Each agent run is one non-interactive `copilot` call:
 # Implementer (read/write): cwd = linked worktree root
 copilot --sandbox --experimental --no-ask-user --allow-all-tools \
         --add-dir "<absolute common Git directory>" \
+        --add-dir "<work-item runtime directory>" \
+        --additional-mcp-config="@<runtime>/playwright-mcp.json" \
         --deny-tool "<destructive ops>" -p "<prompt>"
 
 # Planner/Reviewer (read-only): cwd = read-only inputs
@@ -60,6 +67,32 @@ copilot --sandbox --experimental --no-ask-user --allow-tool read \
 
 Prompts come from reviewable markdown files (see [prompts](prompts.md)). Filesystem,
 network, and deny-tool policy come from the `sandbox:` config block (see [config](config.md)).
+
+## Process and server lifetime
+
+Each invocation runs in a dedicated process group and is supervised by the
+Coordinator. `limits.step_timeout_secs` is enforced. On success, failure, or timeout,
+Quorum terminates the process group so background development servers, browsers,
+language servers, and other descendants cannot survive the step. Captured output is
+bounded to its most recent 1 MiB per stream.
+
+The Implementer may run ordinary repository commands without a Quorum command
+allow-list. Development servers should bind to `127.0.0.1` and exist only long enough
+for tests or browser validation within the same step.
+
+## Browser isolation
+
+The Implementer receives an official, pinned Playwright MCP sidecar. It runs under the
+same sandbox and process group with:
+
+- an isolated in-memory browser profile;
+- a deterministic viewport;
+- a work-item artifact output directory capped by Playwright;
+- headed mode on graphical hosts and headless fallback otherwise;
+- no connection to the user's browser, extensions, cookies, passwords, or history.
+
+Screenshots and browser diagnostics are retained as work-item artifacts. The
+Implementer may also use browser tooling already provided by the repository.
 
 ## Recovery interplay
 
@@ -71,6 +104,11 @@ and Reviewers remain
 read-only and receive no additional writable directory. Combined with recoverable
 worktree setup and the per-round protocol, this keeps each step resumable (see
 [persistence](persistence.md)).
+
+Local Sandbox and MXC are preview technologies and are not virtual-machine-grade
+isolation. With outbound internet enabled, code from a malicious repository can
+transmit repository files it is allowed to read. The boundary protects the rest of the
+host and personal credentials; it does not make readable source code confidential.
 
 ## Cloud sandbox (future)
 

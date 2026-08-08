@@ -55,6 +55,10 @@ Exact model IDs are set in config; the docs fix the *number and roles*, not the 
   the maximum iteration count is reached.
 - The Coordinator, not the Implementer, stages and commits each changed round. Empty rounds retain the
   existing commit while recording its tree SHA.
+- The Implementer can run repository tests and builds, start a loopback development
+  server, automate an isolated headless or visible browser, and retain screenshots.
+- All Implementer child processes are step-scoped and terminated before the
+  Coordinator finalizes the round.
 
 ## Human intervention
 

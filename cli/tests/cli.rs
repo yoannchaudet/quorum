@@ -164,7 +164,7 @@ fn run_advances_to_plan_review_and_status_reads_it_back() {
     let out = quorum(home, &repo, &["status", "my-work-item", "--json"]);
     assert!(out.status.success(), "JSON status failed: {out:?}");
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(value["version"], 2);
+    assert_eq!(value["version"], 3);
     assert_eq!(value["identity"]["slug"], "my-work-item");
     assert_eq!(value["state"]["current"], "plan_review");
     assert_eq!(value["planning"]["iterations"], 1);

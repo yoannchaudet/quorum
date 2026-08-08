@@ -23,6 +23,7 @@ the **Plan** and the work item. You are a different model from the Implementer; 
 - **Work item**: `{{work_item}}`
 - **Plan**: `{{plan}}`
 - **Implementation summary + changes**: `{{implementation}}`
+- **Execution artifacts** (may be empty): `{{artifacts}}`
 
 ## Output
 

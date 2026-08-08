@@ -27,12 +27,14 @@ events are still persisted.
 - planning iterations, planners, convergence, and Plan;
 - implementation round states, commits, trees, and summaries;
 - review verdicts/findings and failures;
+- retained screenshots and browser/execution artifacts by implementation round;
 - worktree path, branch, base, HEAD, and cleanliness;
 - transition and activity history.
 
 Default output uses snippets and the latest ten activity records. `--verbose` prints full
 stored text and all activity. `--json` returns a versioned snapshot document for tools
 and future UI clients.
+The current document version is `3`; version 3 adds execution artifacts.
 
 An unmatched old `agent_started` record is reported only as the latest known activity;
 it is not proof that the process is still running.

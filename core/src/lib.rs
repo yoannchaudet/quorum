@@ -18,11 +18,12 @@ pub use agent::{AgentRole, AgentRunner, CopilotRunner, EchoRunner};
 pub use config::Config;
 pub use coordinator::{Coordinator, Decision};
 pub use observability::{
-    ActivityEvent, ActivityKind, ActivityObserver, NoopActivityObserver, StatusSnapshot,
+    ActivityEvent, ActivityKind, ActivityObserver, ArtifactSnapshot, NoopActivityObserver,
+    StatusSnapshot,
 };
 pub use persistence::{
-    Database, ImplementationRound, ImplementationRoundStatus, RegisteredRepository, RepositoryId,
-    Store, Transition, WorkItemId, WorktreeRecord,
+    Artifact, Database, ImplementationRound, ImplementationRoundStatus, RegisteredRepository,
+    RepositoryId, Store, Transition, WorkItemId, WorktreeRecord,
 };
 pub use prompt::Prompt;
 pub use repository::{RepositoryError, RepositoryRoot};
