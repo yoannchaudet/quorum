@@ -10,10 +10,10 @@ use std::path::{Path, PathBuf};
 
 /// Top-level configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
-    /// Where per-WI state and assets live (see `docs/persistence.md`).
-    pub state_dir: PathBuf,
+    /// Root for Quorum's global database and filesystem state.
+    pub data_dir: PathBuf,
     /// Planner roster override: slot -> model id (see `docs/agents.md`).
     pub planners: BTreeMap<String, String>,
     /// Model targets for the other roles.
@@ -85,7 +85,7 @@ pub enum ConfigError {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            state_dir: default_state_dir(),
+            data_dir: default_data_dir(),
             planners: default_planners(),
             models: Models::default(),
             reviews: Reviews::default(),
@@ -126,11 +126,10 @@ impl Default for Limits {
     }
 }
 
-fn default_state_dir() -> PathBuf {
+fn default_data_dir() -> PathBuf {
     home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".quorum")
-        .join("state")
 }
 
 /// The fixed default planner roster (see `docs/agents.md`). Model ids are left
@@ -147,6 +146,21 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 impl Config {
+    /// The global SQLite database path.
+    pub fn database_path(&self) -> PathBuf {
+        self.data_dir.join("quorum.db")
+    }
+
+    /// Root for filesystem state that does not belong in SQLite.
+    pub fn state_dir(&self) -> PathBuf {
+        self.data_dir.join("state")
+    }
+
+    /// Filesystem state for one work item, keyed by its stable internal id.
+    pub fn work_item_dir(&self, work_item_id: &str) -> PathBuf {
+        self.state_dir().join(work_item_id)
+    }
+
     /// Load config from `path`, merging over defaults. A missing file yields
     /// defaults; a present but partial file overrides only the keys it sets.
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
@@ -213,6 +227,8 @@ mod tests {
         assert!(c.sandbox.enabled);
         assert!(c.sandbox.experimental);
         assert_eq!(c.sandbox.deny_tools, vec!["shell(rm)".to_string()]);
+        assert_eq!(c.database_path(), c.data_dir.join("quorum.db"));
+        assert_eq!(c.state_dir(), c.data_dir.join("state"));
     }
 
     #[test]
@@ -231,6 +247,14 @@ mod tests {
         // Untouched keys keep their defaults.
         assert!(c.reviews.work_review);
         assert_eq!(c.limits.step_retries, 3);
+    }
+
+    #[test]
+    fn removed_state_dir_key_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "state_dir: /tmp/quorum\n").unwrap();
+        assert!(Config::load(&path).is_err());
     }
 
     #[test]

@@ -14,6 +14,6 @@ pub mod state;
 pub use agent::{AgentRunner, CopilotRunner, EchoRunner};
 pub use config::Config;
 pub use coordinator::{Coordinator, Decision};
-pub use persistence::{Store, Transition};
+pub use persistence::{Database, Store, Transition, WorkItemId};
 pub use prompt::Prompt;
 pub use state::{Kind, State};

@@ -1,70 +1,70 @@
 # Persistence & Crash Resilience
 
 The Core runs mostly unattended, so it must survive process crashes at any point.
-State lives in a **per-WI SQLite database**. Every step is **recoverable**: on restart
-the CO reopens the DB and continues from the last committed transaction.
+All structured state lives in one global SQLite database. Every query used by the
+Coordinator is scoped to a stable internal work-item ID.
 
-## On-disk layout (per WI)
+## On-disk layout
 
 ```
-<state_dir>/<wi-id>/
-  quorum.db           # all structured state (SQLite, WAL mode)
-  assets/             # binary image files referenced by the WI (see work-items.md)
-  implementation/     # IM working output (code / files)
+~/.quorum/
+  quorum.db                     # structured state for every WI
+  state/<work-item-id>/
+    assets/                     # binary image files referenced by the WI
+    implementation/             # IM working output
 ```
 
-Only binary blobs (images) and the IM's file output stay on disk. Everything
-structured — WI text, state, history, candidate plans, reviews, event log — lives in
-`quorum.db`.
+The internal ID is a UUID, independent of the user-facing WI slug. Repository ownership
+will be associated in the database; it does not determine the filesystem path.
 
-## Schema (tables)
+## Schema
 
 | Table | Holds |
 |-------|-------|
-| `work_item` | Normalized WI markdown + metadata (source, origin repo/issue). |
-| `state` | Single row: current state + updated-at (see [state-machine](state-machine.md)). |
-| `transitions` | Append-only history of every state transition (from, to, reason, ts). |
-| `candidates` | PL candidate plans: `(planner, iteration, text)`. |
-| `plan` | The converged Plan text + convergence metrics. |
-| `reviews` | RV feedback per adversarial iteration: `(iteration, text, accepted)`. |
-| `sessions` | HI session records: `(state, session_name, ts)` (see [sessions](sessions.md)). |
-| `events` | Append-only event log for auditing and resume. |
+| `work_items` | Stable ID, slug, normalized markdown, and source metadata. |
+| `states` | Current state per WI. |
+| `transitions` | Append-only transition history per WI. |
+| `candidates` | PL candidate plans by WI, planner, and iteration. |
+| `plans` | Converged Plan and metrics per WI. |
+| `implementations` | IM summary by WI and adversarial iteration. |
+| `intake` | Current planner questions per WI. |
+| `reviews` | RV feedback and verdict by WI and iteration. |
+| `sessions` | HI session records by WI and blocked state. |
+| `events` | Append-only audit events per WI. |
+
+Every WI-owned row has a foreign key to `work_items` with cascading deletion. Composite
+keys include the WI ID, preventing planners, iterations, sessions, or reviews from
+colliding across WIs.
+
+## Connection policy
+
+- **WAL mode** permits readers while another process commits.
+- **Foreign keys** are enabled on every connection.
+- **Busy timeout** bounds lock contention instead of failing immediately.
+- **Short transactions** never span agent or external-command execution.
 
 ## Guarantees
 
-- **Atomic steps**: each step (PL run, merge, IM, RV) writes its outputs and advances
-  `state` in a **single SQLite transaction**. A crash leaves either the whole step or
-  none of it — never a partial state.
-- **WAL mode**: write-ahead logging survives process crashes without corruption.
-- **Single source of truth**: the `state` row is authoritative and only advances inside
-  the same transaction that persisted the step's outputs.
-- **Idempotent steps**: each step writes to deterministic keys (e.g. `(planner, iteration)`)
-  so a re-run after a crash overwrites cleanly rather than duplicating.
-- **Confined agent writes**: the Local Sandbox restricts each agent's writes to the WI
-  workspace, so a crashed agent never leaves state outside `<state_dir>/<wi-id>/`
+- **Atomic transitions**: state, transition history, and authorizing events commit in one
+  transaction.
+- **Scoped access**: the Coordinator receives a WI-scoped store rather than unrestricted
+  catalog access.
+- **Single source of truth**: the `states` row for a WI is authoritative.
+- **Idempotent outputs**: deterministic composite keys let a retry replace the same
+  planner, implementation, or review iteration.
+- **Confined agent writes**: Local Sandbox restricts file writes to the WI workspace
   (see [isolation](isolation.md)).
 
 ## Resume after crash
 
-1. Open `quorum.db`, read the `state` row → current state.
-2. Verify the outputs that state requires exist (rows/files) and are valid.
-3. If complete, advance; if partial/missing, **re-run that step** (idempotent).
-4. For blocked (HI) states, re-derive the Session name from `sessions`/state and re-print
-   the resume command (see [sessions](sessions.md)) — no human input is lost.
-
-## What each state persists (before advancing)
-
-| State | Durable output |
-|-------|----------------|
-| `Intake` | `work_item` row + `assets/` |
-| `Planning` | `candidates` rows for every PL |
-| `Converging` | `plan` row (+ convergence metrics) |
-| `Implementing` | `implementation/` files |
-| `Reviewing` | `reviews` row |
-| HI states | `sessions` row (session name) |
+1. Find the WI by its user-facing ID in the global catalog.
+2. Read its scoped `states` row.
+3. Verify the outputs required by that state.
+4. Advance when complete; otherwise re-run the idempotent step.
+5. For blocked states, re-derive and surface the persisted Session name.
 
 ## Failure
 
-- A step retries up to `limits.step_retries` (see [config](config.md)) before the CO
-  moves the WI to `Failed`. `Failed` is terminal but `quorum.db` is preserved for
-  inspection and manual restart.
+A step retries up to `limits.step_retries` before the CO moves the WI to `Failed`.
+`Failed` is terminal, but its structured history and filesystem workspace remain
+available for inspection.

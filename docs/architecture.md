@@ -14,7 +14,8 @@ flowchart TB
   tauri -.-> core
   core --> gh[GitHub]
   core --> cop[copilot CLI]
-  core --> fs[(On-disk state)]
+  core --> db[(Global SQLite state)]
+  core --> fs[(Per-WI files)]
   classDef future stroke-dasharray: 4 4;
 ```
 

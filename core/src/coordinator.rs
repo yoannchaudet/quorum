@@ -575,6 +575,7 @@ impl Coordinator {
 mod tests {
     use super::*;
     use crate::agent::{AgentError, AgentRequest, EchoRunner};
+    use crate::persistence::Database;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -1163,9 +1164,12 @@ mod tests {
     fn resumes_persisted_state_after_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("quorum.db");
+        let work_item_id;
 
         {
-            let mut store = Store::open(&path).unwrap();
+            let mut database = Database::open(&path).unwrap();
+            work_item_id = database.get_or_create_work_item("test-wi").unwrap();
+            let mut store = database.into_store(work_item_id.clone()).unwrap();
             store.set_work_item("# WI").unwrap();
             let mut co = Coordinator::new(
                 Config::default(),
@@ -1179,7 +1183,10 @@ mod tests {
         }
 
         // Reopen: a fresh Coordinator must resume at the persisted state.
-        let store = Store::open(&path).unwrap();
+        let store = Database::open(&path)
+            .unwrap()
+            .into_store(work_item_id)
+            .unwrap();
         let co = Coordinator::new(
             Config::default(),
             store,

@@ -24,14 +24,16 @@ Images are first-class — they will be used extensively.
 ## On-disk shape
 
 ```
-<state-dir>/<wi-id>/
-  quorum.db           # WI text + all CO state (see persistence.md)
-  assets/             # downloaded/embedded images
-  implementation/     # IM output
+~/.quorum/
+  quorum.db           # structured state for every WI
+  state/<work-item-id>/
+    assets/           # downloaded/embedded images
+    implementation/   # IM output
 ```
 
-The WI's normalized markdown is stored in `quorum.db`; only binary images live under
-`assets/`.
+The WI's normalized markdown and stable internal id are stored in the global database.
+Only binary images and implementation files live under the WI's UUID-keyed state
+directory.
 
 `implementation/` is the IM's **writable sandbox workspace** (its cwd). PL and RV run
 read-only against the WI, assets, and IM output. See [isolation](isolation.md).

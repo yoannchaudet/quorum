@@ -63,8 +63,9 @@ network, and deny-tool policy come from the `sandbox:` config block (see [config
 ## Recovery interplay
 
 The sandbox confines every agent's writes to the WI workspace, so a crashed or killed
-agent can never leave partial state outside `<state_dir>/<wi-id>/`. Combined with atomic
-step transactions, this keeps each step recoverable (see [persistence](persistence.md)).
+agent can never leave partial files outside `~/.quorum/state/<work-item-id>/`. Combined
+with atomic global-database transactions, this keeps each step recoverable (see
+[persistence](persistence.md)).
 
 ## Cloud sandbox (future)
 
