@@ -30,20 +30,31 @@ The **CO itself (the Rust Core) is not sandboxed** — it is the orchestrator. O
 | RV | read-only | read-only view of IM output | Reviews; feedback captured from stdout. |
 | IM | read/write | its WI workspace (`implementation/`) | Must write code; writes stay in the workspace. |
 
-Because the sandbox is the boundary, broad tools run non-interactively inside it
-(`--no-ask-user`) rather than a hand-maintained allowlist. A **deny-list** still blocks
-destructive operations (e.g. `shell(rm)`) as defense in depth. There is no blanket
-`--allow-all-tools` outside the sandbox.
+Because the run is non-interactive (`--no-ask-user`), copilot cannot prompt for tool
+approval and would otherwise deny every action. Tools are therefore granted up front,
+**scoped by role**:
+
+- **IM (read/write)**: with the sandbox enabled, `--allow-all-tools` — the sandbox is the
+  boundary, so broad tools are allowed inside it. A **deny-list** still blocks destructive
+  operations (e.g. `shell(rm)`) as defense in depth. If the sandbox is **disabled**, the IM
+  is instead scoped to file tools (`--allow-tool read,write`) — never blanket tools without
+  an OS boundary.
+- **PL / RV (read-only)**: `--allow-tool read` only — they can inspect but not modify.
+
+There is no blanket `--allow-all-tools` outside the sandbox.
 
 ## Invocation shape
 
 Each agent run is one non-interactive `copilot` call:
 
 ```
-copilot --sandbox --experimental --no-ask-user -p "<prompt>" \
-        --deny-tool "<destructive ops>"        # from config
-# PL/RV: cwd = read-only inputs, sandbox denies writes
-# IM:    cwd = implementation/, sandbox allows writes here + temp
+# IM (read/write): cwd = implementation/, sandbox allows writes here + temp
+copilot --sandbox --experimental --no-ask-user --allow-all-tools \
+        --deny-tool "<destructive ops>" -p "<prompt>"
+
+# PL/RV (read-only): cwd = read-only inputs
+copilot --sandbox --experimental --no-ask-user --allow-tool read \
+        --deny-tool "<destructive ops>" -p "<prompt>"
 ```
 
 Prompts come from reviewable markdown files (see [prompts](prompts.md)). Filesystem,
