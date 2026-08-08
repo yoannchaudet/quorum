@@ -5,10 +5,12 @@
 //! after a crash.
 
 use std::path::PathBuf;
+use std::time::Instant;
 
 use crate::agent::{AgentError, AgentRequest, AgentRunner, Filesystem};
 use crate::config::Config;
 use crate::convergence;
+use crate::observability::{ActivityEvent, ActivityKind, ActivityObserver, NoopActivityObserver};
 use crate::persistence::{ImplementationRoundStatus, Store, StoreError, Transition};
 use crate::prompt::{Prompt, PromptError};
 use crate::state::State;
@@ -78,6 +80,7 @@ pub struct Coordinator {
     config: Config,
     store: Store,
     runner: Box<dyn AgentRunner>,
+    observer: Box<dyn ActivityObserver>,
     implementation_workspace: Box<dyn ImplementationWorkspace>,
     /// Working directory used as the sandbox cwd for agent invocations.
     workspace: PathBuf,
@@ -105,6 +108,7 @@ impl Coordinator {
             config,
             store,
             runner,
+            observer: Box::new(NoopActivityObserver),
             implementation_workspace,
             workspace,
             implementation_allowed_dirs: Vec::new(),
@@ -115,6 +119,11 @@ impl Coordinator {
 
     pub fn with_implementation_allowed_dirs(mut self, directories: Vec<PathBuf>) -> Coordinator {
         self.implementation_allowed_dirs = directories;
+        self
+    }
+
+    pub fn with_observer(mut self, observer: Box<dyn ActivityObserver>) -> Coordinator {
+        self.observer = observer;
         self
     }
 
@@ -171,7 +180,15 @@ impl Coordinator {
         }
         self.store
             .record_transition(Some(self.state), next, reason)?;
+        let previous = self.state;
         self.state = next;
+        self.record_activity(
+            ActivityEvent::new(
+                ActivityKind::Transition,
+                format!("{previous} -> {next}: {reason}"),
+            )
+            .phase(next),
+        );
         Ok(self.state)
     }
 
@@ -220,7 +237,15 @@ impl Coordinator {
         let reason = format!("hi: {decision} {} -> {next}", self.state);
         self.store
             .record_transition_with_events(Some(self.state), next, &reason, &extra)?;
+        let previous = self.state;
         self.state = next;
+        self.record_activity(
+            ActivityEvent::new(
+                ActivityKind::Transition,
+                format!("{previous} -> {next}: {reason}"),
+            )
+            .phase(next),
+        );
         Ok(self.state)
     }
 
@@ -248,6 +273,7 @@ impl Coordinator {
                 cwd: self.workspace.clone(),
                 filesystem: Filesystem::ReadOnly,
                 model,
+                iteration: None,
                 additional_dirs: vec![],
             };
             let output = self.invoke(&req)?;
@@ -290,6 +316,7 @@ impl Coordinator {
                 cwd: self.workspace.clone(),
                 filesystem: Filesystem::ReadOnly,
                 model,
+                iteration: Some(iteration),
                 additional_dirs: vec![],
             };
             let output = self.invoke(&req)?;
@@ -330,6 +357,7 @@ impl Coordinator {
             cwd: self.workspace.clone(),
             filesystem: Filesystem::ReadOnly,
             model: self.config.models.coordinator.clone(),
+            iteration: Some(iteration),
             additional_dirs: vec![],
         };
         let output = self.invoke(&req)?;
@@ -348,6 +376,18 @@ impl Coordinator {
             merged.converged
         );
         self.store.set_plan(&merged.plan, &metrics)?;
+        self.record_activity(
+            ActivityEvent::new(
+                ActivityKind::Convergence,
+                if converged {
+                    format!("planning iteration {} converged", iteration + 1)
+                } else {
+                    format!("planning iteration {} requires another pass", iteration + 1)
+                },
+            )
+            .phase(State::Converging)
+            .iteration(iteration),
+        );
         Ok(converged)
     }
 
@@ -392,11 +432,32 @@ impl Coordinator {
                         .into());
                     }
                 }
-                self.store.reserve_implementation_round(iteration, &head)?
+                let round = self.store.reserve_implementation_round(iteration, &head)?;
+                self.record_activity(
+                    ActivityEvent::new(
+                        ActivityKind::ImplementationRound,
+                        format!(
+                            "implementation round {} reserved at {}",
+                            iteration + 1,
+                            short_sha(&head)
+                        ),
+                    )
+                    .phase(State::Implementing)
+                    .iteration(iteration),
+                );
+                round
             }
         };
 
         if round.status == ImplementationRoundStatus::Committed {
+            self.record_activity(
+                ActivityEvent::new(
+                    ActivityKind::ImplementationRound,
+                    format!("implementation round {} already committed", iteration + 1),
+                )
+                .phase(State::Implementing)
+                .iteration(iteration),
+            );
             return Ok(());
         }
 
@@ -420,6 +481,7 @@ impl Coordinator {
                 cwd: self.workspace.clone(),
                 filesystem: Filesystem::ReadWrite,
                 model: self.config.models.implementer.clone(),
+                iteration: Some(iteration),
                 additional_dirs: self.implementation_allowed_dirs.clone(),
             };
             let output = self.invoke(&req)?;
@@ -434,6 +496,18 @@ impl Coordinator {
             self.store
                 .mark_implementation_agent_complete(iteration, &output)?;
             round.status = ImplementationRoundStatus::AgentComplete;
+        } else {
+            self.record_activity(
+                ActivityEvent::new(
+                    ActivityKind::ImplementationRound,
+                    format!(
+                        "implementation round {} resuming commit finalization",
+                        iteration + 1
+                    ),
+                )
+                .phase(State::Implementing)
+                .iteration(iteration),
+            );
         }
 
         let result = self.implementation_workspace.finalize(
@@ -444,6 +518,23 @@ impl Coordinator {
         )?;
         self.store
             .complete_implementation_round(iteration, &result.commit, &result.tree)?;
+        let changed = result.commit != round.start_commit;
+        self.record_activity(
+            ActivityEvent::new(
+                ActivityKind::ImplementationRound,
+                if changed {
+                    format!(
+                        "implementation round {} committed {}",
+                        iteration + 1,
+                        short_sha(&result.commit)
+                    )
+                } else {
+                    format!("implementation round {} produced no changes", iteration + 1)
+                },
+            )
+            .phase(State::Implementing)
+            .iteration(iteration),
+        );
         Ok(())
     }
 
@@ -474,6 +565,7 @@ impl Coordinator {
             cwd: self.workspace.clone(),
             filesystem: Filesystem::ReadOnly,
             model: self.config.models.reviewer.clone(),
+            iteration: Some(iteration),
             additional_dirs: vec![],
         };
         let output = self.invoke(&req)?;
@@ -481,8 +573,8 @@ impl Coordinator {
         self.store
             .save_review(iteration, &review.findings, review.accepted)?;
 
-        if review.accepted {
-            Ok(ReviewOutcome::Accepted)
+        let outcome = if review.accepted {
+            ReviewOutcome::Accepted
         } else if iteration > 0
             && self
                 .store
@@ -490,29 +582,92 @@ impl Coordinator {
                 .zip(self.store.implementation_tree(iteration - 1)?)
                 .is_some_and(|(current, previous)| current == previous)
         {
-            Ok(ReviewOutcome::Escalated("implementation unchanged"))
+            ReviewOutcome::Escalated("implementation unchanged")
         } else if iteration + 1 >= self.config.limits.adversarial_max_iters {
-            Ok(ReviewOutcome::Escalated("max adversarial iterations"))
+            ReviewOutcome::Escalated("max adversarial iterations")
         } else {
-            Ok(ReviewOutcome::Rejected)
-        }
+            ReviewOutcome::Rejected
+        };
+        let message = match outcome {
+            ReviewOutcome::Accepted => format!("review round {} accepted", iteration + 1),
+            ReviewOutcome::Rejected => format!("review round {} rejected", iteration + 1),
+            ReviewOutcome::Escalated(cause) => {
+                format!("review round {} escalated: {cause}", iteration + 1)
+            }
+        };
+        self.record_activity(
+            ActivityEvent::new(ActivityKind::Review, message)
+                .phase(State::Reviewing)
+                .iteration(iteration),
+        );
+        Ok(outcome)
     }
 
     /// Invoke an agent, retrying transient failures up to `limits.step_retries`
     /// times. Returns the last error if every attempt fails. This is the
     /// transient boundary: agent runs (process spawn/exit) are what may fail
     /// intermittently and are safe to re-run (see `docs/persistence.md`).
-    fn invoke(&self, req: &AgentRequest) -> Result<String, AgentError> {
+    fn invoke(&mut self, req: &AgentRequest) -> Result<String, CoordinatorError> {
         // One initial attempt plus up to `step_retries` retries.
         let attempts = self.config.limits.step_retries.saturating_add(1);
         let mut last: Option<AgentError> = None;
-        for _ in 0..attempts {
+        for attempt in 1..=attempts {
+            let mut started =
+                ActivityEvent::new(ActivityKind::AgentStarted, format!("{} started", req.role))
+                    .phase(self.state)
+                    .role(req.role.clone())
+                    .model(req.model.clone())
+                    .attempt(attempt);
+            if let Some(iteration) = req.iteration {
+                started = started.iteration(iteration);
+            }
+            self.record_activity(started);
+            let start = Instant::now();
             match self.runner.run(req) {
-                Ok(output) => return Ok(output),
-                Err(e) => last = Some(e),
+                Ok(output) => {
+                    let mut completed = ActivityEvent::new(
+                        ActivityKind::AgentCompleted,
+                        format!("{} completed", req.role),
+                    )
+                    .phase(self.state)
+                    .role(req.role.clone())
+                    .model(req.model.clone())
+                    .attempt(attempt)
+                    .elapsed(start.elapsed().as_millis() as u64);
+                    if let Some(iteration) = req.iteration {
+                        completed = completed.iteration(iteration);
+                    }
+                    self.record_activity(completed);
+                    return Ok(output);
+                }
+                Err(error) => {
+                    let final_attempt = attempt == attempts;
+                    let mut failed = ActivityEvent::new(
+                        if final_attempt {
+                            ActivityKind::AgentFailed
+                        } else {
+                            ActivityKind::AgentRetrying
+                        },
+                        if final_attempt {
+                            format!("{} failed", req.role)
+                        } else {
+                            format!("{} failed; retrying", req.role)
+                        },
+                    )
+                    .phase(self.state)
+                    .role(req.role.clone())
+                    .model(req.model.clone())
+                    .attempt(attempt)
+                    .elapsed(start.elapsed().as_millis() as u64);
+                    if let Some(iteration) = req.iteration {
+                        failed = failed.iteration(iteration);
+                    }
+                    self.record_activity(failed);
+                    last = Some(error);
+                }
             }
         }
-        Err(last.expect("attempts >= 1"))
+        Err(last.expect("attempts >= 1").into())
     }
 
     /// Advance the WI by one autonomous step, performing any agent work the
@@ -529,6 +684,13 @@ impl Coordinator {
         if self.state.is_blocked() || self.state.is_terminal() {
             return Ok(self.state);
         }
+        self.record_activity(
+            ActivityEvent::new(
+                ActivityKind::PhaseStarted,
+                format!("{} phase started", self.state),
+            )
+            .phase(self.state),
+        );
         match self.compute_next() {
             Ok((next, detail)) => {
                 let reason = detail.unwrap_or_else(|| format!("auto: {} -> {next}", self.state));
@@ -624,6 +786,7 @@ impl Coordinator {
             &[("error", cause)],
         )?;
         self.state = State::Failed;
+        self.record_activity(ActivityEvent::new(ActivityKind::Failed, cause).phase(State::Failed));
         Ok(State::Failed)
     }
 
@@ -637,20 +800,52 @@ impl Coordinator {
             let after = self.step()?;
             if after == before {
                 self.ensure_session()?;
+                let kind = if after.is_blocked() {
+                    ActivityKind::HumanIntervention
+                } else if after == State::Failed {
+                    ActivityKind::Failed
+                } else {
+                    ActivityKind::Completed
+                };
+                self.record_activity(
+                    ActivityEvent::new(kind, format!("work item stopped at {after}")).phase(after),
+                );
                 return Ok(after);
             }
         }
     }
+
+    fn record_activity(&mut self, event: ActivityEvent) {
+        match self.store.record_activity(&event) {
+            Ok(recorded) => self.observer.on_activity(&recorded),
+            Err(error) => self.observer.on_persistence_error(&event, &error),
+        }
+    }
+}
+
+fn short_sha(value: &str) -> &str {
+    value.get(..7).unwrap_or(value)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent::{AgentError, AgentRequest, EchoRunner};
+    use crate::observability::ActivityEvent;
     use crate::persistence::Database;
     use crate::worktree::{ImplementationWorkspace, RoundGitResult};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    struct CollectingObserver {
+        events: Arc<Mutex<Vec<ActivityEvent>>>,
+    }
+
+    impl ActivityObserver for CollectingObserver {
+        fn on_activity(&self, event: &ActivityEvent) {
+            self.events.lock().unwrap().push(event.clone());
+        }
+    }
 
     struct FakeImplementationWorkspace {
         head: Mutex<String>,
@@ -1006,10 +1201,61 @@ mod tests {
         config.reviews.work_review = false;
         // Fail step_retries - 1 times, then every call succeeds.
         let runner = FailingRunner::new(2);
-        let mut co = coordinator_with_runner(config, Box::new(runner));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut co = coordinator_with_runner(config, Box::new(runner)).with_observer(Box::new(
+            CollectingObserver {
+                events: events.clone(),
+            },
+        ));
 
         // Despite the initial transient failures, the WI completes normally.
         assert_eq!(co.run_until_blocked().unwrap(), State::Done);
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == ActivityKind::AgentRetrying)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn emits_and_persists_agent_lifecycle_activity() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut store = Store::open_in_memory().unwrap();
+        store.set_work_item("# WI").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut co = Coordinator::new(
+            Config::default(),
+            store,
+            Box::new(EchoRunner),
+            fake_workspace(),
+            workspace.path().to_path_buf(),
+            "test-wi",
+        )
+        .unwrap()
+        .with_observer(Box::new(CollectingObserver {
+            events: events.clone(),
+        }));
+
+        assert_eq!(co.run_until_blocked().unwrap(), State::PlanReview);
+
+        let observed = events.lock().unwrap().clone();
+        let started = observed
+            .iter()
+            .position(|event| event.kind == ActivityKind::AgentStarted)
+            .unwrap();
+        let completed = observed
+            .iter()
+            .position(|event| event.kind == ActivityKind::AgentCompleted)
+            .unwrap();
+        assert!(started < completed);
+        assert_eq!(observed, co.store.activities().unwrap());
+        assert!(observed
+            .iter()
+            .any(|event| event.kind == ActivityKind::HumanIntervention));
     }
 
     /// A runner that raises intake questions while `needs_answers` is set, and

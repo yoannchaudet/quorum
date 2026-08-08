@@ -98,6 +98,15 @@ fn run_advances_to_plan_review_and_status_reads_it_back() {
     assert!(out.status.success(), "run failed: {out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("PlanReview"), "unexpected output: {stdout}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("PL-intake:planner-a started"),
+        "missing live progress: {stderr}"
+    );
+    assert!(
+        stderr.contains("completed"),
+        "missing completion progress: {stderr}"
+    );
     assert!(
         stdout.contains("copilot --resume quorum/mywi/PlanReview"),
         "missing resume command: {stdout}"
@@ -113,10 +122,79 @@ fn run_advances_to_plan_review_and_status_reads_it_back() {
     );
     assert!(worktree.join(".git").is_file());
 
+    let root = RepositoryRoot::discover(&repo).unwrap();
+    let db = Database::open(&home.join(".quorum/quorum.db")).unwrap();
+    let registered = db.registered_repository(&root).unwrap().unwrap();
+    let internal_id = db.work_item_id(&registered.id, "mywi").unwrap().unwrap();
+    let mut store = db.into_store(internal_id.clone()).unwrap();
+    let long_plan = "0123456789".repeat(25);
+    store.set_plan(&long_plan, "iteration=0").unwrap();
+    let activity_count = store.activities().unwrap().len();
+    drop(store);
+
     let out = quorum(home, &repo, &["status", "mywi"]);
     assert!(out.status.success(), "status failed: {out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("PlanReview"), "unexpected output: {stdout}");
+    assert!(stdout.contains("planning:"), "missing planning: {stdout}");
+    assert!(
+        stdout.contains("transitions:"),
+        "missing transitions: {stdout}"
+    );
+    assert!(stdout.contains("activity"), "missing activity: {stdout}");
+    assert!(
+        !stdout.contains(&long_plan),
+        "default status should abbreviate the plan"
+    );
+
+    let out = quorum(home, &repo, &["status", "mywi", "--verbose"]);
+    assert!(out.status.success(), "verbose status failed: {out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(&long_plan),
+        "verbose status omitted the full plan"
+    );
+
+    let out = quorum(home, &repo, &["status", "mywi", "--json"]);
+    assert!(out.status.success(), "JSON status failed: {out:?}");
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["version"], 1);
+    assert_eq!(value["identity"]["slug"], "mywi");
+    assert_eq!(value["state"]["current"], "plan_review");
+    assert_eq!(value["planning"]["iterations"], 1);
+    assert_eq!(value["planning"]["plan"], long_plan);
+
+    let activity_count_after = Database::open(&home.join(".quorum/quorum.db"))
+        .unwrap()
+        .into_store(internal_id)
+        .unwrap()
+        .activities()
+        .unwrap()
+        .len();
+    assert_eq!(activity_count_after, activity_count);
+}
+
+#[test]
+fn quiet_suppresses_live_progress_but_not_final_report() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let repo = home.join("repo");
+    init_repo(&repo);
+    assert!(register(home, &repo).status.success());
+    let wi = repo.join("quiet.md");
+    std::fs::write(&wi, "# Quiet\n").unwrap();
+
+    let out = quorum(
+        home,
+        &repo,
+        &["run", "--dry-run", "--quiet", wi.to_str().unwrap()],
+    );
+    assert!(out.status.success(), "quiet run failed: {out:?}");
+    assert!(
+        out.stderr.is_empty(),
+        "quiet run wrote stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("PlanReview"));
 }
 
 #[test]

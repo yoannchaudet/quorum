@@ -33,6 +33,7 @@ is associated in the database; it does not determine the filesystem path.
 | `reviews` | RV feedback and verdict by WI and iteration. |
 | `sessions` | HI session records by WI and blocked state. |
 | `events` | Append-only audit events per WI. |
+| `activities` | Structured phase, agent, retry, Git-round, review, and outcome events. |
 | `worktrees` | Pinned base commit, branch, path, and setup status per WI. |
 
 Every WI-owned row has a foreign key to `work_items` with cascading deletion. WI slugs
@@ -63,6 +64,8 @@ iterations, sessions, or reviews from colliding across WIs.
 - **Attributable Git history**: the CO stages with `git add -A` and creates marked
   commits using a fixed Quorum identity. Empty rounds record the unchanged tree without
   creating an empty commit.
+- **Inspectable long work**: activity starts are committed before agent invocations and
+  completions/failures afterward, so another process can read the latest known activity.
 - **Confined agent writes**: Local Sandbox restricts file writes to the linked worktree
   (see [isolation](isolation.md)).
 

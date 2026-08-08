@@ -10,6 +10,8 @@ only stateful orchestrator; PL/IM/RV are stateless workers given explicit inputs
 - Runs the adversarial IM↔RV loop.
 - Pulls humans in (HI) via [Sessions](sessions.md) when blocked.
 - Persists after every step so it can resume after a crash (see [persistence](persistence.md)).
+- Emits typed activity before and after long-running work so frontends can show live
+  progress without parsing agent output (see [observability](observability.md)).
 
 ## Planners (PL) — the quorum
 

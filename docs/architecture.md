@@ -34,7 +34,7 @@ cli/                  # thin binary: parse args, call Core, render state
 | Layer | Owns | Does NOT own |
 |-------|------|--------------|
 | Core | State machine, agent orchestration (CO/PL/IM/RV), persistence, repository/worktree lifecycle, config load, GitHub + `copilot` invocation | Argument parsing, terminal rendering |
-| CLI | One WI: start/resume, print current state + HI resume commands | Any business logic; multi-WI orchestration |
+| CLI | One WI: start/resume, render live activity and status snapshots | Any business logic; multi-WI orchestration |
 | Tauri (future) | Windowing, launching a terminal for HI | Any logic not already in Core |
 
 ## Principles
@@ -43,5 +43,7 @@ cli/                  # thin binary: parse args, call Core, render state
 - **CLI is light**: it drives exactly one WI. Orchestrating many WIs is a future UX concern.
 - **No logic in frontends**: anything a human would call "how Quorum works" lives in Core.
 - **Registered context**: every WI is scoped to an allow-listed Git repository.
+- **Typed observability**: Core emits and persists structured activity; frontends only
+  choose how to render it.
 
 See [glossary](glossary.md) for terms, [state-machine](state-machine.md) for the Core's control flow.
