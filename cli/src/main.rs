@@ -119,7 +119,7 @@ fn run() -> Result<()> {
             let mut co = Coordinator::new(config, store, runner, workspace)
                 .context("initializing coordinator")?;
             co.run_until_blocked().context("advancing work item")?;
-            report(&wi_id, co.state());
+            report(&wi_id, &co)?;
         }
         Command::Status { db } => {
             let wi_id = db
@@ -135,7 +135,7 @@ fn run() -> Result<()> {
             let store = Store::open(&db).context("opening state database")?;
             let co = Coordinator::new(config, store, Box::new(EchoRunner), workspace)
                 .context("initializing coordinator")?;
-            report(&wi_id, co.state());
+            report(&wi_id, &co)?;
         }
         Command::Approve { wi, dry_run } => {
             resolve_and_continue(config, &wi, Decision::Approve, dry_run)?;
@@ -194,15 +194,22 @@ fn resolve_and_continue(
     co.resolve(decision)
         .context("resolving human intervention")?;
     co.run_until_blocked().context("advancing work item")?;
-    report(wi_id, co.state());
+    report(wi_id, &co)?;
     Ok(())
 }
 
-/// Render the current state and, when blocked, the HI resume command.
-fn report(wi_id: &str, state: State) {
+/// Render the current state and, when blocked, the HI resume command (and any
+/// intake questions awaiting answers).
+fn report(wi_id: &str, co: &Coordinator) -> Result<()> {
+    let state = co.state();
     if state.is_blocked() {
         let session = format!("quorum/{wi_id}/{state}");
         println!("state: {state} (stuck — awaiting human intervention)");
+        if state == State::IntakeReview {
+            if let Some(questions) = co.questions().context("reading intake questions")? {
+                println!("questions:\n{questions}");
+            }
+        }
         println!("resume: copilot --resume {session}");
     } else if state == State::Failed {
         println!("state: {state} (failed — see quorum.db for details)");
@@ -211,6 +218,7 @@ fn report(wi_id: &str, state: State) {
     } else {
         println!("state: {state} (progressing)");
     }
+    Ok(())
 }
 
 /// Derive a stable WI id from the work item file name (stem).
