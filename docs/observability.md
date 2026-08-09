@@ -28,6 +28,7 @@ events are still persisted.
 - planning iterations, planners, convergence, and Plan;
 - implementation round states, commits, trees, and summaries;
 - review verdicts/findings and failures;
+- delivery checkpoints, final head, remote/target, and pull-request URL;
 - retained screenshots and browser/execution artifacts by implementation round;
 - worktree path, branch, base, HEAD, and cleanliness;
 - transition and activity history.
@@ -35,7 +36,8 @@ events are still persisted.
 Default output uses snippets and the latest ten activity records. `--verbose` prints full
 stored text and all activity. `--json` returns a versioned snapshot document for tools
 and future UI clients.
-The current document version is `6`; version 6 exposes canonical UUID, short reference,
+The current document version is `7`; version 7 exposes requested and resolved base,
+delivery intent, checkpoint status, and PR handoff. Version 6 exposes canonical UUID, short reference,
 and non-unique label identity. Version 5 added the latest human Plan rejection feedback
 under `planning.feedback`.
 

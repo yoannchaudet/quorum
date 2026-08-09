@@ -13,7 +13,7 @@ quorum
 │   ├── unregister [PATH]
 │   └── list
 ├── work-item
-│   ├── start <WORK_ITEM.md> [--dry-run]
+│   ├── start <WORK_ITEM.md> [--base REVISION] [--target BRANCH] [--remote NAME] [--dry-run]
 │   ├── resume <WORK_ITEM> [--dry-run]
 │   ├── list [--state STATE]
 │   ├── show <WORK_ITEM> [--verbose] [--json]
@@ -27,7 +27,7 @@ quorum
 │   └── reject <WORK_ITEM> [FEEDBACK] [--file PATH] [--dry-run]
 └── implementation
     ├── show <WORK_ITEM> [--verbose] [--json]
-    ├── approve <WORK_ITEM> [--dry-run]
+    ├── approve <WORK_ITEM> [--remote NAME --target BRANCH] [--dry-run]
     └── reject <WORK_ITEM> [FEEDBACK] [--file PATH] [--dry-run]
 ```
 
@@ -47,18 +47,25 @@ activity time, most recent first. Repeat `--state` to filter the current reposit
 `work-item show` renders the complete status document. `--verbose` expands stored text;
 `--json` emits the versioned machine-readable status.
 
+`start --base` resolves a commit before the worktree exists; omitting it uses committed
+`HEAD`. The remote defaults to `origin`. The target is inferred only from an
+unambiguous branch; otherwise `--target` is required.
+
 ## Focused review commands
 
 `plan show` prints raw Plan Markdown by default for paging, copying, or diffing.
 `--metadata` includes convergence, feedback, and execution authorization; `--json`
 emits a focused version 2 Plan document.
 
-`implementation show` reports implementation rounds, reviews, artifacts, and workspace
-state. Its `--json` output is an independently versioned focused document.
+`implementation show` reports implementation rounds, reviews, artifacts, workspace state,
+and delivery handoff. Its `--json` output is an independently versioned focused version 3
+document.
 
 Plan and implementation approval/rejection commands require `PlanReview` and
 `WorkReview`, respectively. Wrong-state actions fail rather than dispatching based on
-the current state.
+the current state. `implementation approve --remote --target` only fills missing
+settings on migrated legacy work items. Successful delivery prints the PR URL; Quorum
+never merges or enables auto-merge.
 
 ## Global options
 

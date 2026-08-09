@@ -5,14 +5,18 @@
 //! after a crash.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::agent::{AgentError, AgentRequest, AgentRole, AgentRunner, Filesystem};
 use crate::capabilities::{CapabilityError, ExecutionCapabilities};
 use crate::config::Config;
 use crate::convergence;
+use crate::delivery::{DeliveryBackend, DeliveryError};
 use crate::observability::{ActivityEvent, ActivityKind, ActivityObserver, NoopActivityObserver};
-use crate::persistence::{ImplementationRoundStatus, Store, StoreError, Transition};
+use crate::persistence::{
+    DeliveryStatus, ImplementationRoundStatus, Store, StoreError, Transition,
+};
 use crate::prompt::{Prompt, PromptError};
 use crate::state::State;
 use crate::worktree::{ImplementationWorkspace, WorktreeError};
@@ -30,6 +34,8 @@ pub enum CoordinatorError {
     Worktree(#[from] WorktreeError),
     #[error(transparent)]
     Capability(#[from] CapabilityError),
+    #[error(transparent)]
+    Delivery(#[from] DeliveryError),
     #[error("illegal transition {from} -> {to}")]
     IllegalTransition { from: State, to: State },
     #[error("no work item has been loaded")]
@@ -85,6 +91,7 @@ pub struct Coordinator {
     runner: Box<dyn AgentRunner>,
     observer: Box<dyn ActivityObserver>,
     implementation_workspace: Box<dyn ImplementationWorkspace>,
+    delivery_backend: Option<Arc<dyn DeliveryBackend>>,
     /// Working directory used as the sandbox cwd for agent invocations.
     workspace: PathBuf,
     implementation_allowed_dirs: Vec<PathBuf>,
@@ -123,6 +130,7 @@ impl Coordinator {
             runner,
             observer: Box::new(NoopActivityObserver),
             implementation_workspace,
+            delivery_backend: None,
             workspace,
             implementation_allowed_dirs: Vec::new(),
             work_item_label: work_item_label.into(),
@@ -134,6 +142,13 @@ impl Coordinator {
 
     pub fn with_implementation_allowed_dirs(mut self, directories: Vec<PathBuf>) -> Coordinator {
         self.implementation_allowed_dirs = directories;
+        self
+    }
+
+    /// Install the Coordinator-owned delivery backend. The CLI supplies the
+    /// production Git/GitHub backend; tests may omit it to exercise agent flow.
+    pub fn with_delivery_backend(mut self, backend: Box<dyn DeliveryBackend>) -> Coordinator {
+        self.delivery_backend = Some(Arc::from(backend));
         self
     }
 
@@ -160,6 +175,11 @@ impl Coordinator {
     /// The intake questions surfaced to the human when the work item awaits answers.
     pub fn questions(&self) -> Result<Option<String>, CoordinatorError> {
         Ok(self.store.questions()?)
+    }
+
+    /// The persisted PR handoff URL, once delivery succeeds.
+    pub fn delivery_url(&self) -> Result<Option<String>, CoordinatorError> {
+        Ok(self.store.delivery()?.and_then(|record| record.pr_url))
     }
 
     /// The human-intervention session name for the current blocked state.
@@ -239,7 +259,7 @@ impl Coordinator {
                 None,
                 Some(("plan_feedback", feedback.as_deref().unwrap_or(""))),
             ),
-            (WorkReview, Approve) => (Done, None, None),
+            (WorkReview, Approve) => (Delivering, None, None),
             (WorkReview, Reject { feedback }) => (
                 Implementing,
                 None,
@@ -709,6 +729,132 @@ impl Coordinator {
         Ok(outcome)
     }
 
+    /// Persist each external delivery boundary so a crash can resume by
+    /// reconciling the deterministic branch and PR instead of duplicating them.
+    fn run_delivery(&mut self) -> Result<(), CoordinatorError> {
+        let Some(backend) = self.delivery_backend.clone() else {
+            return Err(DeliveryError::BackendNotConfigured.into());
+        };
+        let worktree = self
+            .store
+            .worktree()?
+            .ok_or(DeliveryError::MissingDeliverySettings)?;
+        if worktree.delivery_remote.is_none() || worktree.target_branch.is_none() {
+            return Err(DeliveryError::MissingDeliverySettings.into());
+        }
+        let final_head = self
+            .store
+            .latest_committed_implementation()?
+            .ok_or(CoordinatorError::NoImplementation)?;
+        let mut delivery = self.store.reserve_delivery(&final_head)?;
+        if delivery.final_head_commit != final_head {
+            return Err(DeliveryError::HeadChanged {
+                expected: delivery.final_head_commit,
+                actual: final_head,
+            }
+            .into());
+        }
+        if delivery.status == DeliveryStatus::Pending {
+            let workspace = self.workspace.clone();
+            self.retry_delivery(
+                &format!(
+                    "pushing {} to {}",
+                    worktree.branch,
+                    worktree.delivery_remote.as_deref().unwrap_or_default()
+                ),
+                || backend.push(&workspace, &worktree, &final_head),
+            )?;
+            self.store.mark_delivery_pushed()?;
+            delivery = self.store.delivery()?.expect("delivery was just reserved");
+        }
+        if delivery.status == DeliveryStatus::Pushed {
+            let workspace = self.workspace.clone();
+            let summary = self
+                .store
+                .latest_implementation()?
+                .map(|(_, summary)| summary)
+                .unwrap_or_default();
+            let reference = self.store.work_item_reference()?;
+            let title = format!("quorum: {}", self.work_item_label);
+            let body = format!(
+                "Quorum work item `{reference}`.\n\nBase: `{}`\nFinal head: `{final_head}`\n\n{}",
+                worktree.base_commit,
+                summary.trim()
+            );
+            let pr = self.retry_delivery("creating or adopting pull request", || {
+                backend.create_or_adopt_pull_request(&workspace, &worktree, &title, &body)
+            })?;
+            if pr.number == 0 || pr.url.trim().is_empty() {
+                return Err(DeliveryError::IncompleteHandoff.into());
+            }
+            self.store.mark_delivery_pull_request(pr.number, &pr.url)?;
+            self.record_activity(
+                ActivityEvent::new(
+                    ActivityKind::Delivery,
+                    format!("pull request handed off: {}", pr.url),
+                )
+                .phase(State::Delivering),
+            );
+        }
+        let handoff = self
+            .store
+            .delivery()?
+            .ok_or(DeliveryError::IncompleteHandoff)?;
+        if handoff.status != DeliveryStatus::PullRequestCreated
+            || handoff.pr_number.is_none()
+            || handoff.pr_url.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(DeliveryError::IncompleteHandoff.into());
+        }
+        Ok(())
+    }
+
+    fn retry_delivery<T, F>(
+        &mut self,
+        description: &str,
+        mut operation: F,
+    ) -> Result<T, CoordinatorError>
+    where
+        F: FnMut() -> Result<T, DeliveryError>,
+    {
+        let attempts = self.config.limits.step_retries.saturating_add(1);
+        for attempt in 1..=attempts {
+            self.record_activity(
+                ActivityEvent::new(
+                    ActivityKind::Delivery,
+                    format!("{description} (attempt {attempt})"),
+                )
+                .phase(State::Delivering)
+                .attempt(attempt),
+            );
+            match operation() {
+                Ok(value) => {
+                    self.record_activity(
+                        ActivityEvent::new(
+                            ActivityKind::Delivery,
+                            format!("{description} completed"),
+                        )
+                        .phase(State::Delivering)
+                        .attempt(attempt),
+                    );
+                    return Ok(value);
+                }
+                Err(error) if attempt < attempts && error.is_retryable() => {
+                    self.record_activity(
+                        ActivityEvent::new(
+                            ActivityKind::Delivery,
+                            format!("{description} failed; retrying: {error}"),
+                        )
+                        .phase(State::Delivering)
+                        .attempt(attempt),
+                    );
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        unreachable!("delivery attempts is always at least one")
+    }
+
     /// Invoke an agent, retrying transient failures up to `limits.step_retries`
     /// times. Returns the last error if every attempt fails. This is the
     /// transient boundary: agent runs (process spawn/exit) are what may fail
@@ -858,10 +1004,12 @@ impl Coordinator {
             }
             Reviewing => match self.run_reviewer()? {
                 ReviewOutcome::Accepted => {
-                    if self.config.reviews.work_review {
-                        (WorkReview, None)
+                    if self.config.reviews.work_review || self.delivery_settings_missing()? {
+                        let detail = (!self.config.reviews.work_review)
+                            .then_some("delivery settings missing; approval required".to_string());
+                        (WorkReview, detail)
                     } else {
-                        (Done, None)
+                        (Delivering, None)
                     }
                 }
                 ReviewOutcome::Rejected => (Implementing, None),
@@ -870,12 +1018,22 @@ impl Coordinator {
                     Some(format!("escalated to WorkReview: {cause}")),
                 ),
             },
+            Delivering => {
+                self.run_delivery()?;
+                (Done, Some("delivery handoff persisted".to_string()))
+            }
             // Not autonomous; the caller returns early for these.
             IntakeReview | PlanReview | WorkReview | Done | Failed | Abandoned => {
                 (self.state, None)
             }
         };
         Ok((next, detail))
+    }
+
+    fn delivery_settings_missing(&self) -> Result<bool, CoordinatorError> {
+        Ok(self.store.worktree()?.is_none_or(|worktree| {
+            worktree.delivery_remote.is_none() || worktree.target_branch.is_none()
+        }))
     }
 
     /// Move the work item to `Failed`, recording the cause.
@@ -947,8 +1105,10 @@ fn short_sha(value: &str) -> &str {
 mod tests {
     use super::*;
     use crate::agent::{AgentError, AgentRequest, EchoRunner};
+    use crate::delivery::{DeliveryBackend, DeliveryError, DryRunDelivery, PullRequest};
     use crate::observability::ActivityEvent;
     use crate::persistence::Database;
+    use crate::repository::{RepositoryRoot, WorktreeStart};
     use crate::worktree::{ImplementationWorkspace, RoundGitResult};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1016,10 +1176,173 @@ mod tests {
         Box::new(FakeImplementationWorkspace::new(false))
     }
 
+    fn delivery_store(workspace: &std::path::Path) -> Store {
+        let mut db = Database::open_in_memory().unwrap();
+        let repository = db
+            .register_repository(&RepositoryRoot::from_canonical("/test/repository"))
+            .unwrap();
+        let id = db
+            .create_work_item(
+                &repository.id,
+                "test-work-item",
+                "# Work Item\ndo the thing",
+            )
+            .unwrap();
+        db.reserve_worktree_with_delivery(
+            &id,
+            &WorktreeStart {
+                requested_base: "HEAD".to_string(),
+                base_commit: "base-commit".to_string(),
+                delivery_remote: "origin".to_string(),
+                target_branch: "main".to_string(),
+            },
+            "quorum/test-work-item",
+            workspace,
+        )
+        .unwrap();
+        db.into_store(id).unwrap()
+    }
+
+    fn delivering_coordinator(
+        backend: Option<Box<dyn DeliveryBackend>>,
+    ) -> (Coordinator, tempfile::TempDir) {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut store = delivery_store(workspace.path());
+        store
+            .reserve_implementation_round(0, "base-commit")
+            .unwrap();
+        store
+            .mark_implementation_agent_complete(0, "implemented")
+            .unwrap();
+        store
+            .complete_implementation_round(0, "final-commit", "final-tree")
+            .unwrap();
+        store
+            .record_transition(Some(State::Reviewing), State::Delivering, "accepted")
+            .unwrap();
+        let coordinator = Coordinator::new(
+            Config::default(),
+            store,
+            Box::new(EchoRunner),
+            fake_workspace(),
+            workspace.path().to_path_buf(),
+            "test-work-item",
+        )
+        .unwrap();
+        let coordinator = match backend {
+            Some(backend) => coordinator.with_delivery_backend(backend),
+            None => coordinator,
+        };
+        (coordinator, workspace)
+    }
+
+    #[test]
+    fn delivering_without_backend_cannot_reach_done() {
+        let (mut coordinator, _workspace) = delivering_coordinator(None);
+        assert_eq!(coordinator.step().unwrap(), State::Failed);
+        assert_eq!(coordinator.state(), State::Failed);
+        assert!(coordinator.store.delivery().unwrap().is_none());
+    }
+
+    #[test]
+    fn dry_run_delivery_persists_handoff_before_done() {
+        let (mut coordinator, _workspace) = delivering_coordinator(Some(Box::new(DryRunDelivery)));
+        assert_eq!(coordinator.run_until_blocked().unwrap(), State::Done);
+        let delivery = coordinator.store.delivery().unwrap().unwrap();
+        assert_eq!(delivery.status, DeliveryStatus::PullRequestCreated);
+        assert_eq!(delivery.pr_number, Some(1));
+        assert!(delivery.pr_url.is_some());
+    }
+
+    struct IncompleteDelivery;
+
+    impl DeliveryBackend for IncompleteDelivery {
+        fn push(
+            &self,
+            _workspace: &std::path::Path,
+            _worktree: &crate::persistence::WorktreeRecord,
+            _final_head: &str,
+        ) -> Result<(), DeliveryError> {
+            Ok(())
+        }
+
+        fn create_or_adopt_pull_request(
+            &self,
+            _workspace: &std::path::Path,
+            _worktree: &crate::persistence::WorktreeRecord,
+            _title: &str,
+            _body: &str,
+        ) -> Result<PullRequest, DeliveryError> {
+            Ok(PullRequest {
+                number: 0,
+                url: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn delivering_requires_a_persisted_pr_number_and_url() {
+        let (mut coordinator, _workspace) =
+            delivering_coordinator(Some(Box::new(IncompleteDelivery)));
+        assert_eq!(coordinator.step().unwrap(), State::Failed);
+        assert_ne!(coordinator.state(), State::Done);
+    }
+
+    struct RetryDelivery {
+        pushes: Arc<AtomicUsize>,
+    }
+
+    impl DeliveryBackend for RetryDelivery {
+        fn push(
+            &self,
+            _workspace: &std::path::Path,
+            _worktree: &crate::persistence::WorktreeRecord,
+            _final_head: &str,
+        ) -> Result<(), DeliveryError> {
+            if self.pushes.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(DeliveryError::Spawn {
+                    program: "git".to_string(),
+                    source: std::io::Error::other("temporary"),
+                });
+            }
+            Ok(())
+        }
+
+        fn create_or_adopt_pull_request(
+            &self,
+            _workspace: &std::path::Path,
+            _worktree: &crate::persistence::WorktreeRecord,
+            _title: &str,
+            _body: &str,
+        ) -> Result<PullRequest, DeliveryError> {
+            Ok(PullRequest {
+                number: 7,
+                url: "https://github.test/owner/repo/pull/7".to_string(),
+            })
+        }
+    }
+
+    #[test]
+    fn delivery_retries_and_resumes_from_pushed_checkpoint() {
+        let pushes = Arc::new(AtomicUsize::new(0));
+        let backend = RetryDelivery {
+            pushes: pushes.clone(),
+        };
+        let (mut coordinator, _workspace) = delivering_coordinator(Some(Box::new(backend)));
+        coordinator.config.limits.step_retries = 1;
+        assert_eq!(coordinator.run_until_blocked().unwrap(), State::Done);
+        assert_eq!(pushes.load(Ordering::SeqCst), 2);
+        assert!(coordinator
+            .store
+            .activities()
+            .unwrap()
+            .iter()
+            .any(|event| event.message.contains("retrying")));
+    }
+
     fn coordinator_with_work_item(config: Config) -> (Coordinator, tempfile::TempDir) {
         let workspace = tempfile::tempdir().unwrap();
-        let mut store = Store::open_in_memory().unwrap();
-        store.set_work_item("# Work Item\ndo the thing").unwrap();
+        let store = delivery_store(workspace.path());
         let co = Coordinator::new(
             config,
             store,
@@ -1028,7 +1351,8 @@ mod tests {
             workspace.path().into(),
             "test-work-item",
         )
-        .unwrap();
+        .unwrap()
+        .with_delivery_backend(Box::new(DryRunDelivery));
         (co, workspace)
     }
 
@@ -1284,8 +1608,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         // Leak the tempdir so the workspace path stays valid for the test.
         let path = workspace.keep();
-        let mut store = Store::open_in_memory().unwrap();
-        store.set_work_item("# Work Item").unwrap();
+        let store = delivery_store(&path);
         Coordinator::new(
             config,
             store,
@@ -1295,6 +1618,7 @@ mod tests {
             "test-work-item",
         )
         .unwrap()
+        .with_delivery_backend(Box::new(DryRunDelivery))
     }
 
     /// A runner that errors for the first `fail_times` calls, then delegates to
@@ -1480,6 +1804,34 @@ mod tests {
     }
 
     #[test]
+    fn legacy_missing_delivery_settings_force_work_review_when_gate_is_disabled() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut store = Store::open_in_memory().unwrap();
+        store.set_work_item("# Legacy").unwrap();
+        let mut config = Config::default();
+        config.reviews.plan_review = false;
+        config.reviews.work_review = false;
+        let mut coordinator = Coordinator::new(
+            config,
+            store,
+            Box::new(ReviewRunner::new(0)),
+            fake_workspace(),
+            workspace.path().to_path_buf(),
+            "legacy",
+        )
+        .unwrap();
+
+        assert_eq!(coordinator.run_until_blocked().unwrap(), State::WorkReview);
+        assert!(coordinator
+            .history()
+            .unwrap()
+            .last()
+            .unwrap()
+            .reason
+            .contains("delivery settings missing"));
+    }
+
+    #[test]
     fn reviewer_reject_then_accept_loops_then_completes() {
         let mut config = Config::default();
         config.reviews.plan_review = false;
@@ -1610,6 +1962,7 @@ mod tests {
                 State::Converging,
                 State::Implementing,
                 State::Reviewing,
+                State::Delivering,
                 State::Done,
             ]
         );
@@ -1794,7 +2147,8 @@ mod tests {
         assert_eq!(co.resolve(Decision::Approve).unwrap(), State::Implementing);
         // Work gate.
         assert_eq!(co.run_until_blocked().unwrap(), State::WorkReview);
-        assert_eq!(co.resolve(Decision::Approve).unwrap(), State::Done);
+        assert_eq!(co.resolve(Decision::Approve).unwrap(), State::Delivering);
+        assert_eq!(co.run_until_blocked().unwrap(), State::Done);
         assert!(co.state().is_terminal());
     }
 

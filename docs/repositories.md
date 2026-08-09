@@ -31,7 +31,7 @@ remain blocked until that repository is registered again.
 
 ## Work-item worktrees
 
-The first run pins the repository's committed `HEAD` and creates a linked worktree at
+The first run resolves and pins the requested base (default committed `HEAD`) and creates a linked worktree at
 `~/.quorum/state/<work-item-id>/implementation/`. Quorum uses a deterministic branch:
 
 ```
@@ -40,6 +40,10 @@ quorum/<sanitized-work-item-label>-<short-work-item-id>
 
 The original checkout and any uncommitted changes in it remain untouched. Worktrees and
 branches are retained when a work item reaches `Done`, `Failed`, or `Abandoned`.
+
+Accepted work is delivered by the Coordinator, never by an agent: it pushes this branch
+to the persisted remote and creates or adopts a GitHub pull request against the persisted
+target branch. Quorum never merges, enables auto-merge, deletes the branch, or closes the PR.
 
 ## Work-item identity
 

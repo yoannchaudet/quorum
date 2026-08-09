@@ -11,9 +11,11 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use quorum_core::{
     agent::{AgentRunner, EchoRunner},
-    ensure_worktree, git_common_dir, worktree_record, ActivityEvent, ActivityObserver, Config,
-    Coordinator, CopilotRunner, Database, Decision, GitImplementationWorkspace, Kind,
-    RegisteredRepository, RepositoryRoot, State, StatusSnapshot, Store, WorkItemId,
+    create_work_item_with_worktree, ensure_worktree, git_common_dir, resolve_worktree_start,
+    validate_delivery_target, worktree_record, ActivityEvent, ActivityObserver, Config,
+    Coordinator, CopilotRunner, Database, Decision, DryRunDelivery, GitHubDelivery,
+    GitImplementationWorkspace, Kind, RegisteredRepository, RepositoryRoot, State, StatusSnapshot,
+    Store, WorkItemId,
 };
 
 #[derive(Parser)]
@@ -33,6 +35,17 @@ struct Cli {
 
     #[command(subcommand)]
     command: Command,
+}
+
+struct StartOptions<'a> {
+    base: Option<&'a str>,
+    target: Option<&'a str>,
+    remote: Option<&'a str>,
+}
+
+struct Continuation<'a> {
+    expected_state: Option<State>,
+    delivery: Option<(&'a str, &'a str)>,
 }
 
 #[derive(Subcommand)]
@@ -86,6 +99,15 @@ enum WorkItemCommand {
     Start {
         /// Path to the work item markdown file.
         work_item: PathBuf,
+        /// Base revision to resolve to an immutable commit (default: committed HEAD).
+        #[arg(long)]
+        base: Option<String>,
+        /// Branch for the pull request base; inferred only when unambiguous.
+        #[arg(long)]
+        target: Option<String>,
+        /// Remote to push the Quorum branch to (default: origin).
+        #[arg(long)]
+        remote: Option<String>,
         /// Use stub agents instead of invoking copilot (offline; no model calls).
         #[arg(long)]
         dry_run: bool,
@@ -199,6 +221,12 @@ enum ImplementationCommand {
     Approve {
         /// The work-item UUID or unique UUID prefix.
         work_item: String,
+        /// Fill a missing remote on a migrated legacy work item.
+        #[arg(long, requires = "target")]
+        remote: Option<String>,
+        /// Fill a missing target branch on a migrated legacy work item.
+        #[arg(long, requires = "remote")]
+        target: Option<String>,
         #[arg(long)]
         dry_run: bool,
     },
@@ -241,8 +269,25 @@ fn run() -> Result<()> {
             run_repository_command(&config, context.as_deref(), command)?;
         }
         Command::WorkItem { command } => match command {
-            WorkItemCommand::Start { work_item, dry_run } => {
-                start_work_item(config, context.as_deref(), work_item, dry_run, quiet)?;
+            WorkItemCommand::Start {
+                work_item,
+                base,
+                target,
+                remote,
+                dry_run,
+            } => {
+                start_work_item(
+                    config,
+                    context.as_deref(),
+                    work_item,
+                    StartOptions {
+                        base: base.as_deref(),
+                        target: target.as_deref(),
+                        remote: remote.as_deref(),
+                    },
+                    dry_run,
+                    quiet,
+                )?;
             }
             WorkItemCommand::Resume { work_item, dry_run } => {
                 resume_work_item(config, context.as_deref(), &work_item, dry_run, quiet)?;
@@ -260,7 +305,10 @@ fn run() -> Result<()> {
                 context.as_deref(),
                 &work_item,
                 Decision::Abandon,
-                None,
+                Continuation {
+                    expected_state: None,
+                    delivery: None,
+                },
                 true,
                 quiet,
             )?,
@@ -281,7 +329,10 @@ fn run() -> Result<()> {
                     context.as_deref(),
                     &work_item,
                     Decision::Answer(answer),
-                    Some(State::IntakeReview),
+                    Continuation {
+                        expected_state: Some(State::IntakeReview),
+                        delivery: None,
+                    },
                     dry_run,
                     quiet,
                 )?;
@@ -298,7 +349,10 @@ fn run() -> Result<()> {
                 context.as_deref(),
                 &work_item,
                 Decision::Approve,
-                Some(State::PlanReview),
+                Continuation {
+                    expected_state: Some(State::PlanReview),
+                    delivery: None,
+                },
                 dry_run,
                 quiet,
             )?,
@@ -314,7 +368,10 @@ fn run() -> Result<()> {
                 Decision::Reject {
                     feedback: optional_text(feedback, file, "feedback")?,
                 },
-                Some(State::PlanReview),
+                Continuation {
+                    expected_state: Some(State::PlanReview),
+                    delivery: None,
+                },
                 dry_run,
                 quiet,
             )?,
@@ -325,12 +382,20 @@ fn run() -> Result<()> {
                 verbose,
                 json,
             } => show_implementation(&config, context.as_deref(), &work_item, verbose, json)?,
-            ImplementationCommand::Approve { work_item, dry_run } => resolve_and_continue(
+            ImplementationCommand::Approve {
+                work_item,
+                remote,
+                target,
+                dry_run,
+            } => resolve_and_continue(
                 config,
                 context.as_deref(),
                 &work_item,
                 Decision::Approve,
-                Some(State::WorkReview),
+                Continuation {
+                    expected_state: Some(State::WorkReview),
+                    delivery: remote.as_deref().zip(target.as_deref()),
+                },
                 dry_run,
                 quiet,
             )?,
@@ -346,7 +411,10 @@ fn run() -> Result<()> {
                 Decision::Reject {
                     feedback: optional_text(feedback, file, "feedback")?,
                 },
-                Some(State::WorkReview),
+                Continuation {
+                    expected_state: Some(State::WorkReview),
+                    delivery: None,
+                },
                 dry_run,
                 quiet,
             )?,
@@ -360,6 +428,7 @@ fn start_work_item(
     config: Config,
     context: Option<&std::path::Path>,
     work_item: PathBuf,
+    options: StartOptions<'_>,
     dry_run: bool,
     quiet: bool,
 ) -> Result<()> {
@@ -368,24 +437,26 @@ fn start_work_item(
     let text = std::fs::read_to_string(&work_item)
         .with_context(|| format!("reading work item {}", work_item.display()))?;
     let (mut database, repository) = open_registered_context(&config, context)?;
-    let internal_id = database
-        .create_work_item(&repository.id, &work_item_label, &text)
-        .context("creating work item state")?;
+    let start = resolve_worktree_start(
+        &repository.root,
+        options.base,
+        options.remote,
+        options.target,
+    )
+    .context("resolving immutable base and delivery target")?;
+    let (internal_id, worktree) = create_work_item_with_worktree(
+        &mut database,
+        &repository,
+        &work_item_label,
+        &text,
+        &config.state_dir(),
+        &start,
+    )
+    .context("creating work item and preparing checkout")?;
     let work_item_reference = database
         .work_item_reference(&internal_id)
         .context("creating work-item reference")?;
     println!("created work item {work_item_reference} ({work_item_label})");
-    let workspace = config
-        .work_item_dir(internal_id.as_str())
-        .join("implementation");
-    let worktree = ensure_worktree(
-        &mut database,
-        &repository,
-        &internal_id,
-        &work_item_label,
-        &workspace,
-    )
-    .context("preparing work item checkout")?;
     let store = database
         .into_store(internal_id)
         .context("opening work item state")?;
@@ -423,7 +494,7 @@ fn advance_work_item(
 ) -> Result<()> {
     let common_git_dir = git_common_dir(&workspace).context("resolving worktree Git directory")?;
     let runner = runner(&config, store.work_item_id(), dry_run);
-    let mut coordinator = Coordinator::new(
+    let coordinator = Coordinator::new(
         config.clone(),
         store,
         runner,
@@ -432,7 +503,12 @@ fn advance_work_item(
         work_item_label,
     )
     .context("initializing coordinator")?
-    .with_implementation_allowed_dirs(vec![common_git_dir])
+    .with_implementation_allowed_dirs(vec![common_git_dir]);
+    let mut coordinator = if dry_run {
+        coordinator.with_delivery_backend(Box::new(DryRunDelivery))
+    } else {
+        coordinator.with_delivery_backend(Box::new(GitHubDelivery))
+    }
     .with_observer(progress_observer(quiet));
     coordinator
         .run_until_blocked()
@@ -597,8 +673,22 @@ fn show_implementation(
         println!("  {}", artifact.path);
     }
     println!("\nworkspace: {}", snapshot.workspace.path);
+    if let Some(base) = &snapshot.workspace.base_commit {
+        println!("  resolved base: {}", short_sha(base));
+    }
+    if let Some(remote) = &snapshot.workspace.delivery_remote {
+        println!(
+            "  delivery: {remote}/{}",
+            snapshot.workspace.target_branch.as_deref().unwrap_or("?")
+        );
+    }
     if let Some(head) = &snapshot.workspace.head {
         println!("  HEAD: {}", short_sha(head));
+    }
+    if let Some(url) = &snapshot.delivery.pr_url {
+        println!("pull request: {url}");
+    } else if let Some(status) = &snapshot.delivery.status {
+        println!("delivery status: {status}");
     }
     Ok(())
 }
@@ -647,16 +737,23 @@ fn resolve_and_continue(
     context: Option<&std::path::Path>,
     work_item_reference: &str,
     decision: Decision,
-    expected_state: Option<State>,
+    continuation: Continuation<'_>,
     dry_run: bool,
     quiet: bool,
 ) -> Result<()> {
     let require_worktree = !matches!(decision, Decision::Abandon);
-    let (store, internal_id, workspace, label, reference) =
+    let (mut store, internal_id, workspace, label, reference) =
         open_work_item(&config, context, work_item_reference, require_worktree)?;
-    if let Some(expected) = expected_state {
+    if let Some(expected) = continuation.expected_state {
         let actual = store.current_state()?.unwrap_or(State::Intake);
         require_state(actual, expected)?;
+    }
+    if let Some((remote, target)) = continuation.delivery {
+        validate_delivery_target(&workspace, remote, target)
+            .context("validating legacy delivery target")?;
+        store
+            .fill_missing_delivery_settings(remote, target)
+            .context("filling legacy delivery settings")?;
     }
     let runner = runner(&config, &internal_id, dry_run);
     let additional_dirs = if require_worktree {
@@ -664,7 +761,7 @@ fn resolve_and_continue(
     } else {
         vec![]
     };
-    let mut co = Coordinator::new(
+    let co = Coordinator::new(
         config,
         store,
         runner,
@@ -673,7 +770,12 @@ fn resolve_and_continue(
         &label,
     )
     .context("initializing coordinator")?
-    .with_implementation_allowed_dirs(additional_dirs)
+    .with_implementation_allowed_dirs(additional_dirs);
+    let mut co = if dry_run {
+        co.with_delivery_backend(Box::new(DryRunDelivery))
+    } else {
+        co.with_delivery_backend(Box::new(GitHubDelivery))
+    }
     .with_observer(progress_observer(quiet));
     co.resolve(decision)
         .context("resolving human intervention")?;
@@ -967,7 +1069,16 @@ fn report_status(snapshot: &StatusSnapshot, verbose: bool) {
         println!("  branch: {branch}");
     }
     if let Some(base) = &snapshot.workspace.base_commit {
-        println!("  base: {}", short_sha(base));
+        println!("  resolved base: {}", short_sha(base));
+    }
+    if let Some(requested) = &snapshot.workspace.requested_base {
+        println!("  requested base: {requested}");
+    }
+    if let Some(remote) = &snapshot.workspace.delivery_remote {
+        println!("  delivery remote: {remote}");
+    }
+    if let Some(target) = &snapshot.workspace.target_branch {
+        println!("  target branch: {target}");
     }
     if let Some(head) = &snapshot.workspace.head {
         println!("  HEAD: {}", short_sha(head));
@@ -982,6 +1093,18 @@ fn report_status(snapshot: &StatusSnapshot, verbose: bool) {
     );
     if let Some(clean) = snapshot.workspace.clean {
         println!("  working tree: {}", if clean { "clean" } else { "dirty" });
+    }
+
+    println!("\ndelivery:");
+    println!(
+        "  status: {}",
+        snapshot.delivery.status.as_deref().unwrap_or("not started")
+    );
+    if let Some(commit) = &snapshot.delivery.final_head_commit {
+        println!("  final head: {}", short_sha(commit));
+    }
+    if let Some(url) = &snapshot.delivery.pr_url {
+        println!("  pull request: {url}");
     }
 
     if !snapshot.errors.is_empty() {
@@ -1106,6 +1229,9 @@ fn report(work_item_reference: &str, co: &Coordinator) -> Result<()> {
         println!("state: {state} (failed — inspect the work item event history)");
     } else if state.is_terminal() {
         println!("state: {state} (done)");
+        if let Some(url) = co.delivery_url().context("reading delivery handoff")? {
+            println!("pull request: {url}");
+        }
     } else {
         println!("state: {state} (progressing)");
     }
@@ -1180,6 +1306,7 @@ fn parse_state(value: &str) -> std::result::Result<State, String> {
         "implementing" => Ok(State::Implementing),
         "reviewing" => Ok(State::Reviewing),
         "workreview" | "work-review" | "work_review" => Ok(State::WorkReview),
+        "delivering" => Ok(State::Delivering),
         "done" => Ok(State::Done),
         "failed" => Ok(State::Failed),
         "abandoned" => Ok(State::Abandoned),

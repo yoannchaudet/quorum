@@ -32,6 +32,34 @@ fn init_repo(path: &Path) {
             .unwrap();
         assert!(output.status.success(), "git setup failed: {output:?}");
     }
+    let origin = path.with_extension("origin.git");
+    init_bare_repo(&origin);
+    for args in [
+        vec![
+            "remote".to_string(),
+            "add".to_string(),
+            "origin".to_string(),
+            origin.display().to_string(),
+        ],
+        vec![
+            "push".to_string(),
+            "--quiet".to_string(),
+            "-u".to_string(),
+            "origin".to_string(),
+            "HEAD".to_string(),
+        ],
+    ] {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git remote setup failed: {output:?}"
+        );
+    }
 }
 
 fn init_bare_repo(path: &Path) {
@@ -86,6 +114,72 @@ fn git_stdout(repo: &Path, args: &[&str]) -> String {
         .unwrap();
     assert!(output.status.success(), "git command failed: {output:?}");
     String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+#[test]
+fn start_rejects_a_target_missing_from_selected_remote_before_worktree_creation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let repo = home.join("repo");
+    init_repo(&repo);
+    assert!(register(home, &repo).status.success());
+    let work_item = repo.join("remote-target.md");
+    std::fs::write(&work_item, "# Remote target\n").unwrap();
+
+    let output = quorum(
+        home,
+        &repo,
+        &[
+            "work-item",
+            "start",
+            "--dry-run",
+            "--target",
+            "missing-on-origin",
+            work_item.to_str().unwrap(),
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("does not exist at remote"));
+    assert!(!home.join(".quorum/state").exists());
+}
+
+#[test]
+fn target_validation_uses_remote_pushurl_not_fetch_url() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let repo = home.join("repo");
+    init_repo(&repo);
+    let empty_push_destination = home.join("empty-push.git");
+    init_bare_repo(&empty_push_destination);
+    let set_pushurl = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args([
+            "remote",
+            "set-url",
+            "--push",
+            "origin",
+            empty_push_destination.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(set_pushurl.status.success());
+    assert!(register(home, &repo).status.success());
+    let work_item = repo.join("pushurl.md");
+    std::fs::write(&work_item, "# Push URL\n").unwrap();
+
+    let output = quorum(
+        home,
+        &repo,
+        &[
+            "work-item",
+            "start",
+            "--dry-run",
+            work_item.to_str().unwrap(),
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("does not exist at remote"));
 }
 
 #[test]
@@ -187,7 +281,7 @@ fn run_advances_to_plan_review_and_status_reads_it_back() {
     let out = quorum(home, &repo, &["work-item", "show", &reference, "--json"]);
     assert!(out.status.success(), "JSON status failed: {out:?}");
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(value["version"], 6);
+    assert_eq!(value["version"], 7);
     assert_eq!(value["identity"]["reference"], reference);
     assert_eq!(value["identity"]["label"], "my-work-item");
     assert_eq!(value["state"]["current"], "plan_review");
@@ -256,7 +350,7 @@ fn reject_feedback_is_preserved_for_replanning() {
     let status = quorum(home, &repo, &["work-item", "show", &reference, "--json"]);
     assert!(status.status.success(), "status failed: {status:?}");
     let value: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
-    assert_eq!(value["version"], 6);
+    assert_eq!(value["version"], 7);
     assert_eq!(
         value["planning"]["feedback"],
         "Add an explicit rollback step."
@@ -322,7 +416,7 @@ fn canonical_commands_list_and_focus_work_items() {
         &["implementation", "show", &references[1], "--json"],
     );
     let value: serde_json::Value = serde_json::from_slice(&implementation_json.stdout).unwrap();
-    assert_eq!(value["version"], 2);
+    assert_eq!(value["version"], 3);
     assert_eq!(value["state"]["current"], "work_review");
 
     let wrong_state = quorum(

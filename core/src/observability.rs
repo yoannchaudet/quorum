@@ -17,6 +17,7 @@ pub enum ActivityKind {
     Convergence,
     ImplementationRound,
     Review,
+    Delivery,
     Artifact,
     Transition,
     HumanIntervention,
@@ -162,10 +163,21 @@ pub struct ArtifactSnapshot {
 pub struct WorkspaceSnapshot {
     pub path: String,
     pub branch: Option<String>,
+    pub requested_base: Option<String>,
     pub base_commit: Option<String>,
+    pub delivery_remote: Option<String>,
+    pub target_branch: Option<String>,
     pub ready: bool,
     pub head: Option<String>,
     pub clean: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliverySnapshot {
+    pub status: Option<String>,
+    pub final_head_commit: Option<String>,
+    pub pr_number: Option<u64>,
+    pub pr_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,6 +195,7 @@ pub struct StatusSnapshot {
     pub errors: Vec<ActivityEvent>,
     pub activities: Vec<ActivityEvent>,
     pub workspace: WorkspaceSnapshot,
+    pub delivery: DeliverySnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,6 +220,7 @@ pub struct ImplementationDocument {
     pub reviews: Vec<ReviewSnapshot>,
     pub artifacts: Vec<ArtifactSnapshot>,
     pub workspace: WorkspaceSnapshot,
+    pub delivery: DeliverySnapshot,
 }
 
 impl StatusSnapshot {
@@ -236,13 +250,14 @@ impl StatusSnapshot {
 
     pub fn implementation_document(&self) -> ImplementationDocument {
         ImplementationDocument {
-            version: 2,
+            version: 3,
             work_item: self.identity.clone(),
             state: self.state.clone(),
             implementations: self.implementations.clone(),
             reviews: self.reviews.clone(),
             artifacts: self.artifacts.clone(),
             workspace: self.workspace.clone(),
+            delivery: self.delivery.clone(),
         }
     }
 }

@@ -1,8 +1,10 @@
 //! Git worktree lifecycle for work-item implementation checkouts.
 
 use crate::persistence::{
-    Database, ImplementationRound, RegisteredRepository, StoreError, WorkItemId, WorktreeRecord,
+    Database, ImplementationRound, NewWorkItemWorktreeIntent, RegisteredRepository, StoreError,
+    WorkItemId, WorktreeRecord,
 };
+use crate::repository::WorktreeStart;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -17,6 +19,66 @@ pub fn ensure_worktree(
     work_item_id: &WorkItemId,
     slug: &str,
     preferred_path: &Path,
+) -> Result<WorktreeRecord, WorktreeError> {
+    ensure_worktree_with_start(
+        database,
+        repository,
+        work_item_id,
+        slug,
+        preferred_path,
+        None,
+    )
+}
+
+/// Atomically persist a new work item and its immutable worktree intent, then
+/// create or recover the linked checkout. Git failures leave the `creating`
+/// reservation intact for an exact, deterministic resume.
+pub fn create_work_item_with_worktree(
+    database: &mut Database,
+    repository: &RegisteredRepository,
+    slug: &str,
+    text: &str,
+    state_root: &Path,
+    start: &WorktreeStart,
+) -> Result<(WorkItemId, WorktreeRecord), WorktreeError> {
+    let work_item_id = WorkItemId::new();
+    let preferred_path = normalize_target(
+        &state_root
+            .join(work_item_id.as_str())
+            .join("implementation"),
+    )?;
+    let branch = branch_name(slug, &work_item_id);
+    if branch_exists(&repository.root, &branch)? {
+        return Err(WorktreeError::BranchCollision(branch));
+    }
+    if preferred_path.exists() {
+        return Err(WorktreeError::PathOccupied(preferred_path));
+    }
+    let mut record = database.create_work_item_with_worktree_intent(
+        &repository.id,
+        NewWorkItemWorktreeIntent {
+            id: work_item_id.clone(),
+            slug,
+            text,
+            start,
+            branch: &branch,
+            path: &preferred_path,
+        },
+    )?;
+    reconcile(database, repository, &record)?;
+    record.ready = true;
+    Ok((work_item_id, record))
+}
+
+/// As [`ensure_worktree`], using pre-resolved immutable source and delivery intent
+/// when first reserving the worktree.
+pub fn ensure_worktree_with_start(
+    database: &mut Database,
+    repository: &RegisteredRepository,
+    work_item_id: &WorkItemId,
+    slug: &str,
+    preferred_path: &Path,
+    start: Option<&WorktreeStart>,
 ) -> Result<WorktreeRecord, WorktreeError> {
     let preferred_path = normalize_target(preferred_path)?;
     let mut record = match database.worktree(work_item_id)? {
@@ -39,9 +101,24 @@ pub fn ensure_worktree(
             if preferred_path.exists() {
                 return Err(WorktreeError::PathOccupied(preferred_path));
             }
-            let base_commit = committed_head(&repository.root)?;
+            let base_commit = start
+                .map(|value| value.base_commit.clone())
+                .unwrap_or(committed_head(&repository.root)?);
             let branch = branch_name(slug, work_item_id);
-            database.reserve_worktree(work_item_id, &base_commit, &branch, &preferred_path)?
+            match start {
+                Some(start) => database.reserve_worktree_with_delivery(
+                    work_item_id,
+                    start,
+                    &branch,
+                    &preferred_path,
+                )?,
+                None => database.reserve_worktree(
+                    work_item_id,
+                    &base_commit,
+                    &branch,
+                    &preferred_path,
+                )?,
+            }
         }
     };
 
@@ -748,5 +825,61 @@ mod tests {
             git_common_dir(repository.path()).unwrap(),
             std::fs::canonicalize(repository.path().join(".git")).unwrap()
         );
+    }
+
+    #[test]
+    fn atomic_reservation_preserves_explicit_base_across_recovery() {
+        let repository = repository();
+        let base = worktree_head(repository.path()).unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut database = Database::open_in_memory().unwrap();
+        let root = crate::repository::RepositoryRoot::discover(repository.path()).unwrap();
+        let registered = database.register_repository(&root).unwrap();
+        let id = WorkItemId::new();
+        let start = WorktreeStart {
+            requested_base: "HEAD~0".to_string(),
+            base_commit: base.clone(),
+            delivery_remote: "origin".to_string(),
+            target_branch: "main".to_string(),
+        };
+        let path =
+            normalize_target(&state.path().join(id.as_str()).join("implementation")).unwrap();
+        let branch = branch_name("atomic", &id);
+        database
+            .create_work_item_with_worktree_intent(
+                &registered.id,
+                NewWorkItemWorktreeIntent {
+                    id: id.clone(),
+                    slug: "atomic",
+                    text: "# Atomic",
+                    start: &start,
+                    branch: &branch,
+                    path: &path,
+                },
+            )
+            .unwrap();
+
+        std::fs::write(repository.path().join("tracked.txt"), "new main head\n").unwrap();
+        git(repository.path(), &["add", "tracked.txt"]);
+        git(
+            repository.path(),
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "move main head",
+            ],
+        );
+
+        let recovered = ensure_worktree(&mut database, &registered, &id, "atomic", &path).unwrap();
+        assert_eq!(recovered.base_commit, base);
+        assert_eq!(recovered.requested_base.as_deref(), Some("HEAD~0"));
+        assert_eq!(recovered.delivery_remote.as_deref(), Some("origin"));
+        assert_eq!(recovered.target_branch.as_deref(), Some("main"));
+        assert_eq!(worktree_head(&recovered.path).unwrap(), base);
     }
 }

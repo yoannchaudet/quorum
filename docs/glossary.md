@@ -18,6 +18,10 @@ Every Quorum-specific term is written in full throughout the project.
 | Local Sandbox | Copilot's OS-level sandbox (`--sandbox`) that confines an agent's filesystem, network, and tool access. It is Quorum's execution-isolation boundary. |
 | Idea isolation | Keeping each Planner from seeing other Planners' output so candidate plans stay independent. |
 | Execution isolation | Confining an agent's filesystem, network, and tool access through the Local Sandbox so unattended runs remain safe. |
+| Requested base | The revision selected at start, retained separately from its immutable resolved commit. |
+| Resolved base commit | The commit SHA used to create the deterministic Quorum branch. |
+| Delivery remote / target branch | The persisted Git remote and pull-request base branch used for handoff. |
+| Delivered PR | The persisted GitHub pull request created or adopted by the Coordinator; it is not merged by Quorum. |
 
 ## Roles at a glance
 
