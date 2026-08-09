@@ -16,15 +16,15 @@ Coordinator is scoped to a stable internal work-item ID.
       artifacts/                # retained screenshots and browser diagnostics
 ```
 
-The internal ID is a UUID, independent of the user-facing work-item slug. Repository ownership
-is associated in the database; it does not determine the filesystem path.
+The work-item UUID is both the canonical identity and the key for filesystem state.
+Repository ownership scopes user-facing UUID-prefix lookup.
 
 ## Schema
 
 | Table | Holds |
 |-------|-------|
 | `repositories` | Stable ID, canonical root, and active registration status. |
-| `work_items` | Stable ID, repository, slug, normalized markdown, and source metadata. |
+| `work_items` | Stable UUID, repository, non-unique label, normalized markdown, and source metadata. |
 | `states` | Current state per work item. |
 | `transitions` | Append-only transition history per work item. |
 | `candidates` | Planner candidate plans by work item, Planner, and iteration. |
@@ -40,8 +40,8 @@ is associated in the database; it does not determine the filesystem path.
 | `worktrees` | Pinned base commit, branch, path, and setup status per work item. |
 
 Every work-item-owned row has a foreign key to `work_items` with cascading deletion.
-Work-item slugs are unique per repository. Composite keys include the work-item ID,
-preventing Planners, iterations, sessions, or reviews from colliding across work items.
+Labels may repeat. Composite keys include the work-item UUID, preventing Planners,
+iterations, sessions, or reviews from colliding across work items.
 
 ## Connection policy
 
@@ -77,7 +77,7 @@ preventing Planners, iterations, sessions, or reviews from colliding across work
 ## Resume after crash
 
 1. Resolve and validate the registered repository context.
-2. Find the work item by repository and user-facing slug in the global catalog.
+2. Resolve the full UUID or unique UUID prefix within that repository.
 3. Read its scoped `states` row.
 4. Verify the outputs required by that state.
 5. Advance when complete; otherwise re-run the idempotent step.

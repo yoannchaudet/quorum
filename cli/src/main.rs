@@ -92,7 +92,7 @@ enum WorkItemCommand {
     },
     /// Resume autonomous processing for an existing work item.
     Resume {
-        /// The user-facing work-item slug.
+        /// The work-item UUID or unique UUID prefix.
         work_item: String,
         /// Use stub agents instead of invoking copilot (offline; no model calls).
         #[arg(long)]
@@ -106,7 +106,7 @@ enum WorkItemCommand {
     },
     /// Print the complete status of a work item.
     Show {
-        /// The user-facing work-item slug.
+        /// The work-item UUID or unique UUID prefix.
         work_item: String,
         /// Include full plans, summaries, findings, errors, and activity history.
         #[arg(long)]
@@ -117,7 +117,7 @@ enum WorkItemCommand {
     },
     /// Abandon the work item from a blocked state.
     Abandon {
-        /// The user-facing work-item slug.
+        /// The work-item UUID or unique UUID prefix.
         work_item: String,
     },
 }
@@ -126,12 +126,12 @@ enum WorkItemCommand {
 enum IntakeCommand {
     /// Show outstanding Planner questions.
     Show {
-        /// The user-facing work-item slug.
+        /// The work-item UUID or unique UUID prefix.
         work_item: String,
     },
     /// Answer Planner questions and continue.
     Answer {
-        /// The user-facing work-item slug.
+        /// The work-item UUID or unique UUID prefix.
         work_item: String,
         /// The answer text (mutually exclusive with --file).
         #[arg(conflicts_with = "file")]
@@ -149,7 +149,7 @@ enum IntakeCommand {
 enum PlanCommand {
     /// Print the latest persisted Plan.
     Show {
-        /// The user-facing work-item slug.
+        /// The work-item UUID or unique UUID prefix.
         work_item: String,
         /// Include convergence, feedback, and execution metadata.
         #[arg(long)]
@@ -160,7 +160,7 @@ enum PlanCommand {
     },
     /// Approve PlanReview and continue.
     Approve {
-        /// The user-facing work-item slug.
+        /// The work-item UUID or unique UUID prefix.
         work_item: String,
         /// Continue with stub agents instead of invoking copilot.
         #[arg(long)]
@@ -168,7 +168,7 @@ enum PlanCommand {
     },
     /// Reject PlanReview with optional feedback and continue.
     Reject {
-        /// The user-facing work-item slug.
+        /// The work-item UUID or unique UUID prefix.
         work_item: String,
         /// Feedback for the next planning or implementation pass (mutually exclusive with --file).
         #[arg(conflicts_with = "file")]
@@ -186,7 +186,7 @@ enum PlanCommand {
 enum ImplementationCommand {
     /// Show implementation rounds, reviews, artifacts, and workspace state.
     Show {
-        /// The user-facing work-item slug.
+        /// The work-item UUID or unique UUID prefix.
         work_item: String,
         /// Include full summaries and findings.
         #[arg(long)]
@@ -197,14 +197,14 @@ enum ImplementationCommand {
     },
     /// Approve WorkReview and continue.
     Approve {
-        /// The user-facing work-item slug.
+        /// The work-item UUID or unique UUID prefix.
         work_item: String,
         #[arg(long)]
         dry_run: bool,
     },
     /// Reject WorkReview with optional feedback and continue.
     Reject {
-        /// The user-facing work-item slug.
+        /// The work-item UUID or unique UUID prefix.
         work_item: String,
         /// Feedback for the next implementation pass (mutually exclusive with --file).
         #[arg(conflicts_with = "file")]
@@ -363,23 +363,18 @@ fn start_work_item(
     dry_run: bool,
     quiet: bool,
 ) -> Result<()> {
-    let work_item_slug = work_item_slug(&work_item);
-    validate_work_item_slug(&work_item_slug)?;
+    let work_item_label = work_item_label(&work_item);
+    validate_work_item_label(&work_item_label)?;
     let text = std::fs::read_to_string(&work_item)
         .with_context(|| format!("reading work item {}", work_item.display()))?;
     let (mut database, repository) = open_registered_context(&config, context)?;
-    if database
-        .work_item_id(&repository.id, &work_item_slug)
-        .context("looking up work item")?
-        .is_some()
-    {
-        anyhow::bail!(
-            "work item {work_item_slug:?} already exists; run `quorum work-item resume {work_item_slug}` to continue"
-        );
-    }
     let internal_id = database
-        .create_work_item(&repository.id, &work_item_slug, &text)
+        .create_work_item(&repository.id, &work_item_label, &text)
         .context("creating work item state")?;
+    let work_item_reference = database
+        .work_item_reference(&internal_id)
+        .context("creating work-item reference")?;
+    println!("created work item {work_item_reference} ({work_item_label})");
     let workspace = config
         .work_item_dir(internal_id.as_str())
         .join("implementation");
@@ -387,7 +382,7 @@ fn start_work_item(
         &mut database,
         &repository,
         &internal_id,
-        &work_item_slug,
+        &work_item_label,
         &workspace,
     )
     .context("preparing work item checkout")?;
@@ -398,7 +393,8 @@ fn start_work_item(
         config,
         store,
         worktree.path,
-        &work_item_slug,
+        &work_item_label,
+        &work_item_reference,
         dry_run,
         quiet,
     )
@@ -407,19 +403,21 @@ fn start_work_item(
 fn resume_work_item(
     config: Config,
     context: Option<&std::path::Path>,
-    work_item_slug: &str,
+    work_item_reference: &str,
     dry_run: bool,
     quiet: bool,
 ) -> Result<()> {
-    let (store, _, workspace) = open_work_item(&config, context, work_item_slug, true)?;
-    advance_work_item(config, store, workspace, work_item_slug, dry_run, quiet)
+    let (store, _, workspace, label, reference) =
+        open_work_item(&config, context, work_item_reference, true)?;
+    advance_work_item(config, store, workspace, &label, &reference, dry_run, quiet)
 }
 
 fn advance_work_item(
     config: Config,
     store: Store,
     workspace: PathBuf,
-    work_item_slug: &str,
+    work_item_label: &str,
+    work_item_reference: &str,
     dry_run: bool,
     quiet: bool,
 ) -> Result<()> {
@@ -431,7 +429,7 @@ fn advance_work_item(
         runner,
         Box::new(GitImplementationWorkspace),
         workspace,
-        work_item_slug,
+        work_item_label,
     )
     .context("initializing coordinator")?
     .with_implementation_allowed_dirs(vec![common_git_dir])
@@ -439,7 +437,7 @@ fn advance_work_item(
     coordinator
         .run_until_blocked()
         .context("advancing work item")?;
-    report(work_item_slug, &coordinator)
+    report(work_item_reference, &coordinator)
 }
 
 fn runner(config: &Config, work_item_id: &WorkItemId, dry_run: bool) -> Box<dyn AgentRunner> {
@@ -468,8 +466,9 @@ fn list_work_items(
         .filter(|item| states.is_empty() || states.contains(&item.state))
     {
         println!(
-            "{}\t{}\t{}\t{}",
-            item.slug,
+            "{}\t{}\t{}\t{}\t{}",
+            item.reference,
+            item.label,
             item.state,
             kind_label(item.state.kind()),
             format_time(item.updated_at)
@@ -507,7 +506,10 @@ fn show_intake(config: &Config, context: Option<&std::path::Path>, work_item: &s
             .as_deref()
             .unwrap_or("No outstanding Planner questions.")
     );
-    println!("\nanswer: quorum intake answer {work_item} \"...\"");
+    println!(
+        "\nanswer: quorum intake answer {} \"...\"",
+        snapshot.identity.reference
+    );
     Ok(())
 }
 
@@ -561,7 +563,10 @@ fn show_implementation(
         );
         return Ok(());
     }
-    println!("{} — {}", snapshot.identity.slug, snapshot.state.current);
+    println!(
+        "{} ({}) — {}",
+        snapshot.identity.reference, snapshot.identity.label, snapshot.state.current
+    );
     println!("\nimplementation:");
     if snapshot.implementations.is_empty() {
         println!("  no rounds");
@@ -603,7 +608,7 @@ fn load_snapshot(
     context: Option<&std::path::Path>,
     work_item: &str,
 ) -> Result<StatusSnapshot> {
-    let (store, _, _) = open_work_item(config, context, work_item, false)?;
+    let (store, _, _, _, _) = open_work_item(config, context, work_item, false)?;
     StatusSnapshot::load(&store).context("assembling work item status")
 }
 
@@ -640,16 +645,15 @@ fn require_state(actual: State, expected: State) -> Result<()> {
 fn resolve_and_continue(
     config: Config,
     context: Option<&std::path::Path>,
-    work_item_slug: &str,
+    work_item_reference: &str,
     decision: Decision,
     expected_state: Option<State>,
     dry_run: bool,
     quiet: bool,
 ) -> Result<()> {
-    validate_work_item_slug(work_item_slug)?;
     let require_worktree = !matches!(decision, Decision::Abandon);
-    let (store, internal_id, workspace) =
-        open_work_item(&config, context, work_item_slug, require_worktree)?;
+    let (store, internal_id, workspace, label, reference) =
+        open_work_item(&config, context, work_item_reference, require_worktree)?;
     if let Some(expected) = expected_state {
         let actual = store.current_state()?.unwrap_or(State::Intake);
         require_state(actual, expected)?;
@@ -666,7 +670,7 @@ fn resolve_and_continue(
         runner,
         Box::new(GitImplementationWorkspace),
         workspace,
-        work_item_slug,
+        &label,
     )
     .context("initializing coordinator")?
     .with_implementation_allowed_dirs(additional_dirs)
@@ -674,7 +678,7 @@ fn resolve_and_continue(
     co.resolve(decision)
         .context("resolving human intervention")?;
     co.run_until_blocked().context("advancing work item")?;
-    report(work_item_slug, &co)?;
+    report(&reference, &co)?;
     Ok(())
 }
 
@@ -758,21 +762,23 @@ fn open_registered_context(
 fn open_work_item(
     config: &Config,
     context: Option<&std::path::Path>,
-    work_item_slug: &str,
+    work_item_reference: &str,
     require_worktree: bool,
-) -> Result<(Store, WorkItemId, PathBuf)> {
-    validate_work_item_slug(work_item_slug)?;
+) -> Result<(Store, WorkItemId, PathBuf, String, String)> {
     let (mut database, repository) = open_registered_context(config, context)?;
-    let internal_id = database
-        .work_item_id(&repository.id, work_item_slug)
+    let resolved = database
+        .resolve_work_item(&repository.id, work_item_reference)
         .context("looking up work item")?
-        .with_context(|| format!("no work item {work_item_slug}"))?;
+        .with_context(|| format!("no work item {work_item_reference}"))?;
+    let internal_id = resolved.id;
+    let label = resolved.label;
+    let reference = resolved.reference;
     let workspace = if require_worktree {
         ensure_worktree(
             &mut database,
             &repository,
             &internal_id,
-            work_item_slug,
+            &label,
             &config
                 .work_item_dir(internal_id.as_str())
                 .join("implementation"),
@@ -788,7 +794,7 @@ fn open_work_item(
     let store = database
         .into_store(internal_id.clone())
         .context("opening work item state")?;
-    Ok((store, internal_id, workspace))
+    Ok((store, internal_id, workspace, label, reference))
 }
 
 struct StderrProgress {
@@ -846,8 +852,11 @@ fn progress_observer(quiet: bool) -> Box<dyn ActivityObserver> {
 
 fn report_status(snapshot: &StatusSnapshot, verbose: bool) {
     println!(
-        "{}\n  internal id: {}\n  repository: {}",
-        snapshot.identity.slug, snapshot.identity.id, snapshot.identity.repository_root
+        "{} ({})\n  id: {}\n  repository: {}",
+        snapshot.identity.reference,
+        snapshot.identity.label,
+        snapshot.identity.id,
+        snapshot.identity.repository_root
     );
     println!(
         "\nstate: {} ({})",
@@ -872,7 +881,8 @@ fn report_status(snapshot: &StatusSnapshot, verbose: bool) {
         }
         println!("  session: {session}");
         println!("  resume: copilot --resume {session}");
-        for (label, command) in resolution_commands(snapshot.state.current, &snapshot.identity.slug)
+        for (label, command) in
+            resolution_commands(snapshot.state.current, &snapshot.identity.reference)
         {
             println!("  {label}: {command}");
         }
@@ -1075,7 +1085,7 @@ fn now_millis() -> u64 {
 /// Render the current state and, when blocked, the human-intervention resume command
 /// (and any
 /// intake questions awaiting answers).
-fn report(work_item_slug: &str, co: &Coordinator) -> Result<()> {
+fn report(work_item_reference: &str, co: &Coordinator) -> Result<()> {
     let state = co.state();
     if let Some(session) = co.session_name() {
         println!("state: {state} (stuck — awaiting human intervention)");
@@ -1089,7 +1099,7 @@ fn report(work_item_slug: &str, co: &Coordinator) -> Result<()> {
         println!("human-intervention session: {session}");
         println!("  first time: run `copilot`, then `/rename {session}`");
         println!("  resume:     copilot --resume {session}");
-        for (label, command) in resolution_commands(state, work_item_slug) {
+        for (label, command) in resolution_commands(state, work_item_reference) {
             println!("  {label}: {command}");
         }
     } else if state == State::Failed {
@@ -1134,26 +1144,28 @@ fn resolution_commands(state: State, work_item: &str) -> Vec<(&'static str, Stri
     }
 }
 
-/// Derive a stable work-item slug from the input file name.
-fn work_item_slug(path: &std::path::Path) -> String {
+/// Derive a display label from the input file name.
+fn work_item_label(path: &std::path::Path) -> String {
     path.file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("work-item")
         .to_string()
 }
 
-/// Ensure a work-item slug is safe in commands and deterministic session names.
-fn validate_work_item_slug(work_item_slug: &str) -> Result<()> {
-    let mut components = std::path::Path::new(work_item_slug).components();
+/// Ensure a filename-derived label is safe for branch and commit naming.
+fn validate_work_item_label(work_item_label: &str) -> Result<()> {
+    let mut components = std::path::Path::new(work_item_label).components();
     let first = components.next();
     let is_single_normal =
         matches!(first, Some(std::path::Component::Normal(_))) && components.next().is_none();
-    if work_item_slug.is_empty()
-        || work_item_slug == "."
-        || work_item_slug == ".."
+    if work_item_label.is_empty()
+        || work_item_label == "."
+        || work_item_label == ".."
         || !is_single_normal
     {
-        anyhow::bail!("invalid work-item slug {work_item_slug:?}: must be a single path component");
+        anyhow::bail!(
+            "invalid work-item label {work_item_label:?}: must be a single path component"
+        );
     }
     Ok(())
 }

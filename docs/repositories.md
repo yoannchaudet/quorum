@@ -35,7 +35,7 @@ The first run pins the repository's committed `HEAD` and creates a linked worktr
 `~/.quorum/state/<work-item-id>/implementation/`. Quorum uses a deterministic branch:
 
 ```
-quorum/<sanitized-work-item-slug>-<short-work-item-id>
+quorum/<sanitized-work-item-label>-<short-work-item-id>
 ```
 
 The original checkout and any uncommitted changes in it remain untouched. Worktrees and
@@ -43,8 +43,8 @@ branches are retained when a work item reaches `Done`, `Failed`, or `Abandoned`.
 
 ## Work-item identity
 
-The user-facing work-item slug is unique within a repository, not globally. Two
-repositories may therefore each contain a work item named `example`.
+The work-item UUID is canonical and commands accept a repository-unique UUID prefix.
+Filename-derived labels are for display and may repeat, including within one repository.
 
 Repository IDs and work-item IDs are opaque UUIDs stored in the global database. Canonical
 paths identify registration records; they are not used as filesystem directory names.

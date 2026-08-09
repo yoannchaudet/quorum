@@ -35,9 +35,9 @@ events are still persisted.
 Default output uses snippets and the latest ten activity records. `--verbose` prints full
 stored text and all activity. `--json` returns a versioned snapshot document for tools
 and future UI clients.
-The current document version is `5`; version 5 adds the latest human Plan rejection
-feedback under `planning.feedback`. Version 4 added the human-approved execution
-capability grant.
+The current document version is `6`; version 6 exposes canonical UUID, short reference,
+and non-unique label identity. Version 5 added the latest human Plan rejection feedback
+under `planning.feedback`.
 
 `quorum plan show --json` and `quorum implementation show --json` expose smaller,
 independently versioned focused documents.
