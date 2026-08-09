@@ -18,8 +18,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 /// The global database schema version.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const DISPLAY_REFERENCE_LENGTH: usize = 8;
 
 /// Stable internal identity for a work item.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -76,9 +77,17 @@ pub struct RegisteredRepository {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkItemSummary {
     pub id: WorkItemId,
-    pub slug: String,
+    pub reference: String,
+    pub label: String,
     pub state: State,
     pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedWorkItem {
+    pub id: WorkItemId,
+    pub reference: String,
+    pub label: String,
 }
 
 /// Persisted intent and lifecycle state for a work item's linked Git worktree.
@@ -143,8 +152,12 @@ pub enum StoreError {
     UnknownState(String),
     #[error("work item {0} does not exist")]
     WorkItemNotFound(WorkItemId),
-    #[error("work item {slug:?} already exists in this repository")]
-    WorkItemAlreadyExists { slug: String },
+    #[error("work-item reference {reference:?} is invalid; use a UUID or leading UUID prefix")]
+    InvalidWorkItemReference { reference: String },
+    #[error(
+        "work-item reference {reference:?} is ambiguous in this repository; use more UUID characters"
+    )]
+    AmbiguousWorkItemReference { reference: String },
     #[error("database schema version {found} is not supported (expected {expected})")]
     UnsupportedSchema { found: i64, expected: i64 },
     #[error("path is not valid UTF-8: {0}")]
@@ -224,6 +237,9 @@ impl Database {
         }
 
         self.create_schema_v2()?;
+        if (1..8).contains(&stored_version) {
+            self.migrate_v7_to_v8()?;
+        }
         if (1..6).contains(&stored_version) {
             self.migrate_activity_role_names()?;
         }
@@ -293,8 +309,7 @@ impl Database {
                 origin_repo  TEXT,
                 origin_issue INTEGER,
                 created_at   TEXT NOT NULL,
-                updated_at   TEXT NOT NULL,
-                UNIQUE (repository_id, slug)
+                updated_at   TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS states (
@@ -419,6 +434,44 @@ impl Database {
                 ON artifacts(work_item_id, id);
             "#,
         )?;
+        Ok(())
+    }
+
+    fn migrate_v7_to_v8(&self) -> Result<(), StoreError> {
+        self.conn.pragma_update(None, "foreign_keys", false)?;
+        let result = self.conn.execute_batch(
+            r#"
+            BEGIN IMMEDIATE;
+
+            CREATE TABLE work_items_v8 (
+                id            TEXT PRIMARY KEY,
+                repository_id TEXT REFERENCES repositories(id),
+                slug          TEXT NOT NULL,
+                text          TEXT,
+                source        TEXT,
+                origin_repo   TEXT,
+                origin_issue  INTEGER,
+                created_at    TEXT NOT NULL,
+                updated_at    TEXT NOT NULL
+            );
+
+            INSERT INTO work_items_v8
+                (id, repository_id, slug, text, source, origin_repo, origin_issue, created_at, updated_at)
+            SELECT id, repository_id, slug, text, source, origin_repo, origin_issue, created_at, updated_at
+            FROM work_items;
+
+            DROP TABLE work_items;
+            ALTER TABLE work_items_v8 RENAME TO work_items;
+
+            COMMIT;
+            "#,
+        );
+        if result.is_err() {
+            let _ = self.conn.execute_batch("ROLLBACK;");
+        }
+        let foreign_keys = self.conn.pragma_update(None, "foreign_keys", true);
+        result?;
+        foreign_keys?;
         Ok(())
     }
 
@@ -579,14 +632,20 @@ impl Database {
         Ok(repositories)
     }
 
-    /// Find a work item by repository and user-facing slug.
+    /// Find the oldest work item with an exact repository-scoped label.
+    ///
+    /// This is retained for internal setup and migration helpers. User-facing
+    /// commands resolve UUID references with [`Database::resolve_work_item`].
     pub fn work_item_id(
         &self,
         repository_id: &RepositoryId,
         slug: &str,
     ) -> Result<Option<WorkItemId>, StoreError> {
         match self.conn.query_row(
-            "SELECT id FROM work_items WHERE repository_id = ?1 AND slug = ?2",
+            "SELECT id FROM work_items
+             WHERE repository_id = ?1 AND slug = ?2
+             ORDER BY created_at, id
+             LIMIT 1",
             params![repository_id.as_str(), slug],
             |row| row.get::<_, String>(0),
         ) {
@@ -596,39 +655,83 @@ impl Database {
         }
     }
 
+    /// Resolve a full UUID or unique UUID prefix within one repository.
+    pub fn resolve_work_item(
+        &self,
+        repository_id: &RepositoryId,
+        reference: &str,
+    ) -> Result<Option<ResolvedWorkItem>, StoreError> {
+        if reference.is_empty()
+            || reference.len() > 36
+            || !reference
+                .chars()
+                .all(|character| character.is_ascii_hexdigit() || character == '-')
+        {
+            return Err(StoreError::InvalidWorkItemReference {
+                reference: reference.to_string(),
+            });
+        }
+        let normalized = reference.to_ascii_lowercase();
+        let mut statement = self.conn.prepare(
+            "SELECT id, slug FROM work_items
+             WHERE repository_id = ?1
+               AND substr(id, 1, length(?2)) = ?2
+             ORDER BY id
+             LIMIT 2",
+        )?;
+        let matches = statement
+            .query_map(params![repository_id.as_str(), normalized], |row| {
+                Ok(ResolvedWorkItem {
+                    id: WorkItemId(row.get(0)?),
+                    reference: String::new(),
+                    label: row.get(1)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        match matches.as_slice() {
+            [] => Ok(None),
+            [work_item] => {
+                let mut work_item = work_item.clone();
+                work_item.reference = self.work_item_reference(&work_item.id)?;
+                Ok(Some(work_item))
+            }
+            _ => Err(StoreError::AmbiguousWorkItemReference {
+                reference: reference.to_string(),
+            }),
+        }
+    }
+
+    /// Return the shortest repository-unique UUID prefix, using at least eight characters.
+    pub fn work_item_reference(&self, work_item_id: &WorkItemId) -> Result<String, StoreError> {
+        repository_unique_reference(&self.conn, work_item_id)
+    }
+
     /// Return the existing work item for `(repository, slug)`, or create an empty one.
     pub fn get_or_create_work_item(
         &mut self,
         repository_id: &RepositoryId,
         slug: &str,
     ) -> Result<WorkItemId, StoreError> {
+        if let Some(id) = self.work_item_id(repository_id, slug)? {
+            return Ok(id);
+        }
         let id = WorkItemId::new();
         let ts = now_millis();
-        self.conn
-            .query_row(
-                "INSERT INTO work_items (id, repository_id, slug, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?4)
-             ON CONFLICT(repository_id, slug) DO UPDATE SET slug = excluded.slug
-             RETURNING id",
-                params![id.as_str(), repository_id.as_str(), slug, ts],
-                |row| row.get::<_, String>(0),
-            )
-            .map(WorkItemId)
-            .map_err(Into::into)
+        self.conn.execute(
+            "INSERT INTO work_items (id, repository_id, slug, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)",
+            params![id.as_str(), repository_id.as_str(), slug, ts],
+        )?;
+        Ok(id)
     }
 
-    /// Create a new repository-scoped work item, rejecting an existing slug.
+    /// Create a new repository-scoped work item. Labels are intentionally non-unique.
     pub fn create_work_item(
         &mut self,
         repository_id: &RepositoryId,
         slug: &str,
         text: &str,
     ) -> Result<WorkItemId, StoreError> {
-        if self.work_item_id(repository_id, slug)?.is_some() {
-            return Err(StoreError::WorkItemAlreadyExists {
-                slug: slug.to_string(),
-            });
-        }
         let id = WorkItemId::new();
         let ts = now_millis();
         self.conn.execute(
@@ -669,8 +772,9 @@ impl Database {
             let (id, slug, state, updated_at) = row?;
             let state = State::from_db_str(&state).ok_or(StoreError::UnknownState(state))?;
             summaries.push(WorkItemSummary {
+                reference: self.work_item_reference(&WorkItemId(id.clone()))?,
                 id: WorkItemId(id),
-                slug,
+                label: slug,
                 state,
                 updated_at: updated_at as u64,
             });
@@ -775,6 +879,11 @@ impl Store {
     /// The stable internal identity of this store's work item.
     pub fn work_item_id(&self) -> &WorkItemId {
         &self.work_item_id
+    }
+
+    /// The shortest repository-unique UUID prefix, using at least eight characters.
+    pub fn work_item_reference(&self) -> Result<String, StoreError> {
+        repository_unique_reference(&self.conn, &self.work_item_id)
     }
 
     /// The global schema version recorded by this connection.
@@ -1081,11 +1190,20 @@ impl Store {
             .as_ref()
             .and_then(|value| crate::ExecutionCapabilities::parse_plan(&value.0).ok());
 
+        let reference = repository_unique_reference(&self.conn, &WorkItemId(id.clone()))?;
+        let session_id = id.clone();
+        let session_name = if state.is_blocked() {
+            self.session(state)?
+                .or_else(|| Some(format!("quorum/{session_id}/{state}")))
+        } else {
+            None
+        };
         Ok(StatusSnapshot {
-            version: 5,
+            version: 6,
             identity: WorkItemIdentitySnapshot {
                 id,
-                slug: slug.clone(),
+                reference: reference.clone(),
+                label: slug,
                 repository_root,
             },
             state: StateSnapshot {
@@ -1093,7 +1211,7 @@ impl Store {
                 kind: state.kind(),
             },
             questions: self.questions()?,
-            session_name: state.is_blocked().then(|| format!("quorum/{slug}/{state}")),
+            session_name,
             transitions: self.history()?,
             planning: PlanningSnapshot {
                 iterations: iterations as u32,
@@ -1518,6 +1636,40 @@ fn schema_version(conn: &Connection) -> Result<i64, StoreError> {
     Ok(value.parse().unwrap_or(0))
 }
 
+fn repository_unique_reference(
+    conn: &Connection,
+    work_item_id: &WorkItemId,
+) -> Result<String, StoreError> {
+    let mut statement = conn.prepare(
+        "SELECT candidate.id
+         FROM work_items target
+         JOIN work_items candidate
+           ON candidate.repository_id IS target.repository_id
+         WHERE target.id = ?1 AND candidate.id != target.id",
+    )?;
+    let other_ids = statement
+        .query_map(params![work_item_id.as_str()], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let required_length = other_ids
+        .iter()
+        .map(|other| {
+            work_item_id
+                .as_str()
+                .bytes()
+                .zip(other.bytes())
+                .take_while(|(left, right)| left == right)
+                .count()
+                + 1
+        })
+        .max()
+        .unwrap_or(0)
+        .max(DISPLAY_REFERENCE_LENGTH)
+        .min(work_item_id.as_str().len());
+    Ok(work_item_id.as_str()[..required_length].to_string())
+}
+
 fn optional_string(
     conn: &Connection,
     sql: &str,
@@ -1732,6 +1884,94 @@ mod tests {
             .unwrap();
         assert_eq!(store.work_item().unwrap().as_deref(), Some("# Legacy"));
         assert_eq!(store.current_state().unwrap(), Some(State::Planning));
+    }
+
+    #[test]
+    fn migrates_v7_to_non_unique_work_item_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quorum.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta (key, value) VALUES ('schema_version', '7');
+             CREATE TABLE repositories (
+                 id TEXT PRIMARY KEY,
+                 root TEXT NOT NULL UNIQUE,
+                 registered INTEGER NOT NULL,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+             );
+             INSERT INTO repositories
+                 (id, root, registered, created_at, updated_at)
+             VALUES ('repo', '/repo', 1, '1', '1');
+             CREATE TABLE work_items (
+                 id TEXT PRIMARY KEY,
+                 repository_id TEXT REFERENCES repositories(id),
+                 slug TEXT NOT NULL,
+                 text TEXT,
+                 source TEXT,
+                 origin_repo TEXT,
+                 origin_issue INTEGER,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 UNIQUE (repository_id, slug)
+             );
+             INSERT INTO work_items
+                 (id, repository_id, slug, text, created_at, updated_at)
+             VALUES ('aaaaaaaa-1111-4111-8111-111111111111', 'repo', 'same', '# One', '1', '1');
+             CREATE TABLE states (
+                 work_item_id TEXT PRIMARY KEY REFERENCES work_items(id) ON DELETE CASCADE,
+                 state TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+             );
+             INSERT INTO states (work_item_id, state, updated_at)
+             VALUES ('aaaaaaaa-1111-4111-8111-111111111111', 'PlanReview', '1');
+             CREATE TABLE sessions (
+                 work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                 state TEXT NOT NULL,
+                 session_name TEXT NOT NULL,
+                 ts TEXT NOT NULL,
+                 PRIMARY KEY (work_item_id, state)
+             );
+             INSERT INTO sessions (work_item_id, state, session_name, ts)
+             VALUES (
+                 'aaaaaaaa-1111-4111-8111-111111111111',
+                 'PlanReview',
+                 'quorum/same/PlanReview',
+                 '1'
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut db = Database::open(&path).unwrap();
+        let repository = db
+            .registered_repository(&RepositoryRoot::from_canonical("/repo"))
+            .unwrap()
+            .unwrap();
+        let second = db
+            .create_work_item(&repository.id, "same", "# Two")
+            .unwrap();
+        assert_ne!(second.as_str(), "aaaaaaaa-1111-4111-8111-111111111111");
+        assert_eq!(db.work_items(&repository.id).unwrap().len(), 2);
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        let foreign_key_errors: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_errors, 0);
+        let store = db
+            .into_store(WorkItemId(
+                "aaaaaaaa-1111-4111-8111-111111111111".to_string(),
+            ))
+            .unwrap();
+        assert_eq!(store.current_state().unwrap(), Some(State::PlanReview));
+        assert_eq!(
+            store.session(State::PlanReview).unwrap().as_deref(),
+            Some("quorum/same/PlanReview")
+        );
     }
 
     #[test]
@@ -1955,10 +2195,10 @@ mod tests {
         let first = db
             .create_work_item(&repository.id, "first", "# First")
             .unwrap();
-        assert!(matches!(
-            db.create_work_item(&repository.id, "first", "# Duplicate"),
-            Err(StoreError::WorkItemAlreadyExists { .. })
-        ));
+        let duplicate = db
+            .create_work_item(&repository.id, "first", "# Duplicate")
+            .unwrap();
+        assert_ne!(duplicate, first);
         {
             let mut store = db.into_store(first.clone()).unwrap();
             store
@@ -1968,10 +2208,76 @@ mod tests {
         }
 
         let summaries = db.work_items(&repository.id).unwrap();
-        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries.len(), 2);
         assert_eq!(summaries[0].id, first);
-        assert_eq!(summaries[0].slug, "first");
+        assert_eq!(summaries[0].label, "first");
         assert_eq!(summaries[0].state, State::PlanReview);
+        assert_eq!(summaries[1].id, duplicate);
+        assert_eq!(summaries[1].label, "first");
+    }
+
+    #[test]
+    fn resolves_repository_scoped_uuid_prefixes() {
+        let mut db = Database::open_in_memory().unwrap();
+        let repository = register(&mut db, "/repo");
+        let other_repository = register(&mut db, "/other");
+        let ts = now_millis();
+        for (id, repository_id, label) in [
+            (
+                "aaaaaaaa-1111-4111-8111-111111111111",
+                &repository.id,
+                "first",
+            ),
+            (
+                "aaaaaaaa-2222-4222-8222-222222222222",
+                &repository.id,
+                "second",
+            ),
+            (
+                "aaaaaaaa-3333-4333-8333-333333333333",
+                &other_repository.id,
+                "other",
+            ),
+        ] {
+            db.conn
+                .execute(
+                    "INSERT INTO work_items
+                     (id, repository_id, slug, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?4)",
+                    params![id, repository_id.as_str(), label, ts],
+                )
+                .unwrap();
+        }
+
+        assert!(matches!(
+            db.resolve_work_item(&repository.id, "a"),
+            Err(StoreError::AmbiguousWorkItemReference { .. })
+        ));
+        let resolved = db
+            .resolve_work_item(&repository.id, "AAAAAAAA-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.id.as_str(), "aaaaaaaa-1111-4111-8111-111111111111");
+        assert_eq!(resolved.reference, "aaaaaaaa-1");
+        assert_eq!(resolved.label, "first");
+        let full = db
+            .resolve_work_item(&repository.id, "aaaaaaaa-1111-4111-8111-111111111111")
+            .unwrap()
+            .unwrap();
+        assert_eq!(full, resolved);
+        let other = db
+            .resolve_work_item(&other_repository.id, "a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(other.label, "other");
+        assert!(db
+            .resolve_work_item(&repository.id, "bbbbbbbb")
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            db.resolve_work_item(&repository.id, "not-a-uuid"),
+            Err(StoreError::InvalidWorkItemReference { .. })
+        ));
     }
 
     #[test]
@@ -2163,10 +2469,12 @@ mod tests {
             )
             .unwrap();
 
+        let reference = store.work_item_reference().unwrap();
         let snapshot = store.status_snapshot().unwrap();
-        assert_eq!(snapshot.version, 5);
+        assert_eq!(snapshot.version, 6);
         assert_eq!(snapshot.identity.id, work_item.as_str());
-        assert_eq!(snapshot.identity.slug, "observable");
+        assert_eq!(snapshot.identity.reference, reference);
+        assert_eq!(snapshot.identity.label, "observable");
         assert_eq!(snapshot.identity.repository_root, "/repo");
         assert_eq!(snapshot.state.current, State::Planning);
         assert_eq!(snapshot.planning.iterations, 1);

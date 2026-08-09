@@ -2,7 +2,7 @@
 
 A work item is a **local markdown file**. It is the single input Quorum processes.
 Every work item is scoped to a registered Git repository (see
-[repositories](repositories.md)); its user-facing ID is unique within that repository.
+[repositories](repositories.md)) and has a UUID.
 
 ## Sources
 
@@ -13,10 +13,13 @@ Every work item is scoped to a registered Git repository (see
 
 Pulling from GitHub is a one-time import: Quorum operates on the local copy so it can run unattended and offline.
 
-Start a new work item with `quorum work-item start <file.md>`. The filename stem becomes
-the repository-scoped slug. Creation rejects an existing slug. Use
-`quorum work-item resume <slug>` after an interrupted autonomous run; resume does not
-require or re-read the original Markdown file.
+Start a new work item with `quorum work-item start <file.md>`. Every invocation creates
+a new independent UUID, while the filename stem becomes a non-unique display label.
+Use `quorum work-item resume <uuid-or-prefix>` after an interrupted autonomous run;
+resume does not require or re-read the original Markdown file.
+Short prefixes are convenient interactive references; use the full UUID anywhere the
+reference must remain durable because a future work item can make an old prefix
+ambiguous.
 
 ## Images
 

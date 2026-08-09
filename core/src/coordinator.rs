@@ -88,25 +88,35 @@ pub struct Coordinator {
     /// Working directory used as the sandbox cwd for agent invocations.
     workspace: PathBuf,
     implementation_allowed_dirs: Vec<PathBuf>,
-    /// The work-item slug used to derive session names (see `docs/sessions.md`).
-    work_item_slug: String,
+    /// The filename-derived label retained for branch and commit naming.
+    work_item_label: String,
+    /// The canonical UUID used to derive stable, collision-free session names.
+    work_item_session_id: String,
+    /// A session already assigned to the state loaded at startup.
+    persisted_session: Option<(State, String)>,
     state: State,
 }
 
 impl Coordinator {
     /// Create a Coordinator over an opened `store`, resuming the persisted state
     /// if present, otherwise starting at `Intake`. `workspace` is the sandbox
-    /// cwd for agent invocations; `work_item_slug` identifies the work item (used for
-    /// session names).
+    /// cwd for agent invocations; `work_item_label` is the filename-derived display
+    /// label used for branch and commit naming.
     pub fn new(
         config: Config,
         store: Store,
         runner: Box<dyn AgentRunner>,
         implementation_workspace: Box<dyn ImplementationWorkspace>,
         workspace: PathBuf,
-        work_item_slug: impl Into<String>,
+        work_item_label: impl Into<String>,
     ) -> Result<Coordinator, CoordinatorError> {
         let state = store.current_state()?.unwrap_or(State::Intake);
+        let work_item_session_id = store.work_item_id().as_str().to_string();
+        let persisted_session = if state.is_blocked() {
+            store.session(state)?.map(|name| (state, name))
+        } else {
+            None
+        };
         Ok(Coordinator {
             config,
             store,
@@ -115,7 +125,9 @@ impl Coordinator {
             implementation_workspace,
             workspace,
             implementation_allowed_dirs: Vec::new(),
-            work_item_slug: work_item_slug.into(),
+            work_item_label: work_item_label.into(),
+            work_item_session_id,
+            persisted_session,
             state,
         })
     }
@@ -151,11 +163,19 @@ impl Coordinator {
     }
 
     /// The human-intervention session name for the current blocked state.
-    /// Deterministic from the work-item slug and state
-    /// (`quorum/<work-item-slug>/<state>`), so it survives crashes.
+    /// Deterministic from the canonical work-item UUID and state
+    /// (`quorum/<work-item-uuid>/<state>`), so it survives crashes.
     pub fn session_name(&self) -> Option<String> {
         if self.state.is_blocked() {
-            Some(format!("quorum/{}/{}", self.work_item_slug, self.state))
+            if let Some((state, name)) = &self.persisted_session {
+                if *state == self.state {
+                    return Some(name.clone());
+                }
+            }
+            Some(format!(
+                "quorum/{}/{}",
+                self.work_item_session_id, self.state
+            ))
         } else {
             None
         }
@@ -167,6 +187,7 @@ impl Coordinator {
         match self.session_name() {
             Some(name) => {
                 self.store.record_session(self.state, &name)?;
+                self.persisted_session = Some((self.state, name.clone()));
                 Ok(Some(name))
             }
             None => Ok(None),
@@ -564,7 +585,7 @@ impl Coordinator {
         let result = self.implementation_workspace.finalize(
             &self.workspace,
             self.store.work_item_id(),
-            &self.work_item_slug,
+            &self.work_item_label,
             &round,
         )?;
         self.store
@@ -1096,11 +1117,32 @@ mod tests {
         let (mut co, _tmp) = coordinator_with_work_item(Config::default());
         assert_eq!(co.run_until_blocked().unwrap(), State::PlanReview);
 
-        // The session name is deterministic and derived from the work-item slug and state.
-        let expected = "quorum/test-work-item/PlanReview".to_string();
+        // The session name is deterministic and derived from the canonical UUID and state.
+        let expected = format!("quorum/{}/PlanReview", co.store.work_item_id().as_str());
         assert_eq!(co.session_name(), Some(expected.clone()));
         // And it was persisted (recoverable across a crash).
         assert_eq!(co.store.session(State::PlanReview).unwrap(), Some(expected));
+    }
+
+    #[test]
+    fn resuming_preserves_an_existing_blocked_session_name() {
+        let (mut co, _tmp) = coordinator_with_work_item(Config::default());
+        assert_eq!(co.run_until_blocked().unwrap(), State::PlanReview);
+        let legacy_name = "quorum/test-work-item/PlanReview";
+        co.store
+            .record_session(State::PlanReview, legacy_name)
+            .unwrap();
+
+        let resumed = Coordinator::new(
+            Config::default(),
+            co.store,
+            Box::new(EchoRunner),
+            fake_workspace(),
+            PathBuf::from("."),
+            "test-work-item",
+        )
+        .unwrap();
+        assert_eq!(resumed.session_name().as_deref(), Some(legacy_name));
     }
 
     #[test]

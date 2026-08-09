@@ -110,7 +110,8 @@ impl ActivityObserver for NoopActivityObserver {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkItemIdentitySnapshot {
     pub id: String,
-    pub slug: String,
+    pub reference: String,
+    pub label: String,
     pub repository_root: String,
 }
 
@@ -221,7 +222,7 @@ impl StatusSnapshot {
 
     pub fn plan_document(&self) -> Option<PlanDocument> {
         Some(PlanDocument {
-            version: 1,
+            version: 2,
             work_item: self.identity.clone(),
             state: self.state.clone(),
             plan: self.planning.plan.clone()?,
@@ -235,7 +236,7 @@ impl StatusSnapshot {
 
     pub fn implementation_document(&self) -> ImplementationDocument {
         ImplementationDocument {
-            version: 1,
+            version: 2,
             work_item: self.identity.clone(),
             state: self.state.clone(),
             implementations: self.implementations.clone(),

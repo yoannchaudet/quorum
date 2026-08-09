@@ -9,8 +9,8 @@ be resumed later. This keeps human intervention in the same simple interface eve
 A Session name ties it to a work item and the blocking state:
 
 ```
-quorum/<work-item-slug>/<state>
-# e.g. quorum/1234/IntakeReview
+quorum/<work-item-uuid>/<state>
+# e.g. quorum/a0cb7d4b-823a-4f80-a55c-191a32804f92/IntakeReview
 ```
 
 This makes the right Session trivial to find and resume for a given block.
@@ -22,8 +22,8 @@ When a work item enters a blocked state, the CLI:
 1. Prints the current state and why it is blocked.
 2. Records the deterministic session name (see above) and surfaces it, with the
    commands to name/resume the `copilot` session:
-   - First time, start a session and name it: run `copilot`, then `/rename quorum/1234/IntakeReview`.
-   - Later, resume it: `copilot --resume quorum/1234/IntakeReview`.
+   - First time, start a session and name it: run `copilot`, then `/rename quorum/a0cb7d4b-823a-4f80-a55c-191a32804f92/IntakeReview`.
+   - Later, resume it: `copilot --resume quorum/a0cb7d4b-823a-4f80-a55c-191a32804f92/IntakeReview`.
 
    > `copilot` has no non-interactive flag to create a session with a chosen
    > name, so the human assigns the name once via `/rename`; Quorum supplies the
