@@ -30,6 +30,7 @@ pub enum State {
     Implementing,
     Reviewing,
     WorkReview,
+    Delivering,
     Done,
     Failed,
     Abandoned,
@@ -42,7 +43,9 @@ impl State {
         match self {
             IntakeReview | PlanReview | WorkReview => Kind::Blocked,
             Done | Failed | Abandoned => Kind::Terminal,
-            Intake | Planning | Converging | Implementing | Reviewing => Kind::Autonomous,
+            Intake | Planning | Converging | Implementing | Reviewing | Delivering => {
+                Kind::Autonomous
+            }
         }
     }
 
@@ -66,8 +69,9 @@ impl State {
             Converging => &[Planning, PlanReview, Implementing, Failed],
             PlanReview => &[Planning, Implementing, Abandoned],
             Implementing => &[Reviewing, Failed],
-            Reviewing => &[Implementing, WorkReview, Done, Failed],
-            WorkReview => &[Implementing, Done, Abandoned],
+            Reviewing => &[Implementing, WorkReview, Delivering, Failed],
+            WorkReview => &[Implementing, Delivering, Abandoned],
+            Delivering => &[Done, Failed],
             Done | Failed | Abandoned => &[],
         }
     }
@@ -88,6 +92,7 @@ impl State {
             State::Implementing => "Implementing",
             State::Reviewing => "Reviewing",
             State::WorkReview => "WorkReview",
+            State::Delivering => "Delivering",
             State::Done => "Done",
             State::Failed => "Failed",
             State::Abandoned => "Abandoned",
@@ -105,6 +110,7 @@ impl State {
             "Implementing" => State::Implementing,
             "Reviewing" => State::Reviewing,
             "WorkReview" => State::WorkReview,
+            "Delivering" => State::Delivering,
             "Done" => State::Done,
             "Failed" => State::Failed,
             "Abandoned" => State::Abandoned,
@@ -131,6 +137,7 @@ mod tests {
         assert_eq!(State::Converging.kind(), Kind::Autonomous);
         assert_eq!(State::Implementing.kind(), Kind::Autonomous);
         assert_eq!(State::Reviewing.kind(), Kind::Autonomous);
+        assert_eq!(State::Delivering.kind(), Kind::Autonomous);
 
         assert!(State::IntakeReview.is_blocked());
         assert!(State::PlanReview.is_blocked());
@@ -154,7 +161,8 @@ mod tests {
         assert!(State::Planning.can_transition_to(State::IntakeReview));
         assert!(State::Converging.can_transition_to(State::Planning));
         assert!(State::Reviewing.can_transition_to(State::Implementing));
-        assert!(State::WorkReview.can_transition_to(State::Done));
+        assert!(State::WorkReview.can_transition_to(State::Delivering));
+        assert!(State::Delivering.can_transition_to(State::Done));
     }
 
     #[test]
@@ -175,6 +183,7 @@ mod tests {
             State::Implementing,
             State::Reviewing,
             State::WorkReview,
+            State::Delivering,
             State::Done,
             State::Failed,
             State::Abandoned,

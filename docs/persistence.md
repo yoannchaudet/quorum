@@ -37,7 +37,8 @@ Repository ownership scopes user-facing UUID-prefix lookup.
 | `sessions` | Human-intervention session records by work item and blocked state. |
 | `events` | Append-only audit events per work item. |
 | `activities` | Structured phase, agent, retry, Git-round, review, and outcome events. |
-| `worktrees` | Pinned base commit, branch, path, and setup status per work item. |
+| `worktrees` | Requested base, pinned resolved commit, branch, remote, target, path, and setup status per work item. |
+| `deliveries` | Crash-recoverable push/PR checkpoints, final head commit, and persisted PR handoff. |
 
 Every work-item-owned row has a foreign key to `work_items` with cascading deletion.
 Labels may repeat. Composite keys include the work-item UUID, preventing Planners,
@@ -61,6 +62,11 @@ iterations, sessions, or reviews from colliding across work items.
   planner, implementation, or review iteration.
 - **Recoverable worktree setup**: creation intent is persisted before Git is changed;
   restart reconciles only matching branches and paths.
+- **Recoverable delivery**: delivery intent is persisted with the worktree. A `pending`
+  delivery records its final commit before push, `pushed` is committed before GitHub API
+  work, and `pull_request_created` stores a nonzero PR number and URL before `Done`.
+  Transient GitHub/process failures use the configured step retry budget while retaining
+  each checkpoint, so retries never repeat a completed push.
 - **Recoverable implementation rounds**: `running` records are created before the Implementer,
   summaries and `agent_complete` are persisted atomically, and `committed` records hold
   the resulting commit and tree SHA.
@@ -92,6 +98,10 @@ For an implementation round, restart behavior depends on its status:
 
 An unrelated commit or unexpected HEAD is never reset or overwritten; the work item fails with
 the checkout left intact for inspection.
+
+For migrated worktrees, source and delivery fields are nullable. Terminal legacy items
+remain unchanged; a nonterminal legacy item must be supplied `--remote` and `--target`
+at implementation approval before it can deliver.
 
 ## Failure
 

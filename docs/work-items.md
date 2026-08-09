@@ -13,7 +13,7 @@ Every work item is scoped to a registered Git repository (see
 
 Pulling from GitHub is a one-time import: Quorum operates on the local copy so it can run unattended and offline.
 
-Start a new work item with `quorum work-item start <file.md>`. Every invocation creates
+Start a new work item with `quorum work-item start <file.md> [--base <revision>] [--target <branch>] [--remote <name>]`. Every invocation creates
 a new independent UUID, while the filename stem becomes a non-unique display label.
 Use `quorum work-item resume <uuid-or-prefix>` after an interrupted autonomous run;
 resume does not require or re-read the original Markdown file.
@@ -45,10 +45,15 @@ The work item's normalized markdown and stable internal ID are stored in the glo
 Only binary images and implementation files live under the work item's UUID-keyed state
 directory.
 
-`implementation/` is a linked Git worktree on a dedicated Quorum branch. Its base is the
-context repository's committed `HEAD` when the work item first runs; uncommitted changes
-in the user's checkout are deliberately excluded. Planners and the Reviewer use the
+`implementation/` is a linked Git worktree on a dedicated Quorum branch. Its requested
+base revision (default `HEAD`) and immutable resolved commit are persisted separately;
+uncommitted changes in the user's checkout are deliberately excluded. Its delivery remote
+(default `origin`) and pull-request target branch are also persisted before autonomous
+work begins. The target is inferred only from an unambiguous branch; detached HEADs,
+tags, raw SHAs, and ambiguous refs require `--target`. Planners and the Reviewer use the
 worktree read-only, while the Implementer uses it read/write.
+
+The selected target must exist on the selected remote, not merely in the local clone.
 
 ## Validation (during Intake)
 

@@ -19,7 +19,8 @@ MUST surface this distinction.
 | `Implementing` | autonomous | The Implementer produces the implementation from the Plan. |
 | `Reviewing` | autonomous | The Reviewer adversarially reviews the Implementer's output. |
 | `WorkReview` | blocked, optional | A human reviews the accepted work. Approve, or send it back to `Implementing`. |
-| `Done` | terminal | Work accepted. |
+| `Delivering` | autonomous | The Coordinator pushes the deterministic Quorum branch and persists a GitHub pull-request handoff. |
+| `Done` | terminal | The final branch was pushed and its pull-request handoff was persisted. Quorum does not merge it. |
 | `Failed` | terminal | Unrecoverable error (see [persistence](persistence.md) for retry/recovery first). |
 | `Abandoned` | terminal | A human canceled the work item. |
 
@@ -42,13 +43,15 @@ stateDiagram-v2
   Reviewing --> WorkReview: Reviewer accepts
   Reviewing --> WorkReview: unchanged tree or iteration bound
   WorkReview --> Implementing: changes requested
-  WorkReview --> Done: approved
-  Reviewing --> Done: Reviewer accepts, review disabled
+  WorkReview --> Delivering: approved
+  Reviewing --> Delivering: Reviewer accepts, review disabled
+  Delivering --> Done: PR handoff persisted
   Intake --> Failed
   Planning --> Failed
   Converging --> Failed
   Implementing --> Failed
   Reviewing --> Failed
+  Delivering --> Failed
   PlanReview --> Abandoned
   WorkReview --> Abandoned
   IntakeReview --> Abandoned

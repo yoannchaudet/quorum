@@ -5,10 +5,12 @@
 //! one work item so data cannot leak across runs.
 
 use crate::observability::{
-    ActivityEvent, ActivityKind, ArtifactSnapshot, ImplementationSnapshot, PlanningSnapshot,
-    ReviewSnapshot, StateSnapshot, StatusSnapshot, WorkItemIdentitySnapshot, WorkspaceSnapshot,
+    ActivityEvent, ActivityKind, ArtifactSnapshot, DeliverySnapshot, ImplementationSnapshot,
+    PlanningSnapshot, ReviewSnapshot, StateSnapshot, StatusSnapshot, WorkItemIdentitySnapshot,
+    WorkspaceSnapshot,
 };
 use crate::repository::RepositoryRoot;
+use crate::repository::WorktreeStart;
 use crate::state::State;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -18,7 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 /// The global database schema version.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DISPLAY_REFERENCE_LENGTH: usize = 8;
 
@@ -27,7 +29,7 @@ const DISPLAY_REFERENCE_LENGTH: usize = 8;
 pub struct WorkItemId(String);
 
 impl WorkItemId {
-    fn new() -> WorkItemId {
+    pub(crate) fn new() -> WorkItemId {
         WorkItemId(Uuid::new_v4().to_string())
     }
 
@@ -94,10 +96,61 @@ pub struct ResolvedWorkItem {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeRecord {
     pub work_item_id: WorkItemId,
+    pub requested_base: Option<String>,
     pub base_commit: String,
     pub branch: String,
     pub path: std::path::PathBuf,
+    pub delivery_remote: Option<String>,
+    pub target_branch: Option<String>,
     pub ready: bool,
+}
+
+/// All fields that must commit together when first reserving a work item.
+pub(crate) struct NewWorkItemWorktreeIntent<'a> {
+    pub id: WorkItemId,
+    pub slug: &'a str,
+    pub text: &'a str,
+    pub start: &'a WorktreeStart,
+    pub branch: &'a str,
+    pub path: &'a Path,
+}
+
+/// A crash-recoverable checkpoint for Git/GitHub delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryStatus {
+    Pending,
+    Pushed,
+    PullRequestCreated,
+}
+
+impl DeliveryStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeliveryStatus::Pending => "pending",
+            DeliveryStatus::Pushed => "pushed",
+            DeliveryStatus::PullRequestCreated => "pull_request_created",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "pushed" => Some(Self::Pushed),
+            "pull_request_created" => Some(Self::PullRequestCreated),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryRecord {
+    pub status: DeliveryStatus,
+    pub final_head_commit: String,
+    pub pr_number: Option<u64>,
+    pub pr_url: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +217,12 @@ pub enum StoreError {
     NonUtf8Path(std::path::PathBuf),
     #[error("stored implementation round status {0:?} is invalid")]
     InvalidRoundStatus(String),
+    #[error("stored delivery status {0:?} is invalid")]
+    InvalidDeliveryStatus(String),
+    #[error("delivery settings are already persisted and cannot be changed")]
+    DeliverySettingsAlreadyPersisted,
+    #[error("a delivered pull request requires a nonzero number and URL")]
+    InvalidDeliveryHandoff,
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error("artifact filesystem error at {path}: {source}")]
@@ -239,6 +298,9 @@ impl Database {
         self.create_schema_v2()?;
         if (1..8).contains(&stored_version) {
             self.migrate_v7_to_v8()?;
+        }
+        if stored_version < 9 {
+            self.migrate_v8_to_v9()?;
         }
         if (1..6).contains(&stored_version) {
             self.migrate_activity_role_names()?;
@@ -398,10 +460,25 @@ impl Database {
 
             CREATE TABLE IF NOT EXISTS worktrees (
                 work_item_id TEXT PRIMARY KEY REFERENCES work_items(id) ON DELETE CASCADE,
+                requested_base TEXT,
                 base_commit  TEXT NOT NULL,
                 branch       TEXT NOT NULL,
                 path         TEXT NOT NULL UNIQUE,
+                delivery_remote TEXT,
+                target_branch TEXT,
                 status       TEXT NOT NULL CHECK (status IN ('creating', 'ready')),
+                created_at   TEXT NOT NULL,
+                updated_at   TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS deliveries (
+                work_item_id TEXT PRIMARY KEY REFERENCES work_items(id) ON DELETE CASCADE,
+                status       TEXT NOT NULL CHECK (status IN (
+                    'pending', 'pushed', 'pull_request_created'
+                )),
+                final_head_commit TEXT NOT NULL,
+                pr_number    INTEGER,
+                pr_url       TEXT,
                 created_at   TEXT NOT NULL,
                 updated_at   TEXT NOT NULL
             );
@@ -469,9 +546,46 @@ impl Database {
         if result.is_err() {
             let _ = self.conn.execute_batch("ROLLBACK;");
         }
+
         let foreign_keys = self.conn.pragma_update(None, "foreign_keys", true);
         result?;
         foreign_keys?;
+        Ok(())
+    }
+
+    fn migrate_v8_to_v9(&self) -> Result<(), StoreError> {
+        // SQLite only gained conditional ADD COLUMN much later than the versions
+        // shipped with common platforms, so inspect first for idempotent recovery.
+        let mut columns = self.conn.prepare("PRAGMA table_info(worktrees)")?;
+        let names = columns
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(columns);
+        if !names.iter().any(|name| name == "requested_base") {
+            self.conn
+                .execute("ALTER TABLE worktrees ADD COLUMN requested_base TEXT", [])?;
+        }
+        if !names.iter().any(|name| name == "delivery_remote") {
+            self.conn
+                .execute("ALTER TABLE worktrees ADD COLUMN delivery_remote TEXT", [])?;
+        }
+        if !names.iter().any(|name| name == "target_branch") {
+            self.conn
+                .execute("ALTER TABLE worktrees ADD COLUMN target_branch TEXT", [])?;
+        }
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS deliveries (
+                work_item_id TEXT PRIMARY KEY REFERENCES work_items(id) ON DELETE CASCADE,
+                status TEXT NOT NULL CHECK (status IN ('pending', 'pushed', 'pull_request_created')),
+                final_head_commit TEXT NOT NULL,
+                pr_number INTEGER,
+                pr_url TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            "#,
+        )?;
         Ok(())
     }
 
@@ -742,6 +856,61 @@ impl Database {
         Ok(id)
     }
 
+    /// Atomically create a work item and reserve its immutable worktree intent.
+    ///
+    /// This transaction is deliberately completed before any Git mutation so a
+    /// crash can only leave a recoverable `creating` reservation, never a row
+    /// that might later select a different base or delivery destination.
+    pub(crate) fn create_work_item_with_worktree_intent(
+        &mut self,
+        repository_id: &RepositoryId,
+        intent: NewWorkItemWorktreeIntent<'_>,
+    ) -> Result<WorktreeRecord, StoreError> {
+        let path_text = intent
+            .path
+            .to_str()
+            .ok_or_else(|| StoreError::NonUtf8Path(intent.path.to_path_buf()))?;
+        let ts = now_millis();
+        let transaction = self.conn.transaction()?;
+        transaction.execute(
+            "INSERT INTO work_items (id, repository_id, slug, text, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params![
+                intent.id.as_str(),
+                repository_id.as_str(),
+                intent.slug,
+                intent.text,
+                ts
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO worktrees
+             (work_item_id, requested_base, base_commit, branch, path, delivery_remote, target_branch, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'creating', ?8, ?8)",
+            params![
+                intent.id.as_str(),
+                intent.start.requested_base,
+                intent.start.base_commit,
+                intent.branch,
+                path_text,
+                intent.start.delivery_remote,
+                intent.start.target_branch,
+                ts
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(WorktreeRecord {
+            work_item_id: intent.id,
+            requested_base: Some(intent.start.requested_base.clone()),
+            base_commit: intent.start.base_commit.clone(),
+            branch: intent.branch.to_string(),
+            path: intent.path.to_path_buf(),
+            delivery_remote: Some(intent.start.delivery_remote.clone()),
+            target_branch: Some(intent.start.target_branch.clone()),
+            ready: false,
+        })
+    }
+
     /// List work items for one repository, most recently active first.
     pub fn work_items(
         &self,
@@ -788,16 +957,19 @@ impl Database {
         work_item_id: &WorkItemId,
     ) -> Result<Option<WorktreeRecord>, StoreError> {
         match self.conn.query_row(
-            "SELECT base_commit, branch, path, status
+            "SELECT requested_base, base_commit, branch, path, delivery_remote, target_branch, status
              FROM worktrees WHERE work_item_id = ?1",
             params![work_item_id.as_str()],
             |row| {
                 Ok(WorktreeRecord {
                     work_item_id: work_item_id.clone(),
-                    base_commit: row.get(0)?,
-                    branch: row.get(1)?,
-                    path: std::path::PathBuf::from(row.get::<_, String>(2)?),
-                    ready: row.get::<_, String>(3)? == "ready",
+                    requested_base: row.get(0)?,
+                    base_commit: row.get(1)?,
+                    branch: row.get(2)?,
+                    path: std::path::PathBuf::from(row.get::<_, String>(3)?),
+                    delivery_remote: row.get(4)?,
+                    target_branch: row.get(5)?,
+                    ready: row.get::<_, String>(6)? == "ready",
                 })
             },
         ) {
@@ -821,15 +993,57 @@ impl Database {
         let ts = now_millis();
         self.conn.execute(
             "INSERT INTO worktrees
-             (work_item_id, base_commit, branch, path, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 'creating', ?5, ?5)",
+             (work_item_id, requested_base, base_commit, branch, path, delivery_remote, target_branch, status, created_at, updated_at)
+             VALUES (?1, 'HEAD', ?2, ?3, ?4, NULL, NULL, 'creating', ?5, ?5)",
             params![work_item_id.as_str(), base_commit, branch, path_text, ts],
         )?;
         Ok(WorktreeRecord {
             work_item_id: work_item_id.clone(),
+            requested_base: Some("HEAD".to_string()),
             base_commit: base_commit.to_string(),
             branch: branch.to_string(),
             path: path.to_path_buf(),
+            delivery_remote: None,
+            target_branch: None,
+            ready: false,
+        })
+    }
+
+    /// Persist source and delivery intent before creating a linked worktree.
+    pub fn reserve_worktree_with_delivery(
+        &mut self,
+        work_item_id: &WorkItemId,
+        start: &WorktreeStart,
+        branch: &str,
+        path: &Path,
+    ) -> Result<WorktreeRecord, StoreError> {
+        let path_text = path
+            .to_str()
+            .ok_or_else(|| StoreError::NonUtf8Path(path.to_path_buf()))?;
+        let ts = now_millis();
+        self.conn.execute(
+            "INSERT INTO worktrees
+             (work_item_id, requested_base, base_commit, branch, path, delivery_remote, target_branch, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'creating', ?8, ?8)",
+            params![
+                work_item_id.as_str(),
+                start.requested_base,
+                start.base_commit,
+                branch,
+                path_text,
+                start.delivery_remote,
+                start.target_branch,
+                ts
+            ],
+        )?;
+        Ok(WorktreeRecord {
+            work_item_id: work_item_id.clone(),
+            requested_base: Some(start.requested_base.clone()),
+            base_commit: start.base_commit.clone(),
+            branch: branch.to_string(),
+            path: path.to_path_buf(),
+            delivery_remote: Some(start.delivery_remote.clone()),
+            target_branch: Some(start.target_branch.clone()),
             ready: false,
         })
     }
@@ -905,6 +1119,122 @@ impl Store {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Read the delivery intent retained with this work item's worktree.
+    pub fn worktree(&self) -> Result<Option<WorktreeRecord>, StoreError> {
+        self.conn
+                .query_row(
+                    "SELECT requested_base, base_commit, branch, path, delivery_remote, target_branch, status
+                     FROM worktrees WHERE work_item_id = ?1",
+                    params![self.work_item_id.as_str()],
+                    |row| {
+                        Ok(WorktreeRecord {
+                            work_item_id: self.work_item_id.clone(),
+                            requested_base: row.get(0)?,
+                            base_commit: row.get(1)?,
+                            branch: row.get(2)?,
+                            path: std::path::PathBuf::from(row.get::<_, String>(3)?),
+                            delivery_remote: row.get(4)?,
+                            target_branch: row.get(5)?,
+                            ready: row.get::<_, String>(6)? == "ready",
+                        })
+                    },
+                )
+                .optional()
+                .map_err(StoreError::from)
+    }
+
+    /// Supply delivery metadata only for a migrated item whose legacy row lacks it.
+    pub fn fill_missing_delivery_settings(
+        &mut self,
+        remote: &str,
+        target: &str,
+    ) -> Result<(), StoreError> {
+        let updated = self.conn.execute(
+            "UPDATE worktrees
+                 SET delivery_remote = ?1, target_branch = ?2, updated_at = ?3
+                 WHERE work_item_id = ?4
+                   AND delivery_remote IS NULL AND target_branch IS NULL",
+            params![remote, target, now_millis(), self.work_item_id.as_str()],
+        )?;
+        if updated == 0 {
+            return Err(StoreError::DeliverySettingsAlreadyPersisted);
+        }
+        Ok(())
+    }
+
+    /// Reserve the final head before contacting Git or GitHub.
+    pub fn reserve_delivery(
+        &mut self,
+        final_head_commit: &str,
+    ) -> Result<DeliveryRecord, StoreError> {
+        let ts = now_millis();
+        self.conn.execute(
+            "INSERT INTO deliveries
+                 (work_item_id, status, final_head_commit, created_at, updated_at)
+                 VALUES (?1, 'pending', ?2, ?3, ?3)
+                 ON CONFLICT(work_item_id) DO NOTHING",
+            params![self.work_item_id.as_str(), final_head_commit, ts],
+        )?;
+        self.delivery()?
+            .ok_or_else(|| StoreError::WorkItemNotFound(self.work_item_id.clone()))
+    }
+
+    pub fn delivery(&self) -> Result<Option<DeliveryRecord>, StoreError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT status, final_head_commit, pr_number, pr_url, created_at, updated_at
+                 FROM deliveries WHERE work_item_id = ?1",
+                params![self.work_item_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(
+            |(status, final_head_commit, pr_number, pr_url, created_at, updated_at)| {
+                Ok(DeliveryRecord {
+                    status: DeliveryStatus::from_str(&status)
+                        .ok_or(StoreError::InvalidDeliveryStatus(status))?,
+                    final_head_commit,
+                    pr_number: pr_number.map(|value| value as u64),
+                    pr_url,
+                    created_at,
+                    updated_at,
+                })
+            },
+        )
+        .transpose()
+    }
+
+    pub fn mark_delivery_pushed(&mut self) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE deliveries SET status = 'pushed', updated_at = ?1 WHERE work_item_id = ?2",
+            params![now_millis(), self.work_item_id.as_str()],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_delivery_pull_request(&mut self, number: u64, url: &str) -> Result<(), StoreError> {
+        if number == 0 || url.trim().is_empty() {
+            return Err(StoreError::InvalidDeliveryHandoff);
+        }
+        self.conn.execute(
+            "UPDATE deliveries
+                 SET status = 'pull_request_created', pr_number = ?1, pr_url = ?2, updated_at = ?3
+                 WHERE work_item_id = ?4",
+            params![number as i64, url, now_millis(), self.work_item_id.as_str()],
+        )?;
+        Ok(())
     }
 
     pub fn record_transition(
@@ -1129,15 +1459,18 @@ impl Store {
         let worktree = self
             .conn
             .query_row(
-                "SELECT path, branch, base_commit, status
+                "SELECT path, branch, requested_base, base_commit, delivery_remote, target_branch, status
                  FROM worktrees WHERE work_item_id = ?1",
                 params![self.work_item_id.as_str()],
                 |row| {
                     Ok(WorkspaceSnapshot {
                         path: row.get(0)?,
                         branch: Some(row.get(1)?),
-                        base_commit: Some(row.get(2)?),
-                        ready: row.get::<_, String>(3)? == "ready",
+                        requested_base: row.get(2)?,
+                        base_commit: Some(row.get(3)?),
+                        delivery_remote: row.get(4)?,
+                        target_branch: row.get(5)?,
+                        ready: row.get::<_, String>(6)? == "ready",
                         head: None,
                         clean: None,
                     })
@@ -1147,7 +1480,10 @@ impl Store {
             .unwrap_or(WorkspaceSnapshot {
                 path: String::new(),
                 branch: None,
+                requested_base: None,
                 base_commit: None,
+                delivery_remote: None,
+                target_branch: None,
                 ready: false,
                 head: None,
                 clean: None,
@@ -1189,6 +1525,20 @@ impl Store {
         let execution = plan
             .as_ref()
             .and_then(|value| crate::ExecutionCapabilities::parse_plan(&value.0).ok());
+        let delivery = self.delivery()?.map_or(
+            DeliverySnapshot {
+                status: None,
+                final_head_commit: None,
+                pr_number: None,
+                pr_url: None,
+            },
+            |record| DeliverySnapshot {
+                status: Some(record.status.as_str().to_string()),
+                final_head_commit: Some(record.final_head_commit),
+                pr_number: record.pr_number,
+                pr_url: record.pr_url,
+            },
+        );
 
         let reference = repository_unique_reference(&self.conn, &WorkItemId(id.clone()))?;
         let session_id = id.clone();
@@ -1199,7 +1549,7 @@ impl Store {
             None
         };
         Ok(StatusSnapshot {
-            version: 6,
+            version: 7,
             identity: WorkItemIdentitySnapshot {
                 id,
                 reference: reference.clone(),
@@ -1228,6 +1578,7 @@ impl Store {
             errors,
             activities,
             workspace: worktree,
+            delivery,
         })
     }
 
@@ -1494,6 +1845,20 @@ impl Store {
         }
     }
 
+    pub fn latest_committed_implementation(&self) -> Result<Option<String>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT result_commit FROM implementation_rounds
+                     WHERE work_item_id = ?1 AND status = 'committed'
+                     ORDER BY iteration DESC LIMIT 1",
+                params![self.work_item_id.as_str()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+            .map(|value| value.flatten())
+    }
+
     pub fn latest_review(&self) -> Result<Option<(String, bool)>, StoreError> {
         match self.conn.query_row(
             "SELECT text, accepted FROM reviews
@@ -1700,6 +2065,7 @@ fn activity_kind_name(kind: ActivityKind) -> &'static str {
         ActivityKind::Convergence => "convergence",
         ActivityKind::ImplementationRound => "implementation_round",
         ActivityKind::Review => "review",
+        ActivityKind::Delivery => "delivery",
         ActivityKind::Artifact => "artifact",
         ActivityKind::Transition => "transition",
         ActivityKind::HumanIntervention => "human_intervention",
@@ -2170,6 +2536,46 @@ mod tests {
     }
 
     #[test]
+    fn persists_delivery_intent_and_idempotent_checkpoints() {
+        let mut db = Database::open_in_memory().unwrap();
+        let repository = register(&mut db, "/repo");
+        let work_item = db
+            .get_or_create_work_item(&repository.id, "delivery")
+            .unwrap();
+        db.reserve_worktree_with_delivery(
+            &work_item,
+            &WorktreeStart {
+                requested_base: "feature".to_string(),
+                base_commit: "base".to_string(),
+                delivery_remote: "origin".to_string(),
+                target_branch: "main".to_string(),
+            },
+            "quorum/delivery",
+            Path::new("/state/delivery/implementation"),
+        )
+        .unwrap();
+        let mut store = db.into_store(work_item).unwrap();
+        let reserved = store.reserve_delivery("final").unwrap();
+        assert_eq!(reserved.status, DeliveryStatus::Pending);
+        assert_eq!(store.reserve_delivery("final").unwrap(), reserved);
+        store.mark_delivery_pushed().unwrap();
+        store
+            .mark_delivery_pull_request(42, "https://github.test/owner/repo/pull/42")
+            .unwrap();
+        let delivery = store.delivery().unwrap().unwrap();
+        assert_eq!(delivery.status, DeliveryStatus::PullRequestCreated);
+        assert_eq!(delivery.pr_number, Some(42));
+        assert_eq!(
+            delivery.pr_url.as_deref(),
+            Some("https://github.test/owner/repo/pull/42")
+        );
+        let worktree = store.worktree().unwrap().unwrap();
+        assert_eq!(worktree.requested_base.as_deref(), Some("feature"));
+        assert_eq!(worktree.delivery_remote.as_deref(), Some("origin"));
+        assert_eq!(worktree.target_branch.as_deref(), Some("main"));
+    }
+
+    #[test]
     fn registration_is_idempotent_and_reactivation_keeps_identity() {
         let mut db = Database::open_in_memory().unwrap();
         let first = register(&mut db, "/repo");
@@ -2471,7 +2877,7 @@ mod tests {
 
         let reference = store.work_item_reference().unwrap();
         let snapshot = store.status_snapshot().unwrap();
-        assert_eq!(snapshot.version, 6);
+        assert_eq!(snapshot.version, 7);
         assert_eq!(snapshot.identity.id, work_item.as_str());
         assert_eq!(snapshot.identity.reference, reference);
         assert_eq!(snapshot.identity.label, "observable");

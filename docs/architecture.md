@@ -33,7 +33,7 @@ cli/                  # thin binary: parse args, call Core, render state
 
 | Layer | Owns | Does NOT own |
 |-------|------|--------------|
-| Core | State machine, agent orchestration, persistence, repository/worktree lifecycle, config load, GitHub + `copilot` invocation | Argument parsing, terminal rendering |
+| Core | State machine, agent orchestration, persistence, repository/worktree lifecycle, Coordinator-owned Git/GitHub delivery, config load, GitHub + `copilot` invocation | Argument parsing, terminal rendering |
 | CLI | One work item: start/resume, render live activity and status snapshots | Any business logic; multi-work-item orchestration |
 | Tauri (future) | Windowing, launching a terminal for human intervention | Any logic not already in Core |
 
@@ -45,5 +45,8 @@ cli/                  # thin binary: parse args, call Core, render state
 - **Registered context**: every work item is scoped to an allow-listed Git repository.
 - **Typed observability**: Core emits and persists structured activity; frontends only
   choose how to render it.
+- **Coordinator-only delivery**: agents cannot push or create pull requests; Core hands
+  accepted work off through the explicitly selected GitHub remote without merging or
+  enabling auto-merge.
 
 See [glossary](glossary.md) for terms, [state-machine](state-machine.md) for the Core's control flow.
