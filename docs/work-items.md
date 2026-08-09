@@ -17,6 +17,9 @@ Start a new work item with `quorum work-item start <file.md>`. Every invocation 
 a new independent UUID, while the filename stem becomes a non-unique display label.
 Use `quorum work-item resume <uuid-or-prefix>` after an interrupted autonomous run;
 resume does not require or re-read the original Markdown file.
+Short prefixes are convenient interactive references; use the full UUID anywhere the
+reference must remain durable because a future work item can make an old prefix
+ambiguous.
 
 ## Images
 

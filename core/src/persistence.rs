@@ -1918,7 +1918,28 @@ mod tests {
              );
              INSERT INTO work_items
                  (id, repository_id, slug, text, created_at, updated_at)
-             VALUES ('aaaaaaaa-1111-4111-8111-111111111111', 'repo', 'same', '# One', '1', '1');",
+             VALUES ('aaaaaaaa-1111-4111-8111-111111111111', 'repo', 'same', '# One', '1', '1');
+             CREATE TABLE states (
+                 work_item_id TEXT PRIMARY KEY REFERENCES work_items(id) ON DELETE CASCADE,
+                 state TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+             );
+             INSERT INTO states (work_item_id, state, updated_at)
+             VALUES ('aaaaaaaa-1111-4111-8111-111111111111', 'PlanReview', '1');
+             CREATE TABLE sessions (
+                 work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                 state TEXT NOT NULL,
+                 session_name TEXT NOT NULL,
+                 ts TEXT NOT NULL,
+                 PRIMARY KEY (work_item_id, state)
+             );
+             INSERT INTO sessions (work_item_id, state, session_name, ts)
+             VALUES (
+                 'aaaaaaaa-1111-4111-8111-111111111111',
+                 'PlanReview',
+                 'quorum/same/PlanReview',
+                 '1'
+             );",
         )
         .unwrap();
         drop(conn);
@@ -1934,6 +1955,23 @@ mod tests {
         assert_ne!(second.as_str(), "aaaaaaaa-1111-4111-8111-111111111111");
         assert_eq!(db.work_items(&repository.id).unwrap().len(), 2);
         assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        let foreign_key_errors: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_errors, 0);
+        let store = db
+            .into_store(WorkItemId(
+                "aaaaaaaa-1111-4111-8111-111111111111".to_string(),
+            ))
+            .unwrap();
+        assert_eq!(store.current_state().unwrap(), Some(State::PlanReview));
+        assert_eq!(
+            store.session(State::PlanReview).unwrap().as_deref(),
+            Some("quorum/same/PlanReview")
+        );
     }
 
     #[test]
