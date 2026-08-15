@@ -17,7 +17,8 @@ This makes the right Session trivial to find and resume for a given block.
 
 ## CLI behavior
 
-When a work item enters a blocked state, the CLI:
+The CLI is the current reference driver; the Tauri UX drives the same Core session name
+via the [frontend contract](frontend.md). When a work item enters a blocked state, the CLI:
 
 1. Prints the current state and why it is blocked.
 2. Records the deterministic session name (see above) and surfaces it, with the

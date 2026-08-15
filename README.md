@@ -19,3 +19,11 @@ Where does the name come from? I believe all models will eventually converge, an
 ## Documentation
 
 The Core and CLI are specified under [`docs/`](docs/README.md).
+
+## Status
+
+The **Core** (`quorum-core`) is implemented and unit-tested — it owns all of Quorum's
+logic. The **CLI** is a thin **reference driver** used to exercise the Core while the
+real human frontend, a **Tauri v2 UX**, is built on the same Core; the CLI will be retired
+once the UX reaches parity. Frontends drive the Core through a single
+[contract](docs/frontend.md) and contain no logic of their own.

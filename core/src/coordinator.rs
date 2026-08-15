@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::agent::{AgentError, AgentRequest, AgentRole, AgentRunner, Filesystem};
+use crate::cancel::CancelToken;
 use crate::capabilities::{CapabilityError, ExecutionCapabilities};
 use crate::config::Config;
 use crate::convergence;
@@ -46,6 +47,8 @@ pub enum CoordinatorError {
     NoImplementation,
     #[error("cannot {decision} in state {state} (not an applicable human-intervention state)")]
     InvalidResolution { state: State, decision: Decision },
+    #[error("cancelled")]
+    Cancelled,
 }
 
 /// A human's decision to resolve a blocked state (see `docs/agents.md`).
@@ -101,6 +104,8 @@ pub struct Coordinator {
     work_item_session_id: String,
     /// A session already assigned to the state loaded at startup.
     persisted_session: Option<(State, String)>,
+    /// Cooperative cancellation shared with the caller.
+    cancel: CancelToken,
     state: State,
 }
 
@@ -136,6 +141,7 @@ impl Coordinator {
             work_item_label: work_item_label.into(),
             work_item_session_id,
             persisted_session,
+            cancel: CancelToken::new(),
             state,
         })
     }
@@ -155,6 +161,20 @@ impl Coordinator {
     pub fn with_observer(mut self, observer: Box<dyn ActivityObserver>) -> Coordinator {
         self.observer = observer;
         self
+    }
+
+    /// Install a cancellation token the caller can flip to request a graceful,
+    /// state-preserving stop. See [`CancelToken`].
+    pub fn with_cancel_token(mut self, cancel: CancelToken) -> Coordinator {
+        self.cancel = cancel;
+        self
+    }
+
+    /// A clone of the Coordinator's cancellation handle. A frontend can call
+    /// [`CancelToken::cancel`] on it to stop `run_until_blocked` between steps
+    /// and interrupt an in-flight agent run.
+    pub fn cancel_token(&self) -> CancelToken {
+        self.cancel.clone()
     }
 
     /// The current state of the work item.
@@ -864,6 +884,9 @@ impl Coordinator {
         let attempts = self.config.limits.step_retries.saturating_add(1);
         let mut last: Option<AgentError> = None;
         for attempt in 1..=attempts {
+            if self.cancel.is_cancelled() {
+                return Err(CoordinatorError::Cancelled);
+            }
             let mut started =
                 ActivityEvent::new(ActivityKind::AgentStarted, format!("{} started", req.role))
                     .phase(self.state)
@@ -875,7 +898,7 @@ impl Coordinator {
             }
             self.record_activity(started);
             let start = Instant::now();
-            match self.runner.run(req) {
+            match self.runner.run(req, &self.cancel) {
                 Ok(output) => {
                     let mut completed = ActivityEvent::new(
                         ActivityKind::AgentCompleted,
@@ -893,6 +916,12 @@ impl Coordinator {
                     return Ok(output);
                 }
                 Err(error) => {
+                    // Cancellation is a caller-requested stop, not an agent
+                    // failure: propagate it without recording a failure or
+                    // retrying, leaving the persisted state untouched.
+                    if matches!(error, AgentError::Cancelled { .. }) {
+                        return Err(CoordinatorError::Cancelled);
+                    }
                     let final_attempt = attempt == attempts || !agent_error_is_retryable(&error);
                     let mut failed = ActivityEvent::new(
                         if final_attempt {
@@ -936,6 +965,9 @@ impl Coordinator {
     /// aborting the process — the Coordinator runs unattended.
     /// Store (database) errors are not recoverable and propagate.
     pub fn step(&mut self) -> Result<State, CoordinatorError> {
+        if self.cancel.is_cancelled() {
+            return Err(CoordinatorError::Cancelled);
+        }
         if self.state.is_blocked() || self.state.is_terminal() {
             return Ok(self.state);
         }
@@ -952,7 +984,8 @@ impl Coordinator {
                 self.transition_to(next, &reason)
             }
             // Database failures are fundamental — do not mask them as Failed.
-            Err(e @ CoordinatorError::Store(_)) => Err(e),
+            // Cancellation is a caller-requested stop — surface it verbatim.
+            Err(e @ (CoordinatorError::Store(_) | CoordinatorError::Cancelled)) => Err(e),
             Err(cause) => self.fail(&cause.to_string()),
         }
     }
@@ -1063,6 +1096,9 @@ impl Coordinator {
     /// the human can resume it (see `docs/sessions.md`).
     pub fn run_until_blocked(&mut self) -> Result<State, CoordinatorError> {
         loop {
+            if self.cancel.is_cancelled() {
+                return Err(CoordinatorError::Cancelled);
+            }
             let before = self.state;
             let after = self.step()?;
             if after == before {
@@ -1376,7 +1412,7 @@ mod tests {
     }
 
     impl AgentRunner for IteratingRunner {
-        fn run(&self, req: &AgentRequest) -> Result<String, AgentError> {
+        fn run(&self, req: &AgentRequest, _cancel: &CancelToken) -> Result<String, AgentError> {
             if matches!(req.role, AgentRole::IntakePlanner { .. }) {
                 return Ok("NONE".to_string());
             }
@@ -1574,7 +1610,7 @@ mod tests {
     }
 
     impl AgentRunner for ReviewRunner {
-        fn run(&self, req: &AgentRequest) -> Result<String, AgentError> {
+        fn run(&self, req: &AgentRequest, _cancel: &CancelToken) -> Result<String, AgentError> {
             if matches!(req.role, AgentRole::IntakePlanner { .. }) {
                 Ok("NONE".to_string())
             } else if req.role == AgentRole::CoordinatorMerge {
@@ -1638,7 +1674,7 @@ mod tests {
     }
 
     impl AgentRunner for FailingRunner {
-        fn run(&self, req: &AgentRequest) -> Result<String, AgentError> {
+        fn run(&self, req: &AgentRequest, _cancel: &CancelToken) -> Result<String, AgentError> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if n < self.fail_times {
                 Err(AgentError::NonZeroExit {
@@ -1647,7 +1683,7 @@ mod tests {
                     stderr: "boom".to_string(),
                 })
             } else {
-                EchoRunner.run(req)
+                EchoRunner.run(req, _cancel)
             }
         }
     }
@@ -1665,6 +1701,45 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 4);
         // The cause was recorded.
         assert!(co.store.count_events_of_kind("error").unwrap() >= 1);
+    }
+
+    struct CancellingRunner;
+
+    impl AgentRunner for CancellingRunner {
+        fn run(&self, req: &AgentRequest, _cancel: &CancelToken) -> Result<String, AgentError> {
+            Err(AgentError::Cancelled {
+                role: req.role.to_string(),
+            })
+        }
+    }
+
+    #[test]
+    fn a_cancelled_token_stops_run_until_blocked_without_failing() {
+        let config = Config::default();
+        let cancel = CancelToken::new();
+        let mut co =
+            coordinator_with_runner(config, Box::new(EchoRunner)).with_cancel_token(cancel.clone());
+        let before = co.state();
+        cancel.cancel();
+        assert!(matches!(
+            co.run_until_blocked(),
+            Err(CoordinatorError::Cancelled)
+        ));
+        // State is untouched, so the work item can be resumed later.
+        assert_eq!(co.state(), before);
+        assert_ne!(co.state(), State::Failed);
+    }
+
+    #[test]
+    fn agent_cancellation_surfaces_as_cancelled_not_failed() {
+        let config = Config::default();
+        let mut co = coordinator_with_runner(config, Box::new(CancellingRunner));
+        assert!(matches!(
+            co.run_until_blocked(),
+            Err(CoordinatorError::Cancelled)
+        ));
+        // A cancelled agent run is a stop, not a failure.
+        assert_ne!(co.state(), State::Failed);
     }
 
     #[test]
@@ -1738,7 +1813,7 @@ mod tests {
     }
 
     impl AgentRunner for IntakeRunner {
-        fn run(&self, req: &AgentRequest) -> Result<String, AgentError> {
+        fn run(&self, req: &AgentRequest, _cancel: &CancelToken) -> Result<String, AgentError> {
             if matches!(req.role, AgentRole::IntakePlanner { .. }) {
                 if self.needs_answers.load(Ordering::SeqCst) {
                     Ok("1. Please clarify the scope?".to_string())
@@ -1746,7 +1821,7 @@ mod tests {
                     Ok("NONE".to_string())
                 }
             } else {
-                EchoRunner.run(req)
+                EchoRunner.run(req, _cancel)
             }
         }
     }
@@ -1905,7 +1980,11 @@ mod tests {
         struct CountingRunner(Arc<AtomicUsize>);
 
         impl AgentRunner for CountingRunner {
-            fn run(&self, _req: &AgentRequest) -> Result<String, AgentError> {
+            fn run(
+                &self,
+                _req: &AgentRequest,
+                _cancel: &CancelToken,
+            ) -> Result<String, AgentError> {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Ok("unexpected".to_string())
             }

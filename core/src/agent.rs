@@ -4,6 +4,7 @@
 //! sandbox. The [`AgentRunner`] trait abstracts the invocation so tests and the
 //! `--dry-run` path can substitute a fake without spawning any process.
 
+use crate::cancel::CancelToken;
 use crate::config::Sandbox;
 use crate::{BrowserCapability, ExecutionCapabilities, LocalServerCapability};
 use serde_json::json;
@@ -13,7 +14,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wait_timeout::ChildExt;
 
 #[cfg(unix)]
@@ -21,6 +22,8 @@ use std::os::unix::process::CommandExt;
 
 const OUTPUT_LIMIT_BYTES: usize = 1024 * 1024;
 const CLEANUP_GRACE: Duration = Duration::from_millis(250);
+/// How often a running agent is polled for a cancellation request.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Filesystem posture for a sandboxed agent (see `docs/isolation.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,11 +119,16 @@ pub enum AgentError {
     },
     #[error("refusing to run {role} without the local sandbox")]
     SandboxDisabled { role: String },
+    #[error("agent for {role} was cancelled")]
+    Cancelled { role: String },
 }
 
 /// Runs an agent and returns its captured stdout.
+///
+/// The `cancel` token lets a caller request a graceful stop; a runner should
+/// terminate any in-flight process and return [`AgentError::Cancelled`] promptly.
 pub trait AgentRunner: Send + Sync {
-    fn run(&self, req: &AgentRequest) -> Result<String, AgentError>;
+    fn run(&self, req: &AgentRequest, cancel: &CancelToken) -> Result<String, AgentError>;
 }
 
 /// Real runner: invokes the `copilot` CLI, sandboxed and non-interactive.
@@ -421,9 +429,14 @@ impl CopilotRunner {
 }
 
 impl AgentRunner for CopilotRunner {
-    fn run(&self, req: &AgentRequest) -> Result<String, AgentError> {
+    fn run(&self, req: &AgentRequest, cancel: &CancelToken) -> Result<String, AgentError> {
         if !self.sandbox.enabled {
             return Err(AgentError::SandboxDisabled {
+                role: req.role.to_string(),
+            });
+        }
+        if cancel.is_cancelled() {
+            return Err(AgentError::Cancelled {
                 role: req.role.to_string(),
             });
         }
@@ -458,38 +471,52 @@ impl AgentRunner for CopilotRunner {
             .map(|grant| Duration::from_secs(grant.timeout_seconds()))
             .map(|requested| requested.min(self.timeout))
             .unwrap_or(self.timeout);
-        let status = match child.wait_timeout(timeout) {
-            Ok(status) => status,
-            Err(source) => {
-                terminate_process_tree(&mut child);
-                self.cleanup_copilot_home();
-                return Err(AgentError::Spawn {
-                    role: req.role.to_string(),
-                    source,
-                });
+        // Poll in small slices so a cancellation request interrupts a long run
+        // instead of waiting for the whole timeout. Track elapsed time rather
+        // than an absolute deadline so an unbounded configured timeout cannot
+        // overflow `Instant` arithmetic.
+        let start = Instant::now();
+        let mut cancelled = false;
+        let mut spawn_error = None;
+        let status = loop {
+            if cancel.is_cancelled() {
+                cancelled = true;
+                break None;
+            }
+            let remaining = match timeout.checked_sub(start.elapsed()) {
+                Some(remaining) if !remaining.is_zero() => remaining,
+                // Elapsed >= timeout: timed out.
+                _ => break None,
+            };
+            let slice = remaining.min(POLL_INTERVAL);
+            match child.wait_timeout(slice) {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) => continue,
+                Err(source) => {
+                    spawn_error = Some(source);
+                    break None;
+                }
             }
         };
-        let timed_out = status.is_none();
-        if timed_out {
-            terminate_process_tree(&mut child);
-        }
-        let status = match status {
-            Some(status) => status,
-            None => match child.wait() {
-                Ok(status) => status,
-                Err(source) => {
-                    self.cleanup_copilot_home();
-                    return Err(AgentError::Spawn {
-                        role: req.role.to_string(),
-                        source,
-                    });
-                }
-            },
-        };
+        let timed_out = status.is_none() && !cancelled && spawn_error.is_none();
+        // Always terminate and reap the child, and join the reader threads, so
+        // no process or thread is leaked on any exit path.
         terminate_process_tree(&mut child);
+        let _ = child.wait();
         let stdout = join_output(stdout_reader);
         let stderr = join_output(stderr_reader);
         self.cleanup_copilot_home();
+        if let Some(source) = spawn_error {
+            return Err(AgentError::Spawn {
+                role: req.role.to_string(),
+                source,
+            });
+        }
+        if cancelled {
+            return Err(AgentError::Cancelled {
+                role: req.role.to_string(),
+            });
+        }
         if timed_out {
             return Err(AgentError::Timeout {
                 role: req.role.to_string(),
@@ -497,6 +524,7 @@ impl AgentRunner for CopilotRunner {
                 stderr,
             });
         }
+        let status = status.expect("status present when neither cancelled nor timed out");
         if !status.success() {
             return Err(AgentError::NonZeroExit {
                 role: req.role.to_string(),
@@ -629,7 +657,7 @@ fn policy_path(path: &std::path::Path) -> String {
 pub struct EchoRunner;
 
 impl AgentRunner for EchoRunner {
-    fn run(&self, req: &AgentRequest) -> Result<String, AgentError> {
+    fn run(&self, req: &AgentRequest, _cancel: &CancelToken) -> Result<String, AgentError> {
         // Intake-questions asks whether clarification is needed; the stub never
         // has questions, so it returns NONE (no blocking under --dry-run).
         if matches!(req.role, AgentRole::IntakePlanner { .. }) {
@@ -789,7 +817,7 @@ mod tests {
 
     #[test]
     fn echo_runner_returns_stub() {
-        let out = EchoRunner.run(&req()).unwrap();
+        let out = EchoRunner.run(&req(), &CancelToken::new()).unwrap();
         assert!(out.contains("Dry-run stub"));
         assert!(out.contains("Planner:planner-a"));
     }
@@ -989,9 +1017,58 @@ mod tests {
             temp.path().join("runtime"),
         );
         runner.program = script.display().to_string();
-        let error = runner.run(&req()).unwrap_err();
+        let error = runner.run(&req(), &CancelToken::new()).unwrap_err();
         assert!(matches!(error, AgentError::Timeout { .. }));
         std::thread::sleep(Duration::from_secs(1));
         assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runner_cancels_a_running_agent_promptly() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("fake-copilot");
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut runner = CopilotRunner::new(
+            Sandbox {
+                browser: crate::config::Browser {
+                    enabled: false,
+                    ..crate::config::Browser::default()
+                },
+                ..Sandbox::default()
+            },
+            Duration::from_secs(30),
+            temp.path().join("runtime"),
+        );
+        runner.program = script.display().to_string();
+        let cancel = CancelToken::new();
+        let flipper = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            flipper.cancel();
+        });
+        let start = Instant::now();
+        let error = runner.run(&req(), &cancel).unwrap_err();
+        // Returned via cancellation, well before the 30s timeout would fire.
+        assert!(matches!(error, AgentError::Cancelled { .. }));
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runner_declines_a_pre_cancelled_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = CopilotRunner::new(
+            Sandbox::default(),
+            Duration::from_secs(1),
+            temp.path().join("runtime"),
+        );
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let error = runner.run(&req(), &cancel).unwrap_err();
+        assert!(matches!(error, AgentError::Cancelled { .. }));
     }
 }
