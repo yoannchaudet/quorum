@@ -231,15 +231,18 @@ impl Config {
         }
         let yaml = serde_yaml::to_string(self)?;
         // Write to a sibling temp file in the same directory (so the rename is
-        // atomic on the same filesystem), then swap it into place.
+        // atomic on the same filesystem), then swap it into place. The name is
+        // unique per write so two concurrent savers cannot clobber each other's
+        // temp file and rename a half-written config into place.
         let dir = parent
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
         let temp = dir.join(format!(
-            ".{}.tmp",
+            ".{}.{}.tmp",
             path.file_name()
                 .and_then(|name| name.to_str())
-                .unwrap_or("config.yaml")
+                .unwrap_or("config.yaml"),
+            uuid::Uuid::new_v4()
         ));
         let write_err = |source: std::io::Error, at: &Path| ConfigError::Write {
             path: at.to_path_buf(),
@@ -258,6 +261,18 @@ impl Config {
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".quorum")
             .join("config.yaml")
+    }
+
+    /// Load from [`Config::default_path`]. Frontends use this instead of deriving the
+    /// path themselves, so the Core stays the single owner of where config lives.
+    pub fn load_default() -> Result<Config, ConfigError> {
+        Config::load(&Config::default_path())
+    }
+
+    /// Persist to [`Config::default_path`]. Validates before writing, exactly like
+    /// [`Config::save`].
+    pub fn save_default(&self) -> Result<(), ConfigError> {
+        self.save(&Config::default_path())
     }
 
     /// Validate cross-field invariants. Only checks constraints that must hold
@@ -373,6 +388,35 @@ mod tests {
         let path = dir.path().join("config.yaml");
         std::fs::write(&path, "limits:\n  adversarial_max_iters: 0\n").unwrap();
         assert!(Config::load(&path).is_err());
+    }
+
+    #[test]
+    fn concurrent_saves_leave_a_valid_config_and_no_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        // Two writers racing on the same file must not rename a half-written temp
+        // into place, nor leave temp files behind.
+        std::thread::scope(|scope| {
+            for retries in [7_u32, 9] {
+                let path = path.clone();
+                scope.spawn(move || {
+                    for _ in 0..25 {
+                        let mut config = Config::default();
+                        config.limits.step_retries = retries;
+                        config.save(&path).unwrap();
+                    }
+                });
+            }
+        });
+        let reloaded = Config::load(&path).unwrap();
+        assert!([7, 9].contains(&reloaded.limits.step_retries));
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "left temp files behind: {leftovers:?}");
     }
 
     #[test]

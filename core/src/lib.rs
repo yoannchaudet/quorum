@@ -10,6 +10,7 @@ pub mod config;
 pub mod convergence;
 pub mod coordinator;
 pub mod delivery;
+pub mod models;
 pub mod observability;
 pub mod persistence;
 pub mod prompt;
@@ -27,6 +28,7 @@ pub use coordinator::{Coordinator, Decision};
 pub use delivery::{
     DeliveryBackend, DeliveryError, DryRunDelivery, GitHubDelivery, GitHubRepository, PullRequest,
 };
+pub use models::{available_models, ModelsError};
 pub use observability::{
     channel_observer, ActivityEvent, ActivityKind, ActivityObserver, ArtifactSnapshot,
     CallbackObserver, ImplementationDocument, NoopActivityObserver, PlanDocument, StatusSnapshot,

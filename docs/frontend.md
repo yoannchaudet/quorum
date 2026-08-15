@@ -55,3 +55,16 @@ state is untouched, so the work item resumes cleanly.
 `Config::load(path)` reads `~/.quorum/config.yaml` (missing file → defaults). A frontend
 that edits config persists it with `Config::save(path)`, which validates before writing
 and creates parent directories.
+
+Frontends editing the user's own config use the path-free pair instead, so the Core stays
+the single owner of *where* config lives:
+
+| Concern | Core entry point |
+|---|---|
+| Read `~/.quorum/config.yaml` | `Config::load_default` |
+| Write it back (validating first) | `Config::save_default` |
+| Model ids the local `copilot` CLI can run | `available_models` |
+
+`available_models` shells out to `copilot help config` and parses the ids it advertises,
+so a model picker always offers what this machine can actually run rather than a
+hardcoded list. A frontend must not hardcode model ids.
