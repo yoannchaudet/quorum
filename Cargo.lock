@@ -2837,6 +2837,7 @@ dependencies = [
 name = "quorum-app"
 version = "0.1.0"
 dependencies = [
+ "quorum-core",
  "serde",
  "serde_json",
  "tauri",

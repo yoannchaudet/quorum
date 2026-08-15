@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import Settings from "./Settings";
 import "./App.css";
 
 function App() {
@@ -41,6 +42,21 @@ function App() {
             </div>
           ))}
         </div>
+        <div className="px-4 pb-2 text-xs font-semibold text-slate-500 uppercase tracking-wider pointer-events-none mt-6">
+          System
+        </div>
+        <div className="">
+          <div
+            onClick={() => setSelectedProject("settings")}
+            className={`px-4 py-2 mx-2 rounded-md cursor-default text-sm ${
+              selectedProject === "settings"
+                ? "bg-blue-500 text-white"
+                : "text-slate-700 hover:bg-slate-200"
+            }`}
+          >
+            Settings
+          </div>
+        </div>
         <div className="p-4 border-t border-slate-200">
           <button className="w-full text-left text-sm text-slate-500 hover:text-slate-800 cursor-default">
             + Add Project
@@ -52,7 +68,7 @@ function App() {
       <div className="flex-1 flex flex-col bg-white">
         {/* Header */}
         <header
-          className="h-14 border-b border-slate-200 flex items-center px-6 pt-4"
+          className="h-14 border-b border-slate-200 flex items-center px-6"
           onPointerDown={(e) => {
             console.log("Header pointer down", e.target, e.currentTarget);
             if (e.target === e.currentTarget) {
@@ -62,7 +78,9 @@ function App() {
           }}
         >
           <h1 className="text-lg font-medium text-slate-800 pointer-events-none">
-            {selectedProject
+          {selectedProject === "settings"
+              ? "Settings"
+              : selectedProject
               ? projects.find((p) => p.id === selectedProject)?.name
               : "Select a project"}
           </h1>
@@ -70,7 +88,9 @@ function App() {
 
         {/* Content Area */}
         <main className="flex-1 p-6 overflow-y-auto">
-          {selectedProject ? (
+          {selectedProject === "settings" ? (
+            <Settings />
+          ) : selectedProject ? (
             <div className="max-w-3xl mx-auto">
               <h2 className="text-2xl font-semibold mb-4">Plan Work</h2>
               <div className="bg-slate-50 border border-slate-200 rounded-lg p-6">
