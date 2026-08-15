@@ -1,6 +1,8 @@
 # Quorum Documentation
 
-Specifications for Quorum's **Core** and **CLI**. Design-on-paper; no code yet.
+Specifications for Quorum's **Core** and **CLI**. The Core is implemented (Rust
+`quorum-core` crate, unit-tested); the CLI is a thin **reference driver** used to
+exercise the Core and will be superseded by the Tauri UX.
 
 ## Reading order
 
@@ -18,6 +20,7 @@ Specifications for Quorum's **Core** and **CLI**. Design-on-paper; no code yet.
 12. [persistence.md](persistence.md) — crash resilience and recovery.
 13. [observability.md](observability.md) — live progress and rich work-item status.
 14. [dev-lifecycle.md](dev-lifecycle.md) — Makefile: `verify` / `verify-full`.
+15. [frontend.md](frontend.md) — the Core API contract a frontend (CLI or UX) drives.
 
 ## Doc style rules
 
@@ -28,5 +31,7 @@ Specifications for Quorum's **Core** and **CLI**. Design-on-paper; no code yet.
 
 ## Scope
 
-Core + CLI only. The Tauri v2 UX is future sugar over the Core and is referenced, not
-specified, here.
+Core + CLI. The Core is the real product; the CLI is a **reference driver**. The Tauri
+v2 UX is the intended human frontend — it reuses the same Core (see
+[frontend.md](frontend.md)) and replaces the CLI. UX windowing details are referenced,
+not specified, here.

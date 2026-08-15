@@ -1,5 +1,9 @@
 # Command Line Interface
 
+> The CLI is a **reference driver** over the Core (see [architecture.md](architecture.md)
+> and [frontend.md](frontend.md)); the Tauri UX exposes the same Core operations. It will
+> be retired once the UX reaches parity.
+
 Quorum uses noun-based command groups. Work-item commands resolve a full UUID or a
 unique UUID prefix within the repository selected by `--context` or the current
 directory.

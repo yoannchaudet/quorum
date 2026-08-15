@@ -4,6 +4,7 @@
 //! future Tauri UX) are thin drivers over this crate.
 
 pub mod agent;
+pub mod cancel;
 pub mod capabilities;
 pub mod config;
 pub mod convergence;
@@ -16,7 +17,8 @@ pub mod repository;
 pub mod state;
 pub mod worktree;
 
-pub use agent::{AgentRole, AgentRunner, CopilotRunner, EchoRunner};
+pub use agent::{AgentError, AgentRole, AgentRunner, CopilotRunner, EchoRunner};
+pub use cancel::CancelToken;
 pub use capabilities::{
     BrowserCapability, CapabilityError, ExecutionCapabilities, LocalServerCapability,
 };
@@ -26,8 +28,8 @@ pub use delivery::{
     DeliveryBackend, DeliveryError, DryRunDelivery, GitHubDelivery, GitHubRepository, PullRequest,
 };
 pub use observability::{
-    ActivityEvent, ActivityKind, ActivityObserver, ArtifactSnapshot, ImplementationDocument,
-    NoopActivityObserver, PlanDocument, StatusSnapshot,
+    channel_observer, ActivityEvent, ActivityKind, ActivityObserver, ArtifactSnapshot,
+    CallbackObserver, ImplementationDocument, NoopActivityObserver, PlanDocument, StatusSnapshot,
 };
 pub use persistence::{
     Artifact, Database, DeliveryRecord, DeliveryStatus, ImplementationRound,

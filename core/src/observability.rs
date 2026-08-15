@@ -108,6 +108,48 @@ impl ActivityObserver for NoopActivityObserver {
     fn on_activity(&self, _event: &ActivityEvent) {}
 }
 
+/// An [`ActivityObserver`] that forwards each event to a caller-supplied closure.
+///
+/// A frontend uses this to bridge Core activity onto its own transport — a
+/// channel, a Tauri event emit, a log sink — without implementing the trait by
+/// hand. The closure must be `Send + Sync` because Core may record activity from
+/// worker threads.
+pub struct CallbackObserver<F: Fn(&ActivityEvent) + Send + Sync> {
+    callback: F,
+}
+
+impl<F: Fn(&ActivityEvent) + Send + Sync> CallbackObserver<F> {
+    pub fn new(callback: F) -> CallbackObserver<F> {
+        CallbackObserver { callback }
+    }
+}
+
+impl<F: Fn(&ActivityEvent) + Send + Sync> ActivityObserver for CallbackObserver<F> {
+    fn on_activity(&self, event: &ActivityEvent) {
+        (self.callback)(event);
+    }
+}
+
+/// A ready-made streaming observer: returns a boxed observer plus the receiving
+/// end of a channel. A frontend runs `run_until_blocked` on a worker thread with
+/// the observer installed and drains the [`Receiver`] to drive live UI. The send
+/// is best-effort; once the receiver is dropped, events are silently discarded.
+///
+/// [`Receiver`]: std::sync::mpsc::Receiver
+pub fn channel_observer() -> (
+    Box<dyn ActivityObserver>,
+    std::sync::mpsc::Receiver<ActivityEvent>,
+) {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let sender = std::sync::Mutex::new(sender);
+    let observer = CallbackObserver::new(move |event: &ActivityEvent| {
+        if let Ok(sender) = sender.lock() {
+            let _ = sender.send(event.clone());
+        }
+    });
+    (Box::new(observer), receiver)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkItemIdentitySnapshot {
     pub id: String,

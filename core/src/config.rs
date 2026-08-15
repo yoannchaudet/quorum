@@ -93,6 +93,11 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("failed to write config file {path}: {source}")]
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("failed to parse config: {0}")]
     Parse(#[from] serde_yaml::Error),
     #[error("invalid config: {0}")]
@@ -208,6 +213,45 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Persist this config to `path` as YAML, creating parent directories as
+    /// needed. Validates first so an invalid config is never written, and writes
+    /// atomically (temp file + rename) so a failed write cannot truncate or
+    /// corrupt an existing valid config. A future UX uses this to save user edits
+    /// to `~/.quorum/config.yaml`.
+    pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
+        self.validate()?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
+        if let Some(parent) = parent {
+            std::fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let yaml = serde_yaml::to_string(self)?;
+        // Write to a sibling temp file in the same directory (so the rename is
+        // atomic on the same filesystem), then swap it into place.
+        let dir = parent
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let temp = dir.join(format!(
+            ".{}.tmp",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("config.yaml")
+        ));
+        let write_err = |source: std::io::Error, at: &Path| ConfigError::Write {
+            path: at.to_path_buf(),
+            source,
+        };
+        std::fs::write(&temp, yaml).map_err(|source| write_err(source, &temp))?;
+        std::fs::rename(&temp, path).map_err(|source| {
+            let _ = std::fs::remove_file(&temp);
+            write_err(source, path)
+        })
+    }
+
     /// The default config file path (`~/.quorum/config.yaml`).
     pub fn default_path() -> PathBuf {
         home_dir()
@@ -281,6 +325,18 @@ mod tests {
     fn missing_file_yields_defaults() {
         let c = Config::load(Path::new("/does/not/exist.yaml")).unwrap();
         assert_eq!(c, Config::default());
+    }
+
+    #[test]
+    fn save_then_load_roundtrips_and_creates_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("config.yaml");
+        let mut original = Config::default();
+        original.limits.step_retries = 7;
+        original.save(&path).unwrap();
+        assert!(path.exists());
+        let reloaded = Config::load(&path).unwrap();
+        assert_eq!(reloaded, original);
     }
 
     #[test]
