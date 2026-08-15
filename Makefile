@@ -1,10 +1,13 @@
-.PHONY: verify verify-full fmt clippy build
+.PHONY: verify verify-full fmt clippy build test-fast test-slow
 
-verify: fmt clippy
-	cargo test --locked --workspace --lib --bins
+test-fast:
+	cd app && npm run test
+	cargo test --workspace --lib --bins
 
-verify-full: verify build
+test-slow: verify build
 	cargo test --locked --workspace --test '*'
+
+verify: fmt clippy test-fast
 
 fmt:
 	cargo fmt --all --check
