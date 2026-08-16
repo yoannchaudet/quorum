@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Install the Quorum skill into the user-scoped Copilot skills directory.
+#
+#   script/install            symlink (default) — edits in this repo take effect live
+#   script/install --copy     copy instead of symlink
+#   script/install --uninstall
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SRC="$REPO_ROOT/skills/quorum"
+DEST_DIR="${COPILOT_HOME:-$HOME/.copilot}/skills"
+DEST="$DEST_DIR/quorum"
+
+MODE="symlink"
+for arg in "$@"; do
+  case "$arg" in
+    --copy) MODE="copy" ;;
+    --uninstall) MODE="uninstall" ;;
+    -h|--help) sed -n '2,7p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown option: $arg" >&2; exit 2 ;;
+  esac
+done
+
+if [ "$MODE" = "uninstall" ]; then
+  if [ -e "$DEST" ] || [ -L "$DEST" ]; then
+    rm -rf "$DEST"
+    echo "removed $DEST"
+  else
+    echo "nothing installed at $DEST"
+  fi
+  exit 0
+fi
+
+[ -f "$SRC/SKILL.md" ] || { echo "error: $SRC/SKILL.md not found" >&2; exit 1; }
+
+mkdir -p "$DEST_DIR"
+rm -rf "$DEST"
+
+if [ "$MODE" = "copy" ]; then
+  cp -R "$SRC" "$DEST"
+  echo "copied $SRC -> $DEST"
+else
+  ln -s "$SRC" "$DEST"
+  echo "linked $DEST -> $SRC"
+fi
+
+echo "Run /quorum in Copilot to use it (restart the CLI if it was already running)."
