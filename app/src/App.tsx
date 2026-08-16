@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import Settings from "./Settings";
+import { listen } from "@tauri-apps/api/event";
+import Settings, { prefetchSettings } from "./Settings";
 import "./App.css";
 
 function App() {
@@ -10,6 +11,32 @@ function App() {
     { id: "1", name: "Quorum", path: "~/projects/quorum" },
     { id: "2", name: "Tauri App", path: "~/projects/tauri-app" },
   ];
+
+  // The native menu owns Cmd+, ; this only mirrors it for the browser/dev shell,
+  // where no native menu exists.
+  useEffect(() => {
+    // Settings reads shell out to the `copilot` CLI, so warm them at startup rather
+    // than making the user wait the first time they open the pane.
+    prefetchSettings();
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "," && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        setSelectedProject("settings");
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  useEffect(() => {
+    const unlisten = listen("open-settings", () =>
+      setSelectedProject("settings"),
+    ).catch(() => undefined);
+    return () => {
+      void unlisten.then((fn) => fn?.());
+    };
+  }, []);
 
   return (
     <div className="flex h-screen w-full bg-white overflow-hidden">
@@ -42,13 +69,10 @@ function App() {
             </div>
           ))}
         </div>
-        <div className="px-4 pb-2 text-xs font-semibold text-slate-500 uppercase tracking-wider pointer-events-none mt-6">
-          System
-        </div>
-        <div className="">
+        <div className="p-2 border-t border-slate-200">
           <div
             onClick={() => setSelectedProject("settings")}
-            className={`px-4 py-2 mx-2 rounded-md cursor-default text-sm ${
+            className={`px-4 py-2 rounded-md cursor-default text-sm ${
               selectedProject === "settings"
                 ? "bg-blue-500 text-white"
                 : "text-slate-700 hover:bg-slate-200"
@@ -56,11 +80,6 @@ function App() {
           >
             Settings
           </div>
-        </div>
-        <div className="p-4 border-t border-slate-200">
-          <button className="w-full text-left text-sm text-slate-500 hover:text-slate-800 cursor-default">
-            + Add Project
-          </button>
         </div>
       </div>
 

@@ -3,6 +3,27 @@ import { invoke } from "@tauri-apps/api/core";
 
 type SaveState = "idle" | "saving" | "saved" | "error";
 
+// Only the model list is memoized: it costs a `copilot` CLI subprocess, while reading
+// the config is a cheap file read that must stay fresh, since the CLI and other windows
+// write the same file and a stale snapshot would be saved back over their edits.
+// A rejected lookup is dropped from the cache so the next open retries it.
+let modelsPromise: Promise<string[]> | null = null;
+
+function loadModels(): Promise<string[]> {
+  if (!modelsPromise) {
+    modelsPromise = invoke("available_models") as Promise<string[]>;
+    modelsPromise.catch(() => {
+      modelsPromise = null;
+    });
+  }
+  return modelsPromise;
+}
+
+/** Warm the model list ahead of the user ever opening Settings. */
+export function prefetchSettings() {
+  loadModels().catch(() => undefined);
+}
+
 /** "planner-a" -> "Planner A" */
 function plannerLabel(slot: string) {
   return slot
@@ -112,9 +133,8 @@ export default function Settings() {
   useEffect(() => {
     let cancelled = false;
     invoke("read_config")
-      .then((loaded) => !cancelled && setConfig(loaded))
-      .catch((e) => !cancelled && setLoadError(String(e)));
-    invoke("available_models")
+      .then((loaded) => !cancelled && setConfig(loaded))      .catch((e) => !cancelled && setLoadError(String(e)));
+    loadModels()
       .then((loaded) => !cancelled && setModels(loaded as string[]))
       .catch((e) => !cancelled && setModelsError(String(e)));
     return () => {
