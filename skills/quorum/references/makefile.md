@@ -19,9 +19,16 @@ Principles:
   something.
 - Both must exit non-zero on failure. The loop reads exit codes.
 
-## Checking the contract
+## Who owns this
 
-At the start of a Quorum run:
+**`quorum-build` owns the contract.** It checks the targets in its Phase 1 and, at profile
+`full`, bootstraps them before any code is written. `quorum-plan` does not need them and
+never bootstraps them — a plan can name `make verify` and `make verify-full` in its
+`## Verification` section regardless of whether they exist yet. `quorum` may run the
+read-only check below early so a missing contract surfaces before planning, but it
+delegates the bootstrap itself to `quorum-build`.
+
+## Checking the contract
 
 ```bash
 make -n verify >/dev/null 2>&1 && echo "verify: ok" || echo "verify: MISSING"
@@ -34,9 +41,12 @@ right idea under different names (`make test` / `make ci`), add thin `verify` an
 
 ## Bootstrapping
 
-If either target is missing, detect the ecosystem, draft a Makefile from the matching
-template below, show it to the human, and get an explicit OK before proceeding. Do not
-start planning against a contract the human has not agreed to.
+If either target is missing at profile `full`, detect the ecosystem, draft a Makefile from
+the matching template below, show it to the human, and get an explicit OK before writing
+code. Do not start building against a contract the human has not agreed to.
+
+At profile `light`, do not bootstrap unless asked. Substitute the repository's own
+commands for both loops instead, as described in `quorum-build`'s Phase 1.
 
 Detection: `Cargo.toml` → Rust, `package.json` → Node, `pyproject.toml` /
 `requirements.txt` → Python, `go.mod` → Go. In a polyglot repo, compose the targets from
@@ -127,5 +137,7 @@ If a repo genuinely has no integration tests, `verify-full` should still exist a
 still do *more* than `verify` — at minimum a full build and a non-short test run. Do not
 alias `verify-full` to `verify`; that silently deletes the slow gate.
 
-If a repo has no tests at all, say so to the human before planning. The adversarial loop
-leans on the fast gate, and without one the reviewer carries the entire burden.
+If a repo has no tests at all, say so to the human before writing code and settle it then:
+either bootstrap the contract, or take an explicit waiver for the gate you cannot build,
+recorded in the pull request. The adversarial loop leans on the fast gate, and without one
+the reviewer carries the entire burden. See `quorum-build`'s Phase 1 for the waiver terms.

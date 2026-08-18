@@ -28,10 +28,20 @@ rubber-duck review
 
 Two rules make this work:
 
-- **`make verify` gates every review.** The reviewer must never spend a round reporting
+- **The fast loop gates every review.** The reviewer must never spend a round reporting
   something a unit test already catches. A failing fast loop is your problem, not theirs.
+  This is `make verify`, or — in the `light` profile of a repo without the Makefile
+  contract — the repo's own test, lint, and typecheck commands.
 - **`make verify-full` runs once, after `ACCEPT`.** It is slow, so it is the last gate,
-  not the inner loop. Its failures re-enter the fast loop like any other finding.
+  not the inner loop. Its failures re-enter the fast loop like any other finding. In
+  `light` without the Makefile contract, its substitute — the repo's fullest build and
+  test run — plays the same role.
+
+Either gate may be **waived**, but only under the terms in `quorum-build`'s Phase 1: the
+repository offers nothing usable, the human said so explicitly, and it was settled before
+any code was written. A waived gate is skipped and disclosed in the pull request. Deciding
+at delivery time that a gate can be skipped is never allowed, and a waiver never excuses
+the review itself — the reviewer runs every round either way.
 
 ## Launching the reviewer
 
@@ -41,8 +51,9 @@ another strong model from a different vendor. Suggested pairing: implement with
 `claude-opus-5`, review with `gpt-5.6-sol`, or the reverse.
 
 The reviewer is stateless. Give it the full context every round: work item, approved
-plan, what changed this round, the diff, the `make verify` output, and its own previous
-findings so it can check whether they were actually addressed.
+plan (or the resolved spec, if the run had no plan), what changed this round, the diff,
+the fast-loop output, and its own previous findings so it can check whether they were
+actually addressed.
 
 ## Reviewer prompt
 
@@ -66,9 +77,9 @@ findings so it can check whether they were actually addressed.
 >
 > Inputs:
 > - Work item: `{work_item}`
-> - Approved plan: `{plan}`
+> - Approved plan, or the resolved spec if this run had no plan: `{plan}`
 > - Changes this round (summary + diff): `{implementation}`
-> - `make verify` output: `{verify_output}`
+> - Fast-loop command and output: `{verify_output}`
 > - Your previous findings (may be empty): `{previous_findings}`
 >
 > Output — return a markdown document with exactly:
@@ -83,9 +94,9 @@ Write each verdict to `quorum/reviews/round-{n}.md`.
 
 ## Implementer rules
 
-- Follow the approved plan. If a step is wrong or infeasible, do the smallest correct
-  thing and record the deviation.
-- Keep changes scoped to the plan. Unrelated cleanup is out of scope and gives the
+- Follow the spec. If a step is wrong or infeasible, do the smallest correct thing and
+  record the deviation.
+- Keep changes scoped to the spec. Unrelated cleanup is out of scope and gives the
   reviewer noise to reject on.
 - Honor repository conventions and any `AGENTS.md` / instruction files you find.
 - Address **every** finding, or explain in the next round why a finding is wrong. Do not
@@ -99,20 +110,20 @@ The loop must terminate. Escalate to the human when any of these hit:
 
 | Condition | Why | Action |
 |-----------|-----|--------|
-| 5 review rounds | Diminishing returns | Present the state, the open findings, and ask how to proceed |
+| The profile's round cap — 3 in `light`, 5 in `full` | Diminishing returns | Present the state, the open findings, and ask how to proceed |
 | Two consecutive rejected rounds with an identical git tree | You are not actually changing anything; the loop is stuck | Stop, explain what you could not fix |
-| Reviewer rejects on something outside the approved plan | Scope drift | Take it back to the plan gate, not the fix loop |
-| `make verify-full` fails for the same reason twice | The slow gate found something the plan did not anticipate | Escalate with the failure |
+| Reviewer rejects on something outside the spec | Scope drift | Take it back to the human — or to `quorum-plan` — not the fix loop |
+| The slow gate fails for the same reason twice | It found something the plan did not anticipate | Escalate with the failure |
 
 Record the git tree SHA (`git write-tree` or `git rev-parse HEAD^{tree}`) after each round
 so the identical-tree condition can actually be detected.
 
 ## Delivering
 
-Once the reviewer accepts and `make verify-full` passes:
+Once the reviewer accepts and the slow gate passes — or was waived in Phase 1:
 
 1. Commit with a message naming the work item and summarizing the change.
 2. Push the branch.
-3. Open a pull request whose body links the work item and includes the converged plan and
-   the reviewer's final verdict.
+3. Open a pull request whose body links the work item and includes the spec, the
+   reviewer's final verdict, and any waived gate.
 4. Stop. Never merge — the human owns that.

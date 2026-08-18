@@ -1,48 +1,70 @@
 #!/usr/bin/env bash
-# Install the Quorum skill into the user-scoped Copilot skills directory.
+# Install every Quorum skill into the user-scoped Copilot skills directory.
 #
 #   script/install            symlink (default) — edits in this repo take effect live
 #   script/install --copy     copy instead of symlink
 #   script/install --uninstall
+#
+# Every skills/<name>/SKILL.md in this repository is installed as
+# ${COPILOT_HOME:-$HOME/.copilot}/skills/<name>.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SRC="$REPO_ROOT/skills/quorum"
+SRC_DIR="$REPO_ROOT/skills"
 DEST_DIR="${COPILOT_HOME:-$HOME/.copilot}/skills"
-DEST="$DEST_DIR/quorum"
 
 MODE="symlink"
 for arg in "$@"; do
   case "$arg" in
     --copy) MODE="copy" ;;
     --uninstall) MODE="uninstall" ;;
-    -h|--help) sed -n '2,7p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $arg" >&2; exit 2 ;;
   esac
 done
 
+SKILLS=()
+while IFS= read -r name; do
+  [ -n "$name" ] && SKILLS+=("$name")
+done < <(
+  for skill in "$SRC_DIR"/*/; do
+    [ -f "$skill/SKILL.md" ] || continue
+    basename "$skill"
+  done | LC_ALL=C sort
+)
+
+[ ${#SKILLS[@]} -gt 0 ] || { echo "error: no skills found under $SRC_DIR" >&2; exit 1; }
+
 if [ "$MODE" = "uninstall" ]; then
-  if [ -e "$DEST" ] || [ -L "$DEST" ]; then
-    rm -rf "$DEST"
-    echo "removed $DEST"
-  else
-    echo "nothing installed at $DEST"
-  fi
+  removed=0
+  for name in "${SKILLS[@]}"; do
+    dest="$DEST_DIR/$name"
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+      rm -rf "$dest"
+      echo "removed $dest"
+      removed=$((removed + 1))
+    fi
+  done
+  [ "$removed" -gt 0 ] || echo "nothing installed in $DEST_DIR"
   exit 0
 fi
 
-[ -f "$SRC/SKILL.md" ] || { echo "error: $SRC/SKILL.md not found" >&2; exit 1; }
-
 mkdir -p "$DEST_DIR"
-rm -rf "$DEST"
 
-if [ "$MODE" = "copy" ]; then
-  cp -R "$SRC" "$DEST"
-  echo "copied $SRC -> $DEST"
-else
-  ln -s "$SRC" "$DEST"
-  echo "linked $DEST -> $SRC"
-fi
+for name in "${SKILLS[@]}"; do
+  src="$SRC_DIR/$name"
+  dest="$DEST_DIR/$name"
+  rm -rf "$dest"
+  if [ "$MODE" = "copy" ]; then
+    cp -R "$src" "$dest"
+    echo "copied $src -> $dest"
+  else
+    ln -s "$src" "$dest"
+    echo "linked $dest -> $src"
+  fi
+done
 
-echo "Run /quorum in Copilot to use it (restart the CLI if it was already running)."
+printf 'Restart the Copilot CLI if it was already running, then invoke:'
+for name in "${SKILLS[@]}"; do printf ' /%s' "$name"; done
+printf '\n'
