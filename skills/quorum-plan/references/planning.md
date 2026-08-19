@@ -1,9 +1,8 @@
 # Fleet planning and convergence
 
 Planning is delegated to a quorum of independent models. Their value comes entirely from
-**isolation**: three plans written without knowledge of each other surface different
-risks, different orderings, and different assumptions. A single model asked three times
-does not.
+**isolation**: plans written without knowledge of each other surface different risks,
+different orderings, and different assumptions. A single model asked three times does not.
 
 ## Launching the fleet
 
@@ -16,6 +15,8 @@ task(name: "planner-a", agent_type: "explore", mode: "background",
      model: "claude-opus-5", reasoning_effort: "high", prompt: <planner prompt>)
 task(name: "planner-b", agent_type: "explore", mode: "background",
      model: "gpt-5.6-sol", reasoning_effort: "high", prompt: <planner prompt>)
+
+# full profile only
 task(name: "planner-c", agent_type: "explore", mode: "background",
      model: "gemini-3.1-pro-preview", reasoning_effort: "high", prompt: <planner prompt>)
 ```
@@ -29,7 +30,9 @@ there is no quorum.
 
 ## Intake prompt
 
-Sent to each planner model before planning, in the same parallel style.
+Used in the **`full`** profile only: sent to each planner model before planning, in the
+same parallel style. In `light`, the coordinator does intake itself and skips the fleet —
+but the bar for asking is identical, so hold yourself to the rules below.
 
 > You are a **Planner** at intake. Decide whether the work item below is specified well
 > enough to plan against, and if not, ask the human the **minimum** questions needed.
@@ -114,8 +117,14 @@ Material change means a step added, removed, reordered, or a risk that alters th
 approach. Wording churn is not material.
 
 On `ITERATE`, `write_agent` each live planner with the merged plan and ask it to refine
-toward it, returning the same plan sections. Re-merge. Cap at **3 rounds**; at the cap,
-take the current merged plan and tell the human which disagreements never resolved.
+toward it, returning the same plan sections. Re-merge. The round cap comes from the
+profile: **1 round** in `light`, **3 rounds** in `full`, where round 1 is the initial
+fleet plan and merge. So `light` takes the first merge and goes straight to the gate; it
+buys the diversity of independent planners without paying for refinement passes. At the
+cap, take the current merged plan and tell the human which disagreements never resolved.
+
+If `light` hits the cap with a material disagreement still open, say so plainly at the
+plan gate and offer to escalate to `full` rather than papering over it.
 
 If a planner raises a new question mid-convergence, go back to intake, answer it, and
 restart the round.
@@ -125,3 +134,13 @@ restart the round.
 Present the merged plan to the human with `ask_user`: approve, or reject with feedback.
 On rejection, start a new planning round with the feedback threaded into every planner
 prompt, and treat addressing it as a hard requirement of the next merged plan.
+
+`quorum/plans/plan.md` is a draft. On approval — and only on approval — copy it to
+`quorum/plans/approved-plan.md`. That file is the approval record and the handoff to
+`quorum-build`; its absence is what stops a rejected or half-finished plan from being
+implemented by a later or resumed session.
+
+The invariant is that `approved-plan.md` is never older than `plan.md`. Deleting it when a
+planning round starts, and recreating it only at approval, is what maintains that. If you
+ever find yourself with an `approved-plan.md` predating the current draft, the approval is
+stale — go back to the gate.
