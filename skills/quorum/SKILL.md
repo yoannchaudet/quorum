@@ -1,113 +1,65 @@
 ---
 name: quorum
-description: Turn a work item into a converged plan and a reviewed pull request, end to end. Runs a fleet of planner models in isolation, merges their candidate plans into one, gates on the human, then implements against an adversarial reviewer with fast/slow verification loops. Use when the user wants both a plan and the implementation for a non-trivial change, or says "quorum" with no further qualification. For planning only — a spec, a fleet-planned or multi-model plan, a second opinion, no code — use quorum-plan. To implement an existing plan, use quorum-build.
+description: Turn a work item into a human-approved plan and a reviewed pull request, end to end. Two independent planner models propose approaches, a coordinator merges them, and a single implementer works against a reviewer of a different model. Use when the user wants both planning and implementation for a non-trivial change, or says "quorum" with no further qualification. For planning only, use quorum-plan; to implement an existing plan, use quorum-build.
 user-invocable: true
 ---
 
 # Quorum
 
-Planning is the specification. Get it right and the work goes well. So planning is
-delegated to a **quorum** of independent models and merged into one plan; implementation
-is then driven by a single implementer against an **adversarial reviewer** of a different
-model. Humans stay in the loop at intake and plan approval.
+Two independent models plan, a human approves, and one implementer works against a
+read-only reviewer of a different model. Quorum opens a pull request. It never merges.
 
-This skill is the **end-to-end pipeline**. It owns very little itself: it runs the two
-halves back to back at their heaviest settings and carries the artifact between them.
+This skill composes `quorum-plan` and `quorum-build` without changing their defaults.
 
 ```
-quorum-plan (profile: full)
-    Intake ──> Fleet planning ──> Converge ──┐
-       ^            ^                        │ ITERATE
-       │            └────────────────────────┘
-       │                    │ CONVERGED
-       │                    v
-       └── answers ──  Plan gate (human) ──┐ reject
-                            │ approve      │
-                            │              └──> Fleet planning
-                            v
-                  quorum/plans/approved-plan.md   <── the handoff
-                            │
-                            v
-quorum-build (profile: full)
-                    Implement ──> make verify ──> Adversarial review
-                        ^                              │
-                        └──────── REJECT ──────────────┤
-                                                       │ ACCEPT
-                                                       v
-                                                make verify-full
-                                                       │ pass
-                                                       v
-                                                    Deliver
+Independent plans -> Merge -> Human approval
+                                  |
+                                  v
+Implement -> Relevant checks -> Independent review
+    ^                                |
+    +------------ REJECT ------------+
+                                     | ACCEPT
+                                     v
+                           Remaining applicable checks -> Deliver
 ```
 
-## Which skill do I want?
+## Phase A - Plan
 
-| You want | Use |
-|---|---|
-| A plan *and* the pull request, for non-trivial work | `quorum` (this one) |
-| Just a plan — a spec, a second opinion, no code | `quorum-plan` |
-| To implement something already specified, with real review | `quorum-build` |
+Invoke `quorum-plan`. If skill invocation is unavailable, follow
+[../quorum-plan/SKILL.md](../quorum-plan/SKILL.md) directly.
 
-If the work is small, prefer the halves. `quorum` deliberately spends more: a three-model
-planner fleet, fleet intake, up to three convergence rounds, and up to five review rounds.
-That is worth it for a change you would otherwise design badly, and pure overhead for a
-one-file fix. If a run turns out to be smaller than it looked, say so and drop to the
-light path rather than grinding through the full machine.
+It uses two planners, coordinator-led intake, and one merge by default. Focused
+follow-ups or a third opinion address concrete unresolved disagreements, not a preset
+profile. Let that skill own the human approval gate.
 
-## Before anything
+Pass the resulting `quorum/plans/approved-plan.md` path under the session artifacts
+directory to the build phase without paraphrasing it. If it is missing or older than
+the working draft `quorum/plans/plan.md`, do not build: the current draft needs approval.
 
-Run the read-only contract check from
-[references/makefile.md](references/makefile.md) so a missing `make verify` /
-`make verify-full` surfaces now rather than after a planning round. Report what you find,
-but do **not** bootstrap here — `quorum-build` owns the contract and will establish it in
-Phase B, where profile `full` requires it.
+## Phase B - Build
 
-Create a working directory for this run under the session artifacts dir: `quorum/` with
-`plans/` inside it. Both halves read and write there, and it is what lets a crashed or
-resumed session pick up where it left off.
+Invoke `quorum-build` with that approved-plan path. If skill invocation is unavailable,
+follow [../quorum-build/SKILL.md](../quorum-build/SKILL.md) directly.
 
-## Phase A — Plan
-
-Invoke the **`quorum-plan`** skill with **profile `full`**. If skill invocation is not
-available, follow [../quorum-plan/SKILL.md](../quorum-plan/SKILL.md) directly, in full.
-
-At `full` it runs fleet intake across the planner roster, three planner models in
-isolation, up to three convergence rounds, and the human plan gate. Do not shortcut any of
-those on its behalf, and do not merge plans yourself outside of it.
-
-It ends with a human-approved plan at `quorum/plans/approved-plan.md`. That file is the
-handoff, and its existence — not older than the `quorum/plans/plan.md` draft it was copied
-from — is the proof the gate was passed. Do not paraphrase it into the next phase; pass
-the path. If it is missing or older than the draft, the current plan was never approved
-and Phase B must not start.
-
-## Phase B — Build
-
-Invoke the **`quorum-build`** skill with **profile `full`**, pointing it at
-`quorum/plans/approved-plan.md`. If skill invocation is not available, follow
-[../quorum-build/SKILL.md](../quorum-build/SKILL.md) directly, in full.
-
-At `full` it establishes the Makefile contract, runs up to five implement/review rounds
-against an adversarial reviewer of a different model, runs `make verify-full` after the
-reviewer accepts, and opens a pull request. **Never merge it.** A human owns the merge.
+It discovers repository-native checks, implements against an independent reviewer,
+and opens a pull request after acceptance and applicable verification. It does not
+require a Makefile or introduce build tooling.
 
 ## Handling escapes
 
-- **Plan rejected at the gate** — that loop lives inside `quorum-plan`. Let it run its
-  rounds; do not start building against a rejected plan.
-- **Reviewer rejects on something outside the plan** — that is scope drift, not a fix.
-  Take it back to `quorum-plan` with the finding as feedback. It will void the existing
-  approval when it reopens planning, so Phase B restarts only once the revised plan has
-  been approved in its own right.
-- **Either half hits its stop condition** — surface the state, the open findings, and the
-  question to the human. Do not silently restart the phase.
+- A rejected plan stays in the planning phase.
+- A review finding that requires scope beyond the approved plan goes back to the human
+  or `quorum-plan`. Reopening planning invalidates the old approval; build resumes only
+  after the revised plan is approved.
+- If either half hits its stop condition, surface the state and open questions. Do not
+  silently restart the phase.
 
-## Rules that hold across every phase
+## Invariants
 
-- Planners and the reviewer are **read-only**. Only the coordinator/implementer writes
-  files.
-- Reviewer and implementer must be **different models**. If the roster would collide,
-  pick another reviewer model.
-- Every plan, review, and verdict is a file under `quorum/`, never only in the transcript.
-- `make verify` before every review; `make verify-full` only after an `ACCEPT`.
-- Quorum opens a pull request. It never merges one.
+- Planners and reviewers are read-only. Only the coordinator/implementer writes files.
+- Reviewer and implementer use different models.
+- Plans and verdicts persist under `quorum/` in the session artifacts directory.
+- Verification follows
+  [references/verification.md](references/verification.md), using the repository's own
+  workflow and valid evidence rather than mandatory target names.
+- A human owns the merge.

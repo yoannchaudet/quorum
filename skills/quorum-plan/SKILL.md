@@ -1,138 +1,79 @@
 ---
 name: quorum-plan
-description: Produce a converged implementation plan from a work item, and nothing else. Runs a small fleet of planner models in isolation, merges their candidate plans into one, and gates on the human. Writes no code. Use when asked to plan or spec a change, for a second opinion on an approach, or when the user says "quorum plan". For plan *and* build, use the quorum skill; to implement an existing plan, use quorum-build.
+description: Produce a human-approved implementation plan from a work item, and nothing else. Two planner models work independently, a coordinator merges their candidates, and focused follow-ups resolve material disagreements. Writes no code. Use when asked to plan or spec a change, for a second opinion on an approach, or when the user says "quorum plan". For planning and implementation, use quorum; to implement an existing plan, use quorum-build.
 user-invocable: true
 ---
 
-# Quorum — plan
+# Quorum - plan
 
-Planning is the specification. Get it right and the work goes well. So planning is
-delegated to a **quorum** of independent models and merged into one plan.
+You are the coordinator. Two independent planner models supply different approaches
+and risks; you merge their reasoning into a plan for human approval. Stop at the approved
+plan. Never write production code in this skill.
 
-This skill stops at an approved plan. It never writes code. Hand the result to
-`quorum-build` when you want it implemented.
+## Phase 0 - Intake
 
-You are the **Coordinator**. You own the state machine below.
+Resolve the work item from the prompt, a file, or a GitHub issue. Save it as
+`quorum/work-item.md` under the session artifacts directory. Create `quorum/plans/` there
+for candidates and the merged draft.
 
-```
-Intake ──> Fleet planning ──> Converge ──┐
-   ^            ^                        │ ITERATE
-   │            └────────────────────────┘
-   │                    │ CONVERGED
-   │                    v
-   └── answers ──  Plan gate (human) ──┐ reject
-                        │ approve      │
-                        v              └──> Fleet planning
-                    Approved plan
-```
+Read the repository yourself. Ask only blocking questions whose answers change the
+plan, one at a time with `ask_user`; prefer zero questions. Record answers in
+`quorum/answers.md`. Do not run a separate intake fleet.
 
-## Profile
+## Phase 1 - Independent planning
 
-Read the caller's profile. Default to **light** unless a caller (normally the `quorum`
-skill) explicitly says `full`.
+Before producing or revising a plan, delete any existing
+`quorum/plans/approved-plan.md`. Approval applies only to the draft the human saw;
+reopening planning for new answers, rejection, or scope changes invalidates it.
 
-| | `light` (default) | `full` |
-|---|---|---|
-| Planner roster | 2 models | 3 models |
-| Intake | You read the work item and ask only blocking questions yourself | One read-only intake sub-agent per planner, in parallel |
-| Convergence rounds | 1 | 3 |
-| Plan gate | Required | Required |
+Launch two read-only planners in one parallel batch, with explicit model overrides:
 
-`light` is the small-task path: two opinions, one merge, one approval. Escalate to `full`
-mid-run if the work turns out to be larger or more contentious than it looked, and say so
-when you do.
+| Slot | Default model |
+|---|---|
+| `planner-a` | `claude-opus-5` |
+| `planner-b` | `gpt-5.6-sol` |
 
-## Before anything
+Use available models from different vendors if a default is unavailable. Two independent
+planners are the minimum. Each sees the work item, human answers, and repository, but
+not the other candidate. Preserve each candidate as a file.
 
-Create a working directory for this run under the session artifacts dir: `quorum/` with
-`plans/` inside it. Every candidate plan and the merged plan is written there as a file,
-never kept only in the transcript. The merged plan lives at `quorum/plans/plan.md` and is
-a **draft** until the human approves it; approval promotes it to
-`quorum/plans/approved-plan.md`, which is what `quorum-build` reads.
+See [references/planning.md](references/planning.md) for prompts and artifact paths.
+Verification uses the repository's actual checks, not assumed Make targets; see
+[../quorum/references/verification.md](../quorum/references/verification.md).
 
-You do **not** need the Makefile contract to plan, and you do not bootstrap it —
-`quorum-build` owns that. The plan's `## Verification` section still speaks in terms of
-`make verify` and `make verify-full`; see
-[../quorum/references/makefile.md](../quorum/references/makefile.md) for what those mean.
+## Phase 2 - Merge and resolve
 
-## Phase 0 — Intake
+Merge once into `quorum/plans/plan.md`. Weight concrete reasoning over headcount.
+Retain actionable risks and explain why material concerns were dismissed.
 
-The work item is a GitHub issue (`gh issue view <n>`), a markdown file, or a prompt.
-Resolve it to text and save it as `quorum/work-item.md`.
+Do not run refinement rounds merely to obtain agreement. If a material disagreement
+remains, ask the relevant live planners a focused question. Use a third model only when
+an unresolved decision needs another independent opinion. Preserve material dissent
+rather than asking agents to agree with the merged plan.
 
-In `light`, read the work item and the repository yourself, and ask the human only the
-questions whose answers would change the plan.
+Allow at most two focused follow-up rounds after the initial merge. If a decision still
+cannot be resolved, present the alternatives and evidence to the human. Do not call
+reaching the cap consensus, or silently restart the loop.
 
-In `full`, run one intake sub-agent per planner model, read-only, in a single parallel
-batch. Each returns either `NONE` or the **minimum** numbered questions. Dedupe and merge
-overlapping questions.
+## Phase 3 - Human approval
 
-Either way, ask the human **one question at a time** with `ask_user`, offering multiple
-choice whenever the options are predictable, and record answers in `quorum/answers.md`.
+Show the merged plan, including material disagreements, and ask for explicit approval
+with `ask_user`. On rejection, invalidate any approval, address the feedback, and return
+to the affected planning step. Do not rerun unaffected work by default; changes to the
+goal or core approach require fresh independent candidates.
 
-Prefer zero questions. Do not ask about nice-to-haves.
+Only after approval, copy the current `quorum/plans/plan.md` to
+`quorum/plans/approved-plan.md`. Never write the approved file early or leave an old
+approval in place while changing the draft.
 
-## Phase 1 — Fleet planning
+Report the approved path and stop. When called by `quorum`, return the path to that
+orchestrator. If the human requests implementation, invoke `quorum-build`.
 
-**Invalidate any stale approval first.** If `quorum/plans/approved-plan.md` exists from an
-earlier run or an earlier round, delete it before you plan. An approval only ever applies
-to the draft the human actually saw; the moment you start producing a new one, the old
-approval is void. This is what keeps a re-plan — after a rejection, new answers, or scope
-drift bounced back from `quorum-build` — from leaving a stale approval lying around for a
-later session to build against.
+## Invariants
 
-Launch the planner roster in **one parallel batch** of background sub-agents, each with an
-explicit `model` override. Full protocol and prompts in
-[references/planning.md](references/planning.md).
-
-Default roster (override on request):
-
-| Slot | Model | Role | Profile |
-|------|-------|------|---------|
-| `planner-a` | `claude-opus-5` | Primary generalist | both |
-| `planner-b` | `gpt-5.6-sol` | Independent, different vendor | both |
-| `planner-c` | `gemini-3.1-pro-preview` | Third opinion / tie-breaker | `full` only |
-
-Each planner works in **isolation**: it sees the work item and human answers and nothing
-else. It never sees another planner's output. This is the whole point — do not summarize
-one planner's plan into another's prompt.
-
-Two planners is the floor. Below that there is no quorum, and you should be using neither
-this skill nor `quorum`.
-
-## Phase 2 — Converge
-
-Merge the candidates yourself into `quorum/plans/plan.md`, then emit `CONVERGED` or
-`ITERATE`. On `ITERATE`, send the merged plan back to the **same live planners** with
-`write_agent` so they keep their context, and merge again. Cap at the profile's round
-limit — **1** in `light`, **3** in `full` — then take the current merged plan and tell the
-human which disagreements never resolved. Criteria and merge rules in
-[references/planning.md](references/planning.md).
-
-## Phase 3 — Plan gate (human)
-
-Show the merged plan and ask for approval. On rejection, feed the feedback into a new
-planning round — every requested change must be addressed. This gate is not optional.
-
-`quorum/plans/plan.md` is a **working draft** at this point, not something anyone should
-build against. Only on approval do you copy it to `quorum/plans/approved-plan.md`. That
-file is the approval record, and it is what `quorum-build` looks for. Never write it
-before the human says yes, and — because you deleted any stale copy when the round started
-— it always describes the draft the human actually approved, never an earlier one.
-
-## Delivering the plan
-
-On approval, stop. Report where the approved plan lives
-(`quorum/plans/approved-plan.md`), summarize it, and offer the obvious next step: run
-`quorum-build` against it.
-
-If the human asks you to implement it now, invoke `quorum-build` rather than implementing
-inline — it owns the verification and review loop.
-
-## Rules that hold across every phase
-
-- Planners are **read-only**. Only you write files.
-- Every candidate and merged plan is a file under `quorum/`, so a crashed or resumed
-  session can pick up where it left off.
-- Never write production code in this skill. If a plan step is only provable by
-  experiment, say so in `## Risks & assumptions` instead of running the experiment.
+- Planners are read-only; only you write artifacts.
+- Candidates, follow-up responses, and merged plans persist under `quorum/plans/`.
+- The approved copy must not predate the current draft. A missing or stale approval
+  requires a new human gate.
+- If a step needs an experiment to establish feasibility, record that uncertainty in
+  the plan rather than writing production code.
