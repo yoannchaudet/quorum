@@ -1,129 +1,83 @@
-# Adversarial review loop
+# Independent review loop
 
-The implementer and the reviewer are deliberately different models. A model reviewing its
-own work rationalizes it; a different model, told to be adversarial, does not. The
-reviewer's job is to find what is wrong, not to be agreeable.
+A different model provides a separate perspective, not a guarantee of correctness.
+The reviewer looks for concrete defects and missed requirements, not reasons to agree
+or opportunities to expand scope.
 
 ## Round structure
 
 ```
-implement / fix
-      │
-      v
-make verify ──fail──> fix (do not review)
-      │ pass
-      v
-rubber-duck review
-      │
-      ├── REJECT ──> fix ──> make verify ──> review
-      │
-      └── ACCEPT
-             │
-             v
-      make verify-full ──fail──> findings ──> fix ──> make verify ──> review
-             │ pass
-             v
-          deliver
+Implement / fix -> Relevant checks -> Review
+       ^                               |
+       +------------ REJECT -----------+
+                                       | ACCEPT
+                                       v
+                           Remaining applicable checks -> Deliver
+                                       |
+                                      FAIL -> Fix and review again
 ```
 
-Two rules make this work:
-
-- **The fast loop gates every review.** The reviewer must never spend a round reporting
-  something a unit test already catches. A failing fast loop is your problem, not theirs.
-  This is `make verify`, or — in the `light` profile of a repo without the Makefile
-  contract — the repo's own test, lint, and typecheck commands.
-- **`make verify-full` runs once, after `ACCEPT`.** It is slow, so it is the last gate,
-  not the inner loop. Its failures re-enter the fast loop like any other finding. In
-  `light` without the Makefile contract, its substitute — the repo's fullest build and
-  test run — plays the same role.
-
-Either gate may be **waived**, but only under the terms in `quorum-build`'s Phase 1: the
-repository offers nothing usable, the human said so explicitly, and it was settled before
-any code was written. A waived gate is skipped and disclosed in the pull request. Deciding
-at delivery time that a gate can be skipped is never allowed, and a waiver never excuses
-the review itself — the reviewer runs every round either way.
+Follow [../../quorum/references/verification.md](../../quorum/references/verification.md).
+Review receives current evidence and its limitations. Before delivery, run broader
+applicable checks not already covered. No second suite is mandatory; reuse successful
+evidence only while valid. Review acceptance does not excuse a failed check.
 
 ## Launching the reviewer
 
-Use `agent_type: rubber-duck`, `mode: sync`, with an explicit `model` override that
-**differs from your own model**. If your model is the natural reviewer choice, pick
-another strong model from a different vendor. Suggested pairing: implement with
-`claude-opus-5`, review with `gpt-5.6-sol`, or the reverse.
+Use a read-only review agent available in the host, such as `agent_type: code-review`,
+with `mode: sync` and an explicit model override different from the implementer's.
+If no specialized reviewer is available, use a general-purpose agent explicitly
+instructed to remain read-only. Prefer a different vendor.
 
-The reviewer is stateless. Give it the full context every round: work item, approved
-plan (or the resolved spec, if the run had no plan), what changed this round, the diff,
-the fast-loop output, and its own previous findings so it can check whether they were
-actually addressed.
+Give the reviewer full context each round: work item, spec, current diff, verification
+evidence, and previous findings. Do not rely on it remembering an earlier invocation.
 
 ## Reviewer prompt
 
-> You are the **Reviewer**, and you are adversarial by design. You are a different model
-> from the Implementer. Assume the implementation is wrong until the evidence says
-> otherwise, and go looking for that evidence.
+> You are the Reviewer. Investigate the actual code and seek evidence of defects.
+> Remain read-only; do not modify files.
 >
-> Rules:
-> - Hunt for correctness bugs, missed plan steps, security issues, unhandled edge cases,
->   broken error paths, and silent behavior changes.
-> - Read the actual code, not just the summary. The summary may be wrong or incomplete.
-> - Judge against the **plan and the work item** — not personal style preferences. Do not
->   report formatting, naming, or taste. The fast loop already covers lint and format.
-> - Verify that each of your previous findings was genuinely fixed, not worked around or
->   suppressed.
-> - Check that tests actually exercise the new behavior. A passing suite that never calls
->   the new code is a finding.
-> - Read-only. Do not modify files.
-> - Reject if anything material is wrong or missing. Accept only when the work is sound.
->   Do not accept out of politeness or fatigue.
+> - Hunt for correctness bugs, missed requirements, security issues, unhandled edge
+>   cases, broken error paths, and silent behavior changes.
+> - Judge against the spec and work item, not personal style or naming preferences.
+> - Check that previous findings were fixed rather than suppressed.
+> - Check that verification exercises the requested behavior. Assess manual evidence
+>   where automation is absent; distinguish not applicable, unavailable, and failed
+>   checks rather than demanding nonexistent tooling.
+> - Report material verification gaps. Human acceptance of a limitation does not turn
+>   it into a passing check or excuse a known implementation defect.
+> - Reject material defects or missing requirements. Support findings with concrete
+>   evidence; do not invent findings to appear adversarial.
 >
-> Inputs:
-> - Work item: `{work_item}`
-> - Approved plan, or the resolved spec if this run had no plan: `{plan}`
-> - Changes this round (summary + diff): `{implementation}`
-> - Fast-loop command and output: `{verify_output}`
-> - Your previous findings (may be empty): `{previous_findings}`
+> Work item: `{work_item}`
+> Spec: `{plan}`
+> Changes this round and current diff: `{implementation}`
+> Verification commands, results, covered state, and limitations: `{verification}`
+> Previous findings and implementer responses: `{previous_findings}`
 >
-> Output — return a markdown document with exactly:
-> - `## Verdict` — exactly `ACCEPT` or `REJECT` on its own line.
-> - `## Findings` — for `REJECT`, a numbered list of concrete, actionable issues, each
->   fixable by the Implementer and each naming the file and the specific problem. For
->   `ACCEPT`, `NONE` or brief non-blocking notes.
->
-> Nothing outside these sections.
+> Return:
+> - `## Verdict` - `ACCEPT` or `REJECT`
+> - `## Findings` - numbered, actionable findings with file and problem; on acceptance,
+>   `NONE` or brief non-blocking notes
 
-Write each verdict to `quorum/reviews/round-{n}.md`.
-
-## Implementer rules
-
-- Follow the spec. If a step is wrong or infeasible, do the smallest correct thing and
-  record the deviation.
-- Keep changes scoped to the spec. Unrelated cleanup is out of scope and gives the
-  reviewer noise to reject on.
-- Honor repository conventions and any `AGENTS.md` / instruction files you find.
-- Address **every** finding, or explain in the next round why a finding is wrong. Do not
-  silently ignore one — the reviewer checks.
-- Never suppress a test, widen a lint exclusion, or weaken an assertion to make the loop
-  go green. That is an automatic reject and it is a lie to the human.
+Save each verdict as `quorum/reviews/round-{n}.md` under the session artifacts directory.
+Record the reviewed working-tree state with it, including staged, unstaged, and relevant
+untracked changes. A HEAD tree alone cannot detect edits made between reviews.
 
 ## Stop conditions
 
-The loop must terminate. Escalate to the human when any of these hit:
+| Condition | Action |
+|---|---|
+| Three review rounds without deliverable acceptance and verification | Present open findings and ask the human how to proceed |
+| Two consecutive rejected rounds with identical working-tree contents | Stop and explain why the work is stuck |
+| A finding requires work outside the spec | Take the scope decision to the human or `quorum-plan`; do not expand scope silently |
+| A pre-delivery check fails for the same reason twice | Escalate with the failure evidence |
 
-| Condition | Why | Action |
-|-----------|-----|--------|
-| The profile's round cap — 3 in `light`, 5 in `full` | Diminishing returns | Present the state, the open findings, and ask how to proceed |
-| Two consecutive rejected rounds with an identical git tree | You are not actually changing anything; the loop is stuck | Stop, explain what you could not fix |
-| Reviewer rejects on something outside the spec | Scope drift | Take it back to the human — or to `quorum-plan` — not the fix loop |
-| The slow gate fails for the same reason twice | It found something the plan did not anticipate | Escalate with the failure |
+Never reset the round count silently. If planning reopens, invalidate the prior plan
+approval and wait for approval of the revised draft before continuing implementation.
 
-Record the git tree SHA (`git write-tree` or `git rev-parse HEAD^{tree}`) after each round
-so the identical-tree condition can actually be detected.
+## Delivery
 
-## Delivering
-
-Once the reviewer accepts and the slow gate passes — or was waived in Phase 1:
-
-1. Commit with a message naming the work item and summarizing the change.
-2. Push the branch.
-3. Open a pull request whose body links the work item and includes the spec, the
-   reviewer's final verdict, and any waived gate.
-4. Stop. Never merge — the human owns that.
+After acceptance and applicable verification, commit, push, and open a pull request.
+Include the spec or a portable summary, final verdict, verification evidence, and any
+unresolved limitations explicitly accepted by the human. Never merge.
