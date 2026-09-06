@@ -31,7 +31,7 @@ Launch two read-only planners in one parallel batch, with explicit model overrid
 | Slot | Default model |
 |---|---|
 | `planner-a` | `claude-opus-5` |
-| `planner-b` | `gpt-5.6-sol` |
+| `planner-b` | `gpt-6-astra` |
 
 Use available models from different vendors if a default is unavailable. Two independent
 planners are the minimum. Each sees the work item, human answers, and repository, but

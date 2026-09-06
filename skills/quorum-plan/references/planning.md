@@ -7,7 +7,7 @@ or a guarantee that repeated rounds will reach the right answer.
 
 Launch both planners in one parallel batch using `task`, `agent_type: explore`,
 `mode: background`, and explicit model overrides. Defaults are `claude-opus-5` and
-`gpt-5.6-sol`; select available alternatives from different vendors if needed.
+`gpt-6-astra`; select available alternatives from different vendors if needed.
 Keep the agents alive for focused follow-ups through `write_agent`.
 
 ## Candidate prompt
